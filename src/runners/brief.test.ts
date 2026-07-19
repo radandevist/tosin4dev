@@ -106,7 +106,7 @@ describe("buildPrompt", () => {
 });
 
 describe("runner adapters", () => {
-  it("builds a safe Claude print-mode command scoped through CLAUDE_CWD", () => {
+  it("builds a safe Claude print-mode command without environment overrides", () => {
     const command = claudeAdapter.buildCommand(
       { ticket, board, workDir: "/wt/7", phase: "execute" },
       "/wt/7/.tosin/prompt.md",
@@ -121,16 +121,16 @@ describe("runner adapters", () => {
         "--output-format",
         "text",
       ],
-      env: { CLAUDE_CWD: "/wt/7" },
+      env: {},
     });
     expect(command.cmd).not.toContain("--dangerously-skip-permissions");
     expect(command.cmd).not.toContain("--yolo");
   });
 
-  it("builds a safe Codex workspace-write exec command without environment leakage", () => {
+  it("builds a read-only Codex spec command in the board repo", () => {
     const command = codexAdapter.buildCommand(
-      { ticket, board, workDir: "/wt/7", phase: "review_fix" },
-      "/wt/7/.tosin/prompt.md",
+      { ticket, board, workDir: board.repoPath, phase: "spec_draft" },
+      "/repo/.tosin/prompt.md",
     );
 
     expect(codexAdapter.name).toBe("codex");
@@ -139,14 +139,37 @@ describe("runner adapters", () => {
         "codex",
         "exec",
         "--sandbox",
-        "workspace-write",
+        "read-only",
         "--cd",
-        "/wt/7",
-        "Read /wt/7/.tosin/prompt.md and follow it exactly. End with the required SUMMARY section.",
+        "/repo",
+        "Read /repo/.tosin/prompt.md and follow it exactly. End with the required SUMMARY section.",
       ],
       env: {},
     });
     expect(command.cmd).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     expect(command.cmd).not.toContain("--yolo");
   });
+
+  it.each(executablePhases)(
+    "builds a safe Codex workspace-write %s command without environment leakage",
+    (phase) => {
+      const command = codexAdapter.buildCommand(
+        { ticket, board, workDir: "/wt/7", phase },
+        "/wt/7/.tosin/prompt.md",
+      );
+
+      expect(command).toEqual({
+        cmd: [
+          "codex",
+          "exec",
+          "--sandbox",
+          "workspace-write",
+          "--cd",
+          "/wt/7",
+          "Read /wt/7/.tosin/prompt.md and follow it exactly. End with the required SUMMARY section.",
+        ],
+        env: {},
+      });
+    },
+  );
 });
