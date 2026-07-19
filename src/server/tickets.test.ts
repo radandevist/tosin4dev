@@ -107,6 +107,46 @@ describe("tickets server functions", () => {
     await expect(getTicketCore(BOARD_ID, 9999)).rejects.toThrow(/not found/i);
   });
 
+  it("hydrates a legacy ticket missing approvedBy to null, keeping audit timestamps", async () => {
+    await (await tickets()).deleteMany({});
+    // A raw pre-approval-field document, inserted straight into Mongo the way a
+    // legacy write would have: spec.approvedBy simply does not exist yet.
+    const createdAt = "2020-01-01T00:00:00.000Z";
+    const updatedAt = "2020-01-02T00:00:00.000Z";
+    await (await tickets()).insertOne({
+      boardId: BOARD_ID,
+      seq: 77,
+      title: "legacy ticket",
+      type: "implement",
+      status: "inbox",
+      runner: "claude",
+      spec: {
+        intent: "legacy intent",
+        scope: "",
+        nonGoals: "",
+        acceptance: [],
+        links: [],
+        risk: "low",
+        approvedAt: null,
+        // approvedBy intentionally absent — this is the legacy shape.
+      },
+      activeRunId: null,
+      prUrl: null,
+      activity: [{ at: createdAt, kind: "lifecycle", message: "created" }],
+      createdAt,
+      updatedAt,
+    });
+
+    const dto = await getTicketCore(BOARD_ID, 77);
+    // Hydrated through TicketSchema, so the missing field defaults to null...
+    expect(dto.spec.approvedBy).toBeNull();
+    expect(dto.spec.approvedAt).toBeNull();
+    // ...and the server-owned audit timestamps survive untouched.
+    expect(dto.createdAt).toBe(createdAt);
+    expect(dto.updatedAt).toBe(updatedAt);
+    expect(typeof dto._id).toBe("string");
+  });
+
   describe("transitions (human events only)", () => {
     it("accepts only human UI events, never machine/supervisor events", () => {
       for (const ok of [

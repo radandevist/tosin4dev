@@ -1,8 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { boundary, unwrapResult } from "./result";
+import { boundary, ServerResultError, unwrapResult } from "./result";
 
 const Input = z.object({ n: z.number() }).strict();
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("boundary (server boundary helper)", () => {
   it("returns the ok union with the core result on valid input", async () => {
@@ -30,15 +34,38 @@ describe("boundary (server boundary helper)", () => {
     expect(r.ok).toBe(false);
   });
 
-  it("catches a thrown core error and returns the error union", async () => {
+  it("redacts an unexpected thrown error but logs it server-side", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const secret = "connection to mongodb://user:pw@internal:27017 refused";
     const r = await boundary(Input, { n: 1 }, () => {
-      throw new Error("core blew up");
+      throw new Error(secret);
     });
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.error.code).toBe("internal");
-      expect(r.error.message).toBe("core blew up");
+      // The raw driver/internal message must never cross the wire.
+      expect(r.error.message).toBe("Unexpected server error");
+      expect(r.error.message).not.toContain("mongodb");
     }
+    // ...but the operator still gets the real error in the server logs.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0].some((arg) => String(arg).includes(secret))).toBe(
+      true,
+    );
+  });
+
+  it("preserves the code and message of a safe expected error", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r = await boundary(Input, { n: 1 }, () => {
+      throw new ServerResultError("not_found", "board not found: acme");
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("not_found");
+      expect(r.error.message).toBe("board not found: acme");
+    }
+    // Expected errors are intentional control flow, not incidents to log.
+    expect(spy).not.toHaveBeenCalled();
   });
 });
 

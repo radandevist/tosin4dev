@@ -3,7 +3,7 @@ import type { WithId } from "mongodb";
 import { z } from "zod";
 import { BoardSchema, type Board } from "../domain/schemas";
 import { db } from "./db";
-import { boundary, type ServerResult } from "./result";
+import { boundary, ServerResultError, type ServerResult } from "./result";
 
 // Persisted board document: the validated board fields plus the server-owned
 // audit timestamps. `_id` is added by Mongo and stripped into a string on the
@@ -47,7 +47,7 @@ export async function createBoardCore(input: Board): Promise<{ id: string }> {
 
 export async function getBoardCore(slug: string): Promise<BoardDTO> {
   const doc = await (await boards()).findOne({ slug });
-  if (!doc) throw new Error(`board not found: ${slug}`);
+  if (!doc) throw new ServerResultError("not_found", `board not found: ${slug}`);
   return toDTO(doc);
 }
 

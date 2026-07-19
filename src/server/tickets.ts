@@ -5,6 +5,7 @@ import {
   CreateTicketInputSchema,
   ObjectIdString,
   SetRunnerInputSchema,
+  TicketSchema,
   TicketStatus,
   UpdateSpecInputSchema,
   type CreateTicketInput,
@@ -14,7 +15,7 @@ import {
 } from "../domain/schemas";
 import { PublicEventSchema, transition } from "../domain/stateMachine";
 import { db, ObjectId } from "./db";
-import { boundary, type ServerResult } from "./result";
+import { boundary, ServerResultError, type ServerResult } from "./result";
 
 // Persisted ticket document: the validated ticket fields plus server-owned
 // audit timestamps. `_id` is added by Mongo and stripped to a string on the
@@ -52,8 +53,14 @@ function tickets() {
 }
 
 function toDTO(doc: WithId<TicketDoc>): TicketDTO {
-  const { _id, ...rest } = doc;
-  return { _id: _id.toString(), ...rest };
+  // Hydrate the persisted ticket fields through TicketSchema so legacy
+  // documents written before a field existed (e.g. spec.approvedBy) pick up its
+  // schema default (null) instead of surfacing `undefined` to the client. The
+  // server-owned audit timestamps and `_id` live outside TicketSchema, so we
+  // carry them across untouched rather than dropping them.
+  const { _id, createdAt, updatedAt, ...ticketFields } = doc;
+  const ticket = TicketSchema.parse(ticketFields);
+  return { _id: _id.toString(), ...ticket, createdAt, updatedAt };
 }
 
 function isDuplicateKeyError(err: unknown): boolean {
@@ -91,7 +98,12 @@ export async function getTicketCore(
   seq: number,
 ): Promise<TicketDTO> {
   const doc = await (await tickets()).findOne({ boardId, seq });
-  if (!doc) throw new Error(`ticket not found: board ${boardId} seq ${seq}`);
+  if (!doc) {
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: board ${boardId} seq ${seq}`,
+    );
+  }
   return toDTO(doc);
 }
 
@@ -159,7 +171,10 @@ export async function updateSpecCore(input: UpdateSpecInput): Promise<void> {
   );
 
   if (res.matchedCount === 0) {
-    throw new Error(`ticket not found: ${input.ticketId}`);
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${input.ticketId}`,
+    );
   }
 }
 
@@ -176,7 +191,10 @@ export async function setRunnerCore(input: SetRunnerInput): Promise<void> {
   );
 
   if (res.matchedCount === 0) {
-    throw new Error(`ticket not found: ${input.ticketId}`);
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${input.ticketId}`,
+    );
   }
 }
 
@@ -186,7 +204,12 @@ export async function transitionTicketCore(
   const coll = await tickets();
 
   const doc = await coll.findOne({ _id: new ObjectId(input.ticketId) });
-  if (!doc) throw new Error(`ticket not found: ${input.ticketId}`);
+  if (!doc) {
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${input.ticketId}`,
+    );
+  }
 
   // Re-validate the persisted status through the domain enum before trusting it
   // as a machine input — a corrupt/legacy value fails loudly here rather than
@@ -215,7 +238,8 @@ export async function transitionTicketCore(
   );
 
   if (res.matchedCount === 0) {
-    throw new Error(
+    throw new ServerResultError(
+      "conflict",
       `stale ticket transition: ${input.ticketId} is no longer in ${from}`,
     );
   }
