@@ -1,6 +1,28 @@
+# dependencies
 node_modules/
+
+# build output
 dist/
-.dump/
+dist-ssr/
+.output/
+.nitro/
+.vinxi/
+.wrangler/
+
+# TanStack / tooling caches
+.tanstack/
+__unconfig*
+todos.json
+
+# runner runtime (worktrees, run logs, prompts)
+.tosin4dev/
+
+# env & secrets
 .env
 .env.local
+*.local
+
+# misc
+.dump/
 *.log
+.DS_Store
