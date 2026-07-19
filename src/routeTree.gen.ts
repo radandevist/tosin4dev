@@ -10,33 +10,67 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as BBoardSlugRouteImport } from './routes/b/$boardSlug'
+import { Route as BBoardSlugNewRouteImport } from './routes/b/$boardSlug/new'
+import { Route as BBoardSlugTTicketSeqRouteImport } from './routes/b/$boardSlug/t/$ticketSeq'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const BBoardSlugRoute = BBoardSlugRouteImport.update({
+  id: '/b/$boardSlug',
+  path: '/b/$boardSlug',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BBoardSlugNewRoute = BBoardSlugNewRouteImport.update({
+  id: '/new',
+  path: '/new',
+  getParentRoute: () => BBoardSlugRoute,
+} as any)
+const BBoardSlugTTicketSeqRoute = BBoardSlugTTicketSeqRouteImport.update({
+  id: '/t/$ticketSeq',
+  path: '/t/$ticketSeq',
+  getParentRoute: () => BBoardSlugRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/b/$boardSlug': typeof BBoardSlugRouteWithChildren
+  '/b/$boardSlug/new': typeof BBoardSlugNewRoute
+  '/b/$boardSlug/t/$ticketSeq': typeof BBoardSlugTTicketSeqRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/b/$boardSlug': typeof BBoardSlugRouteWithChildren
+  '/b/$boardSlug/new': typeof BBoardSlugNewRoute
+  '/b/$boardSlug/t/$ticketSeq': typeof BBoardSlugTTicketSeqRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/b/$boardSlug': typeof BBoardSlugRouteWithChildren
+  '/b/$boardSlug/new': typeof BBoardSlugNewRoute
+  '/b/$boardSlug/t/$ticketSeq': typeof BBoardSlugTTicketSeqRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    '/' | '/b/$boardSlug' | '/b/$boardSlug/new' | '/b/$boardSlug/t/$ticketSeq'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to: '/' | '/b/$boardSlug' | '/b/$boardSlug/new' | '/b/$boardSlug/t/$ticketSeq'
+  id:
+    | '__root__'
+    | '/'
+    | '/b/$boardSlug'
+    | '/b/$boardSlug/new'
+    | '/b/$boardSlug/t/$ticketSeq'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  BBoardSlugRoute: typeof BBoardSlugRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
@@ -48,11 +82,47 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/b/$boardSlug': {
+      id: '/b/$boardSlug'
+      path: '/b/$boardSlug'
+      fullPath: '/b/$boardSlug'
+      preLoaderRoute: typeof BBoardSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/b/$boardSlug/new': {
+      id: '/b/$boardSlug/new'
+      path: '/new'
+      fullPath: '/b/$boardSlug/new'
+      preLoaderRoute: typeof BBoardSlugNewRouteImport
+      parentRoute: typeof BBoardSlugRoute
+    }
+    '/b/$boardSlug/t/$ticketSeq': {
+      id: '/b/$boardSlug/t/$ticketSeq'
+      path: '/t/$ticketSeq'
+      fullPath: '/b/$boardSlug/t/$ticketSeq'
+      preLoaderRoute: typeof BBoardSlugTTicketSeqRouteImport
+      parentRoute: typeof BBoardSlugRoute
+    }
   }
 }
 
+interface BBoardSlugRouteChildren {
+  BBoardSlugNewRoute: typeof BBoardSlugNewRoute
+  BBoardSlugTTicketSeqRoute: typeof BBoardSlugTTicketSeqRoute
+}
+
+const BBoardSlugRouteChildren: BBoardSlugRouteChildren = {
+  BBoardSlugNewRoute: BBoardSlugNewRoute,
+  BBoardSlugTTicketSeqRoute: BBoardSlugTTicketSeqRoute,
+}
+
+const BBoardSlugRouteWithChildren = BBoardSlugRoute._addFileChildren(
+  BBoardSlugRouteChildren,
+)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  BBoardSlugRoute: BBoardSlugRouteWithChildren,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
