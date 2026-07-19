@@ -20,6 +20,41 @@ export const TicketStatus = z.enum([
 export const RunnerName = z.enum(["claude", "codex"]);
 export const Risk = z.enum(["low", "medium", "high"]);
 
+// A serialized Mongo ObjectId: exactly 24 hex characters. Used wherever a
+// document references another document by its stringified _id.
+export const ObjectIdString = z
+  .string()
+  .regex(/^[0-9a-fA-F]{24}$/, "must be a 24-character hex ObjectId");
+
+// Absolute host filesystem path. This module is browser-bound (imported by
+// client code), so we cannot pull in Node's `path`. A small regex covers the
+// POSIX form (/foo), Windows drive form (C:\foo or C:/foo), and Windows UNC
+// form (\\server\share) without any platform-specific import.
+const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
+export const AbsolutePathString = z
+  .string()
+  .min(1)
+  .regex(ABSOLUTE_PATH, "must be an absolute host path");
+
+// A PR link must be a real http(s) URL. `.url()` alone accepts mailto:,
+// javascript:, etc., so we additionally pin the protocol.
+export const HttpUrlString = z
+  .string()
+  .url()
+  .refine(
+    (value) => {
+      try {
+        const { protocol } = new URL(value);
+        return protocol === "http:" || protocol === "https:";
+      } catch {
+        return false;
+      }
+    },
+    { message: "must be an http(s) URL" },
+  );
+
+// Persisted spec shape. Defaults are retained so stored documents (and the
+// server that hydrates them) can rely on every field being present.
 export const SpecSchema = z.object({
   intent: z.string().min(1),
   scope: z.string().default(""),
@@ -38,16 +73,19 @@ export const ActivityEntry = z.object({
 });
 export type Activity = z.infer<typeof ActivityEntry>;
 
+// Persisted ticket shape. Server-owned fields (seq/status/activeRunId/prUrl/
+// activity) keep defaults for hydration; client input uses the *Input schemas
+// below, which never expose these.
 export const TicketSchema = z.object({
-  boardId: z.string(),
+  boardId: ObjectIdString,
   seq: z.number().int().positive(),
   title: z.string().min(1),
   type: TicketType,
   status: TicketStatus,
   runner: RunnerName,
   spec: SpecSchema,
-  activeRunId: z.string().nullable().default(null),
-  prUrl: z.string().url().nullable().default(null),
+  activeRunId: ObjectIdString.nullable().default(null),
+  prUrl: HttpUrlString.nullable().default(null),
   activity: z.array(ActivityEntry).default([]),
 });
 export type Ticket = z.infer<typeof TicketSchema>;
@@ -55,7 +93,7 @@ export type Ticket = z.infer<typeof TicketSchema>;
 export const BoardSchema = z.object({
   slug: z.string().regex(/^[a-z0-9-]+$/),
   name: z.string().min(1),
-  repoPath: z.string().min(1),
+  repoPath: AbsolutePathString,
   defaultBaseBranch: z.string().min(1),
 });
 export type Board = z.infer<typeof BoardSchema>;
@@ -71,15 +109,52 @@ export const RunStatus = z.enum([
 ]);
 
 export const RunSchema = z.object({
-  ticketId: z.string(),
-  boardId: z.string(),
+  ticketId: ObjectIdString,
+  boardId: ObjectIdString,
   runner: RunnerName,
   phase: RunPhase,
   status: RunStatus,
-  workDir: z.string(),
-  promptFile: z.string(),
-  logFile: z.string(),
+  workDir: AbsolutePathString,
+  promptFile: AbsolutePathString,
+  logFile: AbsolutePathString,
   exitCode: z.number().int().nullable().default(null),
   summary: z.string().nullable().default(null),
 });
 export type Run = z.infer<typeof RunSchema>;
+
+// --- Client input schemas (consumed by Task 4) --------------------------
+// These are the shapes the browser is allowed to submit. They are `.strict()`
+// so a client cannot smuggle server-owned fields, and they intentionally drop
+// the persisted defaults: an update must send every spec field explicitly, so
+// a partial payload can never silently erase scope/nonGoals/etc. via defaults.
+
+export const SpecInputSchema = z
+  .object({
+    intent: z.string().min(1),
+    scope: z.string(),
+    nonGoals: z.string(),
+    acceptance: z.array(z.string()),
+    links: z.array(z.string()),
+    risk: Risk,
+  })
+  .strict();
+export type SpecInput = z.infer<typeof SpecInputSchema>;
+
+export const CreateTicketInputSchema = z
+  .object({
+    boardId: ObjectIdString,
+    title: z.string().min(1),
+    type: TicketType,
+    runner: RunnerName,
+    spec: SpecInputSchema,
+  })
+  .strict();
+export type CreateTicketInput = z.infer<typeof CreateTicketInputSchema>;
+
+export const UpdateSpecInputSchema = z
+  .object({
+    ticketId: ObjectIdString,
+    spec: SpecInputSchema,
+  })
+  .strict();
+export type UpdateSpecInput = z.infer<typeof UpdateSpecInputSchema>;
