@@ -5,9 +5,9 @@ default:
 dev:
     bun run dev
 
-# Start local MongoDB
+# Start local MongoDB (returns only once healthy)
 db-up:
-    docker compose up -d
+    docker compose up -d --wait
 
 # Stop local MongoDB
 db-down:
