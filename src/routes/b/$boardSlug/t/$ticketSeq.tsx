@@ -9,6 +9,7 @@ import {
 } from "../../../../components/TicketCard";
 import { GateButtons } from "../../../../components/GateButtons";
 import { OverlayPanel } from "../../../../components/OverlayPanel";
+import { RunsSection } from "../../../../components/RunsSection";
 
 export const Route = createFileRoute("/b/$boardSlug/t/$ticketSeq")({
   component: TicketDetailPage,
@@ -85,6 +86,8 @@ function TicketDetail({ ticket }: { ticket: TicketDTO }) {
       </div>
 
       <GateButtons ticket={ticket} />
+
+      <RunsSection key={ticket._id} ticket={ticket} />
 
       <section aria-labelledby="detail-meta">
         <SectionHeading id="detail-meta">Metadata</SectionHeading>
