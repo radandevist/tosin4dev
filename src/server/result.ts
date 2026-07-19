@@ -31,10 +31,10 @@ export class ServerResultError extends Error {
 // explicit typed schema is kept at the call site (retaining typed variables);
 // `run` is the core function, which may still throw and is integration-tested
 // directly — any throw is caught and mapped into the error union.
-export async function boundary<I, O>(
-  schema: z.ZodType<I>,
+export async function boundary<Schema extends z.ZodTypeAny, O>(
+  schema: Schema,
   raw: unknown,
-  run: (input: I) => O | Promise<O>,
+  run: (input: z.output<Schema>) => O | Promise<O>,
 ): Promise<ServerResult<O>> {
   const parsed = schema.safeParse(raw);
   if (!parsed.success) {
