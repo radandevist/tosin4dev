@@ -7,12 +7,9 @@ dist-ssr/
 .output/
 .nitro/
 .vinxi/
-.wrangler/
 
 # TanStack / tooling caches
 .tanstack/
-__unconfig*
-todos.json
 
 # runner runtime (worktrees, run logs, prompts)
 .tosin4dev/
@@ -20,7 +17,6 @@ todos.json
 # env & secrets
 .env
 .env.local
-*.local
 
 # misc
 .dump/
