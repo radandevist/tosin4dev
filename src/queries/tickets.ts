@@ -1,14 +1,20 @@
 import { createMutation, createQuery } from "react-query-kit";
-import type { CreateTicketInput, UpdateSpecInput } from "../domain/schemas";
+import type {
+  CreateTicketInput,
+  SetRunnerInput,
+  UpdateSpecInput,
+} from "../domain/schemas";
 import {
   createTicket,
   getTicket,
   listTickets,
+  setRunner,
   transitionTicket,
   updateSpec,
   type TicketDTO,
   type TransitionInput,
 } from "../server/tickets";
+import { unwrapResult } from "../server/result";
 
 // Keys are stable and variable-scoped: react-query-kit appends the hook's
 // variables to the root segment, so ["tickets", { boardId }] and
@@ -17,7 +23,7 @@ import {
 
 export const useTickets = createQuery<TicketDTO[], { boardId: string }>({
   queryKey: ["tickets"],
-  fetcher: (variables) => listTickets({ data: variables }),
+  fetcher: (variables) => listTickets({ data: variables }).then(unwrapResult),
 });
 
 export const useTicket = createQuery<
@@ -25,22 +31,27 @@ export const useTicket = createQuery<
   { boardId: string; seq: number }
 >({
   queryKey: ["ticket"],
-  fetcher: (variables) => getTicket({ data: variables }),
+  fetcher: (variables) => getTicket({ data: variables }).then(unwrapResult),
 });
 
 export const useCreateTicket = createMutation<
   { id: string; seq: number },
   CreateTicketInput
 >({
-  mutationFn: (variables) => createTicket({ data: variables }),
+  mutationFn: (variables) => createTicket({ data: variables }).then(unwrapResult),
 });
 
 export const useUpdateSpec = createMutation<void, UpdateSpecInput>({
-  mutationFn: (variables) => updateSpec({ data: variables }),
+  mutationFn: (variables) => updateSpec({ data: variables }).then(unwrapResult),
+});
+
+export const useSetRunner = createMutation<void, SetRunnerInput>({
+  mutationFn: (variables) => setRunner({ data: variables }).then(unwrapResult),
 });
 
 export const useTransition = createMutation<{ status: string }, TransitionInput>(
   {
-    mutationFn: (variables) => transitionTicket({ data: variables }),
+    mutationFn: (variables) =>
+      transitionTicket({ data: variables }).then(unwrapResult),
   },
 );

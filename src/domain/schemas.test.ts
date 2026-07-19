@@ -3,7 +3,9 @@ import {
   BoardSchema,
   CreateTicketInputSchema,
   RunSchema,
+  SetRunnerInputSchema,
   SpecInputSchema,
+  SpecSchema,
   TicketSchema,
   TicketStatus,
   TicketType,
@@ -82,6 +84,7 @@ describe("schemas", () => {
     expect(t.spec.acceptance).toEqual([]);
     expect(t.spec.links).toEqual([]);
     expect(t.spec.approvedAt).toBeNull();
+    expect(t.spec.approvedBy).toBeNull();
     expect(t.activeRunId).toBeNull();
     expect(t.prUrl).toBeNull();
     expect(t.activity).toEqual([]);
@@ -166,6 +169,25 @@ describe("input schemas (client boundary)", () => {
     ).toThrow();
   });
 
+  it("rejects approvedBy smuggled into a spec input (strict)", () => {
+    expect(() =>
+      SpecInputSchema.parse({ ...validSpecInput, approvedBy: "radan" }),
+    ).toThrow();
+  });
+
+  it("defaults persisted spec approval metadata to null and pins approvedBy to radan", () => {
+    const spec = SpecSchema.parse({ intent: "ship" });
+    expect(spec.approvedAt).toBeNull();
+    expect(spec.approvedBy).toBeNull();
+    expect(
+      SpecSchema.safeParse({ intent: "ship", approvedBy: "radan" }).success,
+    ).toBe(true);
+    expect(
+      SpecSchema.safeParse({ intent: "ship", approvedBy: "someone-else" })
+        .success,
+    ).toBe(false);
+  });
+
   it("rejects a spec input that omits a required field", () => {
     const withoutScope = {
       intent: validSpecInput.intent,
@@ -185,6 +207,40 @@ describe("input schemas (client boundary)", () => {
         type: "implement",
         runner: "claude",
         spec: validSpecInput,
+      }),
+    ).toThrow();
+  });
+});
+
+describe("setRunner input schema (client boundary)", () => {
+  const TICKET = "89abcdef0123456789abcdef";
+
+  it("accepts a valid ticketId + runner", () => {
+    const parsed = SetRunnerInputSchema.parse({
+      ticketId: TICKET,
+      runner: "codex",
+    });
+    expect(parsed.runner).toBe("codex");
+  });
+
+  it("rejects an unknown runner", () => {
+    expect(() =>
+      SetRunnerInputSchema.parse({ ticketId: TICKET, runner: "gemini" }),
+    ).toThrow();
+  });
+
+  it("rejects an invalid ticket ObjectId", () => {
+    expect(() =>
+      SetRunnerInputSchema.parse({ ticketId: "nope", runner: "claude" }),
+    ).toThrow();
+  });
+
+  it("rejects extra keys (strict)", () => {
+    expect(() =>
+      SetRunnerInputSchema.parse({
+        ticketId: TICKET,
+        runner: "claude",
+        status: "running",
       }),
     ).toThrow();
   });

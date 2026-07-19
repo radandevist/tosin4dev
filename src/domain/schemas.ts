@@ -63,6 +63,10 @@ export const SpecSchema = z.object({
   links: z.array(z.string()).default([]),
   risk: Risk.default("low"),
   approvedAt: z.string().datetime().nullable().default(null),
+  // Approval is a single-operator action: the only non-null value is "radan".
+  // Server-owned like approvedAt — the input schemas below omit both, so a
+  // client can neither set nor clear approval, only the server can.
+  approvedBy: z.literal("radan").nullable().default(null),
 });
 export type Spec = z.infer<typeof SpecSchema>;
 
@@ -158,3 +162,14 @@ export const UpdateSpecInputSchema = z
   })
   .strict();
 export type UpdateSpecInput = z.infer<typeof UpdateSpecInputSchema>;
+
+// Changing a ticket's runner is a targeted mutation: only the ticket id and
+// the new runner cross the boundary. `.strict()` keeps every other field
+// server-owned.
+export const SetRunnerInputSchema = z
+  .object({
+    ticketId: ObjectIdString,
+    runner: RunnerName,
+  })
+  .strict();
+export type SetRunnerInput = z.infer<typeof SetRunnerInputSchema>;

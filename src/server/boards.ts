@@ -3,6 +3,7 @@ import type { WithId } from "mongodb";
 import { z } from "zod";
 import { BoardSchema, type Board } from "../domain/schemas";
 import { db } from "./db";
+import { boundary, type ServerResult } from "./result";
 
 // Persisted board document: the validated board fields plus the server-owned
 // audit timestamps. `_id` is added by Mongo and stripped into a string on the
@@ -51,15 +52,28 @@ export async function getBoardCore(slug: string): Promise<BoardDTO> {
 }
 
 // --- Server functions (client transport) --------------------------------
+// Each handler takes raw `unknown` and runs it through `boundary`, which
+// safeParses against the explicit typed schema and returns a ServerResult —
+// validation failures come back as { ok: false } instead of throwing out of
+// the transport. The core functions keep throwing and stay integration-tested.
 
-export const listBoards = createServerFn({ method: "GET" }).handler(() =>
-  listBoardsCore(),
+const passthrough = (data: unknown): unknown => data;
+
+export const listBoards = createServerFn({ method: "GET" }).handler(
+  (): Promise<ServerResult<BoardDTO[]>> =>
+    boundary(z.unknown(), undefined, () => listBoardsCore()),
 );
 
 export const createBoard = createServerFn({ method: "POST" })
-  .validator(BoardSchema)
-  .handler(({ data }) => createBoardCore(data));
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
+    boundary(BoardSchema, data, createBoardCore),
+  );
 
 export const getBoard = createServerFn({ method: "GET" })
-  .validator(z.object({ slug: z.string().min(1) }).strict())
-  .handler(({ data }) => getBoardCore(data.slug));
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<BoardDTO>> =>
+    boundary(z.object({ slug: z.string().min(1) }).strict(), data, (input) =>
+      getBoardCore(input.slug),
+    ),
+  );

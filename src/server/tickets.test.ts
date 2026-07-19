@@ -10,6 +10,7 @@ const {
   createTicketCore,
   getTicketCore,
   listTicketsCore,
+  setRunnerCore,
   transitionTicketCore,
   updateSpecCore,
   TransitionInputSchema,
@@ -64,6 +65,7 @@ describe("tickets server functions", () => {
     expect(dto.activeRunId).toBeNull();
     expect(dto.prUrl).toBeNull();
     expect(dto.spec.approvedAt).toBeNull();
+    expect(dto.spec.approvedBy).toBeNull();
     expect(typeof dto.createdAt).toBe("string");
     expect(typeof dto.updatedAt).toBe("string");
   });
@@ -143,6 +145,7 @@ describe("tickets server functions", () => {
       expect(status).toBe("approved");
       const dto = await getTicketCore(BOARD_ID, 1);
       expect(typeof dto.spec.approvedAt).toBe("string");
+      expect(dto.spec.approvedBy).toBe("radan");
     });
 
     it("rejects a stale transition atomically (only one concurrent winner)", async () => {
@@ -183,6 +186,7 @@ describe("tickets server functions", () => {
       const dto = await getTicketCore(BOARD_ID, 1);
       expect(dto.spec.intent).toBe("revised intent");
       expect(dto.spec.approvedAt).toBeNull();
+      expect(dto.spec.approvedBy).toBeNull();
     });
 
     it("rejects updateSpec for a missing ticket", async () => {
@@ -206,6 +210,64 @@ describe("tickets server functions", () => {
       const dto = await getTicketCore(BOARD_ID, 1);
       expect(dto.activity.length).toBe(50);
     });
+  });
+
+  describe("setRunner", () => {
+    it("updates the runner and stamps activity + updatedAt", async () => {
+      await (await tickets()).deleteMany({});
+      const { id } = await createTicketCore(makeInput({ runner: "claude" }));
+      const before = await getTicketCore(BOARD_ID, 1);
+
+      await setRunnerCore({ ticketId: id, runner: "codex" });
+
+      const after = await getTicketCore(BOARD_ID, 1);
+      expect(after.runner).toBe("codex");
+      expect(after.updatedAt >= before.updatedAt).toBe(true);
+      const runnerEntries = after.activity.filter((a) => a.kind === "runner");
+      expect(runnerEntries).toHaveLength(1);
+      expect(runnerEntries[0].message).toMatch(/codex/);
+    });
+
+    it("caps activity at the last 50 entries on repeated runner changes", async () => {
+      await (await tickets()).deleteMany({});
+      const { id } = await createTicketCore(makeInput());
+      for (let i = 0; i < 55; i++) {
+        await setRunnerCore({
+          ticketId: id,
+          runner: i % 2 === 0 ? "codex" : "claude",
+        });
+      }
+      const dto = await getTicketCore(BOARD_ID, 1);
+      expect(dto.activity.length).toBe(50);
+    });
+
+    it("rejects setRunner for a missing ticket", async () => {
+      await expect(
+        setRunnerCore({
+          ticketId: "ffffffffffffffffffffffff",
+          runner: "codex",
+        }),
+      ).rejects.toThrow(/not found/i);
+    });
+  });
+
+  it("accepts many null activeRunId docs but rejects a duplicate run id (partial unique index)", async () => {
+    const c = await tickets();
+    await c.deleteMany({});
+    // Touching db() ensures the partial unique index on activeRunId exists.
+    const runId = "0123456789abcdef01234567";
+
+    // Idle tickets carry activeRunId=null, which the partial filter excludes —
+    // so any number of them coexist.
+    await c.insertOne({ boardId: BOARD_ID, seq: 1, activeRunId: null });
+    await c.insertOne({ boardId: BOARD_ID, seq: 2, activeRunId: null });
+
+    // The first non-null run id is accepted...
+    await c.insertOne({ boardId: BOARD_ID, seq: 3, activeRunId: runId });
+    // ...but the same run id attached to a second ticket is rejected.
+    await expect(
+      c.insertOne({ boardId: BOARD_ID, seq: 4, activeRunId: runId }),
+    ).rejects.toThrow();
   });
 
   it("enforces unique boardId+seq via the index", async () => {
