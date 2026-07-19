@@ -28,6 +28,20 @@ export const EventSchema = z.enum([
 ]);
 export type Event = z.infer<typeof EventSchema>;
 
+// The subset of events a human may trigger from the UI. Derived from
+// `EventSchema` (never hand-listed) by excluding the three machine/supervisor
+// events — `dispatch`, `run_succeeded`, `run_failed` — so a browser can request
+// a spec submit/approval, a resume, a final approval/changes, or an archive,
+// but can never forge a run outcome or a dispatch. The server boundary
+// (`transitionTicket`) validates its `event` input against this, while the
+// supervisor keeps calling `transition` with the full `Event` vocabulary.
+export const PublicEventSchema = EventSchema.exclude([
+  "dispatch",
+  "run_succeeded",
+  "run_failed",
+]);
+export type PublicEvent = z.infer<typeof PublicEventSchema>;
+
 // The only keys the table may hold: a legal `${status}:${event}` string for
 // every non-archive event. Typing TABLE against this union makes a misspelled
 // status or event key a compile error, while `Partial` still lets us omit the
