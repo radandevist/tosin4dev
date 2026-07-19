@@ -8,7 +8,7 @@ import {
   TYPE_LABELS,
 } from "../../../../components/TicketCard";
 import { GateButtons } from "../../../../components/GateButtons";
-import { OverlayPanel } from "../new";
+import { OverlayPanel } from "../../../../components/OverlayPanel";
 
 export const Route = createFileRoute("/b/$boardSlug/t/$ticketSeq")({
   component: TicketDetailPage,
