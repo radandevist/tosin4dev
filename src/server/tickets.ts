@@ -4,14 +4,17 @@ import { z } from "zod";
 import {
   CreateTicketInputSchema,
   ObjectIdString,
+  SetRunnerInputSchema,
   TicketStatus,
   UpdateSpecInputSchema,
   type CreateTicketInput,
+  type SetRunnerInput,
   type Ticket,
   type UpdateSpecInput,
 } from "../domain/schemas";
 import { PublicEventSchema, transition } from "../domain/stateMachine";
 import { db, ObjectId } from "./db";
+import { boundary, type ServerResult } from "./result";
 
 // Persisted ticket document: the validated ticket fields plus server-owned
 // audit timestamps. `_id` is added by Mongo and stripped to a string on the
@@ -117,7 +120,7 @@ export async function createTicketCore(
       type: input.type,
       status: "inbox",
       runner: input.runner,
-      spec: { ...input.spec, approvedAt: null },
+      spec: { ...input.spec, approvedAt: null, approvedBy: null },
       activeRunId: null,
       prUrl: null,
       activity: [{ at, kind: "lifecycle", message: "ticket created" }],
@@ -141,16 +144,34 @@ export async function updateSpecCore(input: UpdateSpecInput): Promise<void> {
   const at = now();
 
   // Editing the spec clears any prior approval: an approved spec that changes
-  // must be re-approved, so approvedAt is reset to null here (and the input
-  // schema never lets a client send approvedAt in the first place).
+  // must be re-approved, so both approval fields are reset to null here (and the
+  // input schema never lets a client send approvedAt/approvedBy in the first
+  // place).
   const res = await coll.updateOne(
     { _id: new ObjectId(input.ticketId) },
     {
       $set: {
-        spec: { ...input.spec, approvedAt: null },
+        spec: { ...input.spec, approvedAt: null, approvedBy: null },
         updatedAt: at,
       },
       $push: pushActivity("spec", "spec updated", at),
+    },
+  );
+
+  if (res.matchedCount === 0) {
+    throw new Error(`ticket not found: ${input.ticketId}`);
+  }
+}
+
+export async function setRunnerCore(input: SetRunnerInput): Promise<void> {
+  const coll = await tickets();
+  const at = now();
+
+  const res = await coll.updateOne(
+    { _id: new ObjectId(input.ticketId) },
+    {
+      $set: { runner: input.runner, updatedAt: at },
+      $push: pushActivity("runner", `runner set to ${input.runner}`, at),
     },
   );
 
@@ -175,10 +196,11 @@ export async function transitionTicketCore(
   const at = now();
 
   const set: Partial<TicketDoc> = { status: to, updatedAt: at };
-  // Approval timestamp is server-owned: stamped only on approve_spec, from the
-  // already-loaded spec so we never touch other spec fields.
+  // Approval metadata is server-owned: stamped only on approve_spec, from the
+  // already-loaded spec so we never touch other spec fields. approvedBy is
+  // pinned to the sole operator, "radan".
   if (input.event === "approve_spec") {
-    set.spec = { ...doc.spec, approvedAt: at };
+    set.spec = { ...doc.spec, approvedAt: at, approvedBy: "radan" };
   }
 
   // Optimistic concurrency: the update only lands if the ticket is still in the
@@ -202,25 +224,54 @@ export async function transitionTicketCore(
 }
 
 // --- Server functions (client transport) --------------------------------
+// Every handler takes raw `unknown` and runs it through `boundary`, which
+// safeParses against the explicit typed schema and returns a ServerResult —
+// so a validation failure surfaces as { ok: false } rather than throwing out
+// of the transport before the handler runs. The core functions keep throwing
+// and stay directly integration-tested above.
+
+const passthrough = (data: unknown): unknown => data;
 
 export const listTickets = createServerFn({ method: "GET" })
-  .validator(z.object({ boardId: ObjectIdString }).strict())
-  .handler(({ data }) => listTicketsCore(data.boardId));
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<TicketDTO[]>> =>
+    boundary(z.object({ boardId: ObjectIdString }).strict(), data, (input) =>
+      listTicketsCore(input.boardId),
+    ),
+  );
 
 export const getTicket = createServerFn({ method: "GET" })
-  .validator(
-    z.object({ boardId: ObjectIdString, seq: z.number().int().positive() }).strict(),
-  )
-  .handler(({ data }) => getTicketCore(data.boardId, data.seq));
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<TicketDTO>> =>
+    boundary(
+      z
+        .object({ boardId: ObjectIdString, seq: z.number().int().positive() })
+        .strict(),
+      data,
+      (input) => getTicketCore(input.boardId, input.seq),
+    ),
+  );
 
 export const createTicket = createServerFn({ method: "POST" })
-  .validator(CreateTicketInputSchema)
-  .handler(({ data }) => createTicketCore(data));
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<{ id: string; seq: number }>> =>
+    boundary(CreateTicketInputSchema, data, createTicketCore),
+  );
 
 export const updateSpec = createServerFn({ method: "POST" })
-  .validator(UpdateSpecInputSchema)
-  .handler(({ data }) => updateSpecCore(data));
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<void>> =>
+    boundary(UpdateSpecInputSchema, data, updateSpecCore),
+  );
+
+export const setRunner = createServerFn({ method: "POST" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<void>> =>
+    boundary(SetRunnerInputSchema, data, setRunnerCore),
+  );
 
 export const transitionTicket = createServerFn({ method: "POST" })
-  .validator(TransitionInputSchema)
-  .handler(({ data }) => transitionTicketCore(data));
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<{ status: string }>> =>
+    boundary(TransitionInputSchema, data, transitionTicketCore),
+  );
