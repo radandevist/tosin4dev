@@ -1,10 +1,10 @@
-import type { Board, Ticket } from "../domain/schemas";
+import type { Board, Run, Ticket } from "../domain/schemas";
 
 export interface RunnerBrief {
   ticket: Ticket;
   board: Board;
   workDir: string;
-  phase: "spec_draft" | "execute" | "review_fix";
+  phase: Run["phase"];
 }
 
 export interface RunnerCommand {

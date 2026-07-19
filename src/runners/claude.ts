@@ -2,7 +2,7 @@ import type { RunnerAdapter } from "./types";
 
 export const claudeAdapter: RunnerAdapter = {
   name: "claude",
-  buildCommand({ workDir }, promptFile) {
+  buildCommand(_brief, promptFile) {
     return {
       cmd: [
         "claude",
@@ -11,7 +11,7 @@ export const claudeAdapter: RunnerAdapter = {
         "--output-format",
         "text",
       ],
-      env: { CLAUDE_CWD: workDir },
+      env: {},
     };
   },
 };
