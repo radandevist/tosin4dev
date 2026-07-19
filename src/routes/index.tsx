@@ -6,11 +6,11 @@ import { useBoards, useCreateBoard } from "../queries/boards";
 
 export const Route = createFileRoute("/")({ component: Home });
 
-const EMPTY_FORM: Board = {
+export const DEFAULT_BOARD: Board = {
   slug: "",
   name: "",
   repoPath: "",
-  defaultBaseBranch: "main",
+  defaultBaseBranch: "develop",
 };
 
 function Home() {
@@ -67,7 +67,7 @@ function BoardList() {
                     {board.name}
                   </span>
                   <span className="block font-mono text-xs text-zinc-400">
-                    {board.slug}
+                    {board.repoPath}
                   </span>
                 </span>
                 <span className="font-mono text-xs text-zinc-500">
@@ -85,7 +85,7 @@ function BoardList() {
 function CreateBoardForm() {
   const queryClient = useQueryClient();
   const createBoard = useCreateBoard();
-  const [form, setForm] = useState<Board>(EMPTY_FORM);
+  const [form, setForm] = useState<Board>(DEFAULT_BOARD);
 
   const set = <K extends keyof Board>(key: K, value: Board[K]) =>
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -95,7 +95,7 @@ function CreateBoardForm() {
     createBoard.mutate(form, {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: useBoards.getKey() });
-        setForm(EMPTY_FORM);
+        setForm(DEFAULT_BOARD);
       },
     });
   };
@@ -153,7 +153,7 @@ function CreateBoardForm() {
             required
             value={form.defaultBaseBranch}
             onChange={(e) => set("defaultBaseBranch", e.target.value)}
-            placeholder="main"
+            placeholder="develop"
             className={`${inputClass} font-mono`}
           />
         </Field>

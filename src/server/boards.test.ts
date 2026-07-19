@@ -7,7 +7,7 @@ process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 
 const { db, closeDb } = await import("./db");
 const { createBoardCore, getBoardCore, listBoardsCore } = await import(
-  "./boards"
+  "./boards.server"
 );
 
 const BOARD = {

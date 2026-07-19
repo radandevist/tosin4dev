@@ -57,6 +57,18 @@ const RUNNER_LABELS: Record<Runner, string> = {
   codex: "Codex",
 };
 
+export function RiskLabel({ risk }: { risk: Risk }) {
+  return (
+    <>
+      <span
+        aria-hidden="true"
+        className={`size-1.5 rounded-full ${RISK_DOT[risk]}`}
+      />
+      <span>{RISK_LABELS[risk]}</span>
+    </>
+  );
+}
+
 // Group a board's tickets into its seven columns. Pure and exported so it can be
 // unit-tested and reused without pulling in React. Tickets whose status is not a
 // board column (e.g. `archived`) are dropped from the board view.
@@ -103,10 +115,8 @@ export function TicketCard({
 
       <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
         <span className="inline-flex items-center gap-1.5">
-          <span
-            aria-hidden="true"
-            className={`size-1.5 rounded-full ${RISK_DOT[ticket.spec.risk]}`}
-          />
+          <RiskLabel risk={ticket.spec.risk} />
+          <span aria-hidden="true">·</span>
           {RUNNER_LABELS[ticket.runner]}
         </span>
         {ticket.prUrl ? (

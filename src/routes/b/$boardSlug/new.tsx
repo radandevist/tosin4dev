@@ -108,6 +108,11 @@ function NewTicketPage() {
   return (
     <OverlayPanel title="New ticket" onClose={close}>
       <form onSubmit={handleSubmit} className="space-y-4">
+        <BoardDependencyNotice
+          isPending={board.isPending}
+          error={board.isError ? board.error : null}
+        />
+
         <Field label="Title" htmlFor="ticket-title">
           <input
             id="ticket-title"
@@ -238,6 +243,30 @@ function NewTicketPage() {
       </form>
     </OverlayPanel>
   );
+}
+
+export function BoardDependencyNotice({
+  isPending,
+  error,
+}: {
+  isPending: boolean;
+  error: Error | null;
+}) {
+  if (isPending) {
+    return (
+      <p role="status" className="text-sm text-zinc-500">
+        Loading board…
+      </p>
+    );
+  }
+  if (error) {
+    return (
+      <p role="alert" className="text-sm text-rose-600">
+        Could not load board: {error.message}
+      </p>
+    );
+  }
+  return null;
 }
 
 const inputClass =
