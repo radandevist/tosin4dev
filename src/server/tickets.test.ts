@@ -13,8 +13,8 @@ const {
   setRunnerCore,
   transitionTicketCore,
   updateSpecCore,
-  TransitionInputSchema,
-} = await import("./tickets");
+} = await import("./tickets.server");
+const { TransitionInputSchema } = await import("./tickets");
 const { CreateTicketInputSchema, UpdateSpecInputSchema } = await import(
   "../domain/schemas"
 );

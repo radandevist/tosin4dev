@@ -52,6 +52,9 @@ const TONE_CLASS: Record<Gate["tone"], string> = {
     "border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50 focus-visible:outline-zinc-900",
 };
 
+export const APPROVED_MESSAGE =
+  "Ready to run — use the Run button below to dispatch manually.";
+
 export function GateButtons({ ticket }: { ticket: TicketDTO }) {
   const queryClient = useQueryClient();
   const transition = useTransition();
@@ -71,7 +74,7 @@ export function GateButtons({ ticket }: { ticket: TicketDTO }) {
   if (ticket.status === "approved") {
     return (
       <p className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
-        Ready to run — the supervisor will dispatch this ticket to its runner.
+        {APPROVED_MESSAGE}
       </p>
     );
   }
