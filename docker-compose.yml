@@ -1,11 +1,11 @@
 services:
   mongo:
-    image: mongo:8.2.11@sha256:951c2ff9fc6bdb6cb89b1dfea4a0e8ae3ee4fb287c0bf579b2bba54c7803f75d
+    image: mongo:7.0.28-jammy@sha256:88785f6f665ab817955ec1cb4f05b7b9c76947023086401413085cd1fff091a4
     restart: unless-stopped
     ports:
       - "127.0.0.1:27017:27017"
     volumes:
-      - mongo-data:/data/db
+      - mongo-data-v7-jammy:/data/db
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -14,4 +14,4 @@ services:
       start_period: 20s
 
 volumes:
-  mongo-data:
+  mongo-data-v7-jammy:
