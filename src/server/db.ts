@@ -12,6 +12,10 @@ import { type Db, MongoClient, ObjectId } from "mongodb";
 // hands out client.db() before connect() resolves).
 const globalForDb = globalThis as typeof globalThis & {
   __tosin4devDb?: Promise<Db> | null;
+  // The connected client is cached alongside the Db promise so tests (and any
+  // graceful-shutdown path) can close the pool via closeDb(). Db has no public
+  // client getter, so we keep our own reference.
+  __tosin4devClient?: MongoClient | null;
 };
 
 async function connect(): Promise<Db> {
@@ -22,6 +26,7 @@ async function connect(): Promise<Db> {
   try {
     await client.connect();
     const database = client.db();
+    globalForDb.__tosin4devClient = client;
 
     // createIndex is idempotent: identical spec + options is a no-op after the
     // first call, so running these on every cold start is safe.
@@ -55,9 +60,20 @@ async function connect(): Promise<Db> {
     // Connection or index initialization failed. Close the (possibly
     // half-open) client so we don't leak its connection pool, then rethrow so
     // db() can clear the cache and let a later call retry from scratch.
+    globalForDb.__tosin4devClient = null;
     await client.close().catch(() => {});
     throw err;
   }
+}
+
+// Close and forget the cached client. Primarily for test teardown so a suite
+// can drop its database and release the connection pool; a later db() call
+// re-connects from scratch.
+export async function closeDb(): Promise<void> {
+  const client = globalForDb.__tosin4devClient;
+  globalForDb.__tosin4devDb = null;
+  globalForDb.__tosin4devClient = null;
+  if (client) await client.close().catch(() => {});
 }
 
 export function db(): Promise<Db> {
