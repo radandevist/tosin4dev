@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Collection, Db } from "mongodb";
+import type { Collection, Db, WithId } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Board, Run, Ticket } from "../domain/schemas";
 
@@ -86,7 +86,7 @@ async function waitForRun(
   runId: string,
   expected: Run["status"],
   timeoutMs = 15_000,
-): Promise<RunDoc> {
+): Promise<WithId<RunDoc>> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const run = await runs.findOne({ _id: new ObjectId(runId) });
@@ -205,7 +205,10 @@ describe("runner outcomes", () => {
     });
     const ticketId = await insertApproved(3);
     const { runId } = await dispatchRun(ticketId, "execute");
-    await waitForRun(runId, "awaiting_input");
+    const parkedRun = await waitForRun(runId, "awaiting_input");
+    const originalWorkDir = parkedRun.workDir;
+    const originalBranch = parkedRun.branch;
+    const originalExecutionSessionId = parkedRun.executionSessionId;
 
     await rm(join(binDirectory, "claude"), { force: true });
     process.env.PATH = binDirectory;
@@ -219,6 +222,27 @@ describe("runner outcomes", () => {
     expect(ticket?.activeRunId).toBe(runId);
     expect(run?.status).toBe("awaiting_input");
     expect(run?.awaitingQuestion).toBe("Which auth library?");
+    expect(run?.pid).toBeNull();
+    expect(run?.startedAt).toBe(parkedRun.startedAt);
+
+    process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
+    await writeRunner();
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "completed",
+      summary: "done after retry",
+    });
+    await provideInputCore({ ticketId, answer: "use lucia" });
+
+    const retriedRun = await waitForRun(runId, "succeeded");
+    const retriedTicket = await tickets.findOne({
+      _id: new ObjectId(ticketId),
+    });
+    expect(retriedTicket?.status).toBe("review_ready");
+    expect(retriedRun._id.toString()).toBe(runId);
+    expect(retriedRun.verdict).toBe("passed");
+    expect(retriedRun.workDir).toBe(originalWorkDir);
+    expect(retriedRun.branch).toBe(originalBranch);
+    expect(retriedRun.executionSessionId).toBe(originalExecutionSessionId);
   }, 20_000);
 
   it("sends a completed outcome through verification", async () => {
