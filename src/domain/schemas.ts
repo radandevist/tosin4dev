@@ -240,3 +240,44 @@ export const SetRunnerInputSchema = z
   })
   .strict();
 export type SetRunnerInput = z.infer<typeof SetRunnerInputSchema>;
+
+// --- Chat (brainstorm → draft → ticket) ---------------------------------
+// A single chat session's provider conversation. Turn-based: each user turn
+// is a batch `claude -p` call surfaced by polling. `turnStatus` is the
+// session-level turn state; a failed turn is retryable (session stays usable).
+
+export const ChatMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  text: z.string(),
+  at: z.string().datetime(),
+});
+export type ChatMessage = z.infer<typeof ChatMessageSchema>;
+
+export const ChatTurnStatus = z.enum(["idle", "pending", "error"]);
+
+// What draftSpecFromChat asks the model to emit — a superset of the ticket
+// input minus server-owned fields. `.strict()` so a stray key fails closed.
+export const ChatDraftSchema = z
+  .object({
+    title: z.string().min(1),
+    type: TicketType,
+    runner: RunnerName,
+    spec: SpecInputSchema,
+  })
+  .strict();
+export type ChatDraft = z.infer<typeof ChatDraftSchema>;
+
+// Persisted chat session's validated fields. Defaults are retained so stored
+// documents always hydrate with every field present (as with TicketSchema).
+export const ChatSessionSchema = z.object({
+  boardId: ObjectIdString,
+  provider: z.literal("claude").default("claude"),
+  sessionId: z.string().nullable().default(null),
+  status: z.enum(["active", "ticket_created", "abandoned"]).default("active"),
+  turnStatus: ChatTurnStatus.default("idle"),
+  turnError: z.string().nullable().default(null),
+  messages: z.array(ChatMessageSchema).default([]),
+  proposedSpec: ChatDraftSchema.nullable().default(null),
+  ticketId: ObjectIdString.nullable().default(null),
+});
+export type ChatSession = z.infer<typeof ChatSessionSchema>;
