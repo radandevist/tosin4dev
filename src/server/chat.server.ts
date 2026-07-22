@@ -15,14 +15,13 @@ import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
 import {
   drainStream,
-  isProcessAlive,
   settledExit,
   waitForSpawn,
 } from "./supervisor.server";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
 
-const STUCK_TURN_MS = 5 * 60 * 1000;
+export const STUCK_TURN_MS = 5 * 60 * 1000;
 
 interface RunningTurn {
   stdout: Promise<string>;
@@ -108,6 +107,7 @@ async function monitorChatTurn(
       {
         $set: {
           turnStatus: "idle",
+          turnError: null,
           pendingKind: null,
           pendingUserMessageAt: null,
           pid: null,
@@ -130,6 +130,7 @@ async function monitorChatTurn(
     {
       $set: {
         turnStatus: "idle",
+        turnError: null,
         pendingKind: null,
         pendingUserMessageAt: null,
         pid: null,
@@ -161,8 +162,6 @@ export async function startChatTurn(
 
   const at = now();
   const logFile = `${board.repoPath}/.tosin4dev/chat/${sessionId}/turn.log`;
-  await mkdir(dirname(logFile), { recursive: true });
-  await writeFile(logFile, "");
 
   const claim = await coll.updateOne(
     { _id: new ObjectId(sessionId), turnStatus: { $ne: "pending" } },
@@ -184,6 +183,8 @@ export async function startChatTurn(
   if (claim.matchedCount === 0) {
     throw new ServerResultError("conflict", "a turn is already in progress");
   }
+  await mkdir(dirname(logFile), { recursive: true });
+  await writeFile(logFile, "");
 
   let child: ChildProcess | undefined;
   let running: RunningTurn | undefined;
@@ -220,9 +221,9 @@ export async function startChatTurn(
   }
 }
 
-// Light boot/stuck reconcile: a session left `pending` by a crash (dead pid or
-// a turn older than STUCK_TURN_MS) is failed so it becomes retryable. Called on
-// read; full daemon recovery is out of scope (a stuck brainstorm is low-stakes).
+// Light boot/stuck reconcile: a session left `pending` past STUCK_TURN_MS is
+// failed so it becomes retryable. Called on read; full daemon recovery is out
+// of scope (a stuck brainstorm is low-stakes).
 export async function reconcileChatSession(
   doc: WithId<ChatSessionDoc>,
 ): Promise<void> {
@@ -230,13 +231,27 @@ export async function reconcileChatSession(
   const stale =
     doc.pendingUserMessageAt !== null &&
     Date.now() - new Date(doc.pendingUserMessageAt).getTime() > STUCK_TURN_MS;
-  // A null pid means the turn is still starting: claimed (turnStatus:"pending")
-  // but the pid is written only AFTER waitForSpawn resolves. A concurrent poll
-  // hitting that window must NOT reap a healthy turn — treat null pid as alive
-  // unless it has gone stale. Only reap a turn whose RECORDED pid is dead, or
-  // any pending turn past STUCK_TURN_MS (the crash-during-startup backstop).
-  if (!stale && (doc.pid === null || isProcessAlive(doc.pid))) return;
-  await failTurn(doc._id.toString(), "the previous turn was interrupted");
+  if (!stale) return;
+  // Reap only a genuinely stuck turn, and CAS-guard on turnStatus:"pending" so a
+  // turn that completed between our read and this write is never clobbered. The
+  // pid-liveness fast-reap was removed: a dead pid is the normal state while the
+  // monitor is committing a successful turn, so it is not evidence of a stuck
+  // turn. A crash-during-startup turn (pending, pid null forever) is still
+  // recovered by the STUCK_TURN_MS backstop.
+  const coll = await chatSessions();
+  await coll.updateOne(
+    { _id: new ObjectId(doc._id.toString()), turnStatus: "pending" },
+    {
+      $set: {
+        turnStatus: "error",
+        turnError: "the previous turn was interrupted",
+        pendingKind: null,
+        pendingUserMessageAt: null,
+        pid: null,
+        updatedAt: now(),
+      },
+    },
+  );
 }
 
 // Explicit field-pick (never spread) so growth of ChatSessionDoc can never
