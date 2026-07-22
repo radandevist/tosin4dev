@@ -20,8 +20,42 @@ type RunDoc = Run & {
 };
 
 function toDTO(doc: WithId<RunDoc>): RunDTO {
-  const { _id, ...run } = doc;
-  return RunDTOSchema.parse({ _id: _id.toString(), ...run });
+  const {
+    _id,
+    ticketId,
+    boardId,
+    runner,
+    phase,
+    status,
+    workDir,
+    promptFile,
+    logFile,
+    pid,
+    exitCode,
+    summary,
+    awaitingQuestion,
+    queuedAt,
+    startedAt,
+    finishedAt,
+  } = doc;
+  return RunDTOSchema.parse({
+    _id: _id.toString(),
+    ticketId,
+    boardId,
+    runner,
+    phase,
+    status,
+    workDir,
+    promptFile,
+    logFile,
+    pid,
+    exitCode,
+    summary,
+    awaitingQuestion,
+    queuedAt,
+    startedAt,
+    finishedAt,
+  });
 }
 
 export async function listRunsCore(

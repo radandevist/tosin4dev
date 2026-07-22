@@ -35,13 +35,14 @@ export const RISK_LABELS: Record<Risk, string> = {
   high: "High risk",
 };
 
-// The seven columns the board shows, in lifecycle order. `archived` is
+// The eight columns the board shows, in lifecycle order. `archived` is
 // intentionally excluded — it is a terminal side state, not a board column.
 export const BOARD_COLUMNS: readonly { key: TicketStatus; label: string }[] = [
   { key: "inbox", label: STATUS_LABELS.inbox },
   { key: "spec_review", label: STATUS_LABELS.spec_review },
   { key: "approved", label: STATUS_LABELS.approved },
   { key: "running", label: STATUS_LABELS.running },
+  { key: "needs_input", label: STATUS_LABELS.needs_input },
   { key: "blocked", label: STATUS_LABELS.blocked },
   { key: "review_ready", label: STATUS_LABELS.review_ready },
   { key: "done", label: STATUS_LABELS.done },
@@ -70,7 +71,7 @@ export function RiskLabel({ risk }: { risk: Risk }) {
   );
 }
 
-// Group a board's tickets into its seven columns. Pure and exported so it can be
+// Group a board's tickets into its eight columns. Pure and exported so it can be
 // unit-tested and reused without pulling in React. Tickets whose status is not a
 // board column (e.g. `archived`) are dropped from the board view.
 export function groupTicketsByStatus(

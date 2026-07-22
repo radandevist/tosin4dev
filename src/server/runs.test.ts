@@ -78,6 +78,7 @@ describe("run browser contracts", () => {
       pid: 123,
       exitCode: null,
       summary: null,
+      awaitingQuestion: null,
       queuedAt: timestamp,
       startedAt: timestamp,
       finishedAt: null,

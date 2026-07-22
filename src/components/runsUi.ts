@@ -34,7 +34,12 @@ export function isLiveRunStatus(status: RunDTO["status"]): boolean {
 }
 
 export function isTerminalRunStatus(status: RunDTO["status"]): boolean {
-  return !isLiveRunStatus(status);
+  return (
+    status === "succeeded" ||
+    status === "failed" ||
+    status === "blocked" ||
+    status === "cancelled"
+  );
 }
 
 export function shouldPollLog(

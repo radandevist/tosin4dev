@@ -30,6 +30,7 @@ export const RunDTOSchema = z
     pid: z.number().int().positive().nullable(),
     exitCode: z.number().int().nullable(),
     summary: z.string().nullable(),
+    awaitingQuestion: z.string().nullable(),
     queuedAt: timestamp,
     startedAt: timestamp.nullable(),
     finishedAt: timestamp.nullable(),

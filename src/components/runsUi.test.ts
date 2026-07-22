@@ -42,15 +42,19 @@ describe("run polling helpers", () => {
   it("classifies only queued and running runs as live", () => {
     expect(isLiveRunStatus("queued")).toBe(true);
     expect(isLiveRunStatus("running")).toBe(true);
+    expect(isLiveRunStatus("awaiting_input")).toBe(false);
+    expect(isLiveRunStatus("verifying")).toBe(false);
     expect(isLiveRunStatus("succeeded")).toBe(false);
     expect(isLiveRunStatus("failed")).toBe(false);
     expect(isLiveRunStatus("blocked")).toBe(false);
     expect(isLiveRunStatus("cancelled")).toBe(false);
   });
 
-  it("classifies every non-live run as terminal", () => {
+  it("classifies only completed run states as terminal", () => {
     expect(isTerminalRunStatus("queued")).toBe(false);
     expect(isTerminalRunStatus("running")).toBe(false);
+    expect(isTerminalRunStatus("awaiting_input")).toBe(false);
+    expect(isTerminalRunStatus("verifying")).toBe(false);
     expect(isTerminalRunStatus("succeeded")).toBe(true);
     expect(isTerminalRunStatus("failed")).toBe(true);
     expect(isTerminalRunStatus("blocked")).toBe(true);
