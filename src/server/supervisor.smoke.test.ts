@@ -35,10 +35,17 @@ let boardId: string;
 
 const timestamp = () => new Date().toISOString();
 
-async function writeRunner(lines: readonly string[], exitCode = 0): Promise<void> {
+async function writeRunner(
+  lines: readonly string[],
+  exitCode = 0,
+  commit = false,
+): Promise<void> {
   const body = lines.map((line) => `printf '%s\\n' '${line}'`).join("\n");
+  const commitBody = commit
+    ? `echo "artifact $$" > verify-artifact.txt\ngit add -A\ngit commit -m "runner work" >/dev/null 2>&1\n`
+    : "";
   const executable = join(binDirectory, "claude");
-  await writeFile(executable, `#!/bin/sh\n${body}\nexit ${exitCode}\n`);
+  await writeFile(executable, `#!/bin/sh\n${body}\n${commitBody}exit ${exitCode}\n`);
   await chmod(executable, 0o755);
 }
 
@@ -137,13 +144,15 @@ describe("supervisor smoke", () => {
     ]);
   });
 
-  it("executes end-to-end in a detached worktree", async () => {
+  it("executes end-to-end on a named run branch", async () => {
+    await writeRunner(["runner output", "## SUMMARY", "smoke ok"], 0, true);
     const ticketId = await insertTicket("approved", 1);
     const { runId } = await dispatchRun(ticketId, "execute");
     const run = await waitForRun(runId, "succeeded");
     const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
 
     expect(ticket?.status).toBe("review_ready");
+    expect(run.verdict).toBe("passed");
     expect(ticket?.activeRunId).toBeNull();
     expect(run.pid).toBeGreaterThan(0);
     expect(run.startedAt).toMatch(/Z$/);
@@ -181,6 +190,7 @@ describe("supervisor smoke", () => {
 
   it("accepts review fixes only from the already-running state", async () => {
     const ticketId = await insertTicket("running", 9);
+    await writeRunner(["runner output", "## SUMMARY", "smoke ok"], 0, true);
     const { runId } = await dispatchRun(ticketId, "review_fix");
     await waitForRun(runId, "succeeded");
     const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });

@@ -99,7 +99,7 @@ export type Ticket = z.infer<typeof TicketSchema>;
 // board's stored check can never be a shell-injection vector. `key` is stable
 // and referenced by Evidence; `timeoutMs` bounds a hung check.
 export const BoardCheck = z.object({
-  key: z.string().min(1),
+  key: z.string().min(1).regex(/^[a-z0-9_-]+$/),
   label: z.string().min(1),
   command: z.array(z.string().min(1)).min(1),
   timeoutMs: z.number().int().positive().default(120_000),
