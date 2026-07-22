@@ -6,6 +6,7 @@ import type {
 } from "../domain/schemas";
 import {
   createTicket,
+  dependencyStatus,
   getTicket,
   listTickets,
   provideInput,
@@ -13,6 +14,7 @@ import {
   transitionTicket,
   updateSpec,
   type TicketDTO,
+  type DependencyStatusDTO,
   type ProvideInputInput,
   type TransitionInput,
 } from "../server/tickets";
@@ -34,6 +36,15 @@ export const useTicket = createQuery<
 >({
   queryKey: ["ticket"],
   fetcher: (variables) => getTicket({ data: variables }).then(unwrapResult),
+});
+
+export const useDependencyStatus = createQuery<
+  DependencyStatusDTO,
+  { ticketId: string }
+>({
+  queryKey: ["dependencyStatus"],
+  fetcher: (variables) =>
+    dependencyStatus({ data: variables }).then(unwrapResult),
 });
 
 export const useCreateTicket = createMutation<
