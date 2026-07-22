@@ -206,14 +206,17 @@ No independent verifier agent yet (Medium only); no GitHub sync, auth/multi-user
 
 Additive collections (`Run`, `Turn`, `EventJournal`, `Evidence`, later `ChatSession`/`SpecBundle`); extended `Ticket`/`Board`; `TicketStatus` extended; `HUMAN_GATES` gains `needs_input`/`permission_required`. v1 supervisor refactors into the durable daemon with `recoverOrphans` wired to startup. Worktrees move from `--detach` to a named per-run branch. Legacy form tickets keep working (`bundleId: null`) — and are exactly what the first slice runs on.
 
-## 12. Provider contract spike checklist (step 1 — verify before chat work)
+## 12. Provider contract spike — RESOLVED (2026-07-22)
 
-- Codex App Server is **JSONL over stdio** (WebSocket experimental); each connection needs `initialize`/`initialized`; **generate schemas from the pinned CLI version**, don't hand-write protocol types.
-- `turn/steer` requires an active turn + `expectedTurnId` (no turn-level overrides) — it is **not** the durable unblock; post-completion unblock uses `turn/start`.
-- **Hypothesis to test**: can an App Server thread id be handed to `codex exec resume` (App-Server-chat → exec-batch continuity)? If not, the execution session is always fresh (which §3E already assumes).
-- Claude Agent SDK streaming uses `includePartialMessages` in a long-lived streaming-input process; keep CLI-only flags out of the SDK adapter contract.
-- Claude sessions are **local-file + cwd-sensitive**; a mismatched worktree cwd can silently start a fresh session — pin cwd per execution session; consider a `SessionStore`/transcript mirror for cross-host recovery.
-- **Auth**: the Agent SDK bundles its own Claude Code binary; verify whether API-key auth vs subscription login is required for this integration.
+Ran as slice A. Full evidence: `2026-07-22-provider-contract-spike-findings.md`. All items empirically confirmed on `codex-cli 0.144.6` + current Claude Agent SDK; two assumptions corrected. **Decisions A–E hold; no rework.**
+
+- ✅ Codex App Server is **NDJSON over stdio** (`--listen stdio://` default; Unix socket / WebSocket also); needs the two-stage `initialize`→`initialized` handshake; **generate types via `codex app-server generate-ts`** (don't hand-write). Methods: `thread/start|resume`, `turn/start|steer|interrupt`; deltas via `item/agentMessage/delta`.
+- ✅ `turn/steer` is **active-turn-only** (needs `expectedTurnId`; errors after `turn/completed`) — so the durable unblock is a fresh **`turn/start`** (Decision D confirmed). Wait for `turn/started` before steering (start-response can precede the notification).
+- ✅ **Resolved (yes):** an App Server `thread_id` **is** accepted by `codex exec resume <id>` (sessions at `~/.codex/sessions/…/rollout-*-<id>.jsonl` + `sessions.db`). Chat→exec continuity is possible; §3E still chooses a fresh execution session by design.
+- ✅ Claude Agent SDK: `query(AsyncGenerator<SDKUserMessage>)` + `includePartialMessages` → `StreamEvent`/`text_delta`. Build on the **SDK**, not raw CLI stdin.
+- ✅ Claude sessions are **cwd-keyed local JSONL**; a cwd mismatch silently forks a new session → **pin `cwd` per execution session** (§3E). `SessionStore` only for cross-host (not needed here).
+- ✅ **Auth corrected:** both providers **inherit the existing login** (`~/.codex/auth.json` ChatGPT; `~/.claude/.credentials.json`) — **no API key required**. The Agent SDK does **not** bundle a `claude` binary; it requires `claude` on `PATH`.
+- ⚠️ **Corrected:** `codex exec resume` takes cwd/sandbox as **root-level** flags (`codex -C <dir> -s <policy> exec resume …`), not as subcommand flags — so config need not be reproduced exactly.
 
 ## 13. Key risks & mitigations
 
