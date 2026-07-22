@@ -34,6 +34,42 @@ let binDirectory: string;
 let boardId: string;
 
 const timestamp = () => new Date().toISOString();
+type BootGlobal = typeof globalThis & { __tosin4devRecovered?: Promise<void> };
+
+async function seedOrphan(
+  seq: number,
+  status: "running" | "verifying",
+): Promise<{ ticketId: string; runId: import("mongodb").ObjectId }> {
+  const ticketId = await insertTicket("running", seq);
+  const runId = new ObjectId();
+  const at = timestamp();
+  await tickets.updateOne(
+    { _id: new ObjectId(ticketId) },
+    { $set: { activeRunId: runId.toString() } },
+  );
+  await runs.insertOne({
+    _id: runId,
+    ticketId,
+    boardId,
+    runner: "claude",
+    phase: "execute",
+    status,
+    workDir: repo,
+    promptFile: join(repo, `p-${seq}.md`),
+    logFile: join(repo, `o-${seq}.log`),
+    pid: 2_147_483_647,
+    exitCode: null,
+    summary: null,
+    branch: null,
+    baseSha: null,
+    verdict: null,
+    failureKind: null,
+    queuedAt: at,
+    startedAt: at,
+    finishedAt: null,
+  });
+  return { ticketId, runId };
+}
 
 async function writeRunner(
   lines: readonly string[],
@@ -304,5 +340,31 @@ describe("supervisor smoke", () => {
     await expect(runs.findOne({ _id: unrelatedDeadRunId })).resolves.toMatchObject({
       status: "failed",
     });
+  });
+
+  it("recovers a dead run orphaned in the verifying state", async () => {
+    (globalThis as BootGlobal).__tosin4devRecovered = undefined;
+    const { ticketId, runId } = await seedOrphan(40, "verifying");
+    await recoverOrphans();
+    const run = await runs.findOne({ _id: runId });
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(run?.status).toBe("failed");
+    expect(run?.failureKind).toBe("verification_failed");
+    expect(ticket?.status).toBe("blocked");
+    expect(ticket?.activeRunId).toBeNull();
+  });
+
+  it("runs orphan recovery exactly once per process", async () => {
+    (globalThis as BootGlobal).__tosin4devRecovered = undefined;
+    const { bootRecoveryOnce } = await import("./supervisor.server");
+    const first = await seedOrphan(41, "running");
+    await bootRecoveryOnce();
+    await bootRecoveryOnce();
+    expect((await runs.findOne({ _id: first.runId }))?.status).toBe("failed");
+    expect((await tickets.findOne({ _id: new ObjectId(first.ticketId) }))?.status).toBe("blocked");
+    const later = await seedOrphan(42, "running");
+    await bootRecoveryOnce();
+    expect((await runs.findOne({ _id: later.runId }))?.status).toBe("running");
+    (globalThis as BootGlobal).__tosin4devRecovered = undefined;
   });
 });
