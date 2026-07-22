@@ -136,31 +136,38 @@ async function monitorChatTurn(
     await failTurn(sessionId, `the proposal is invalid: ${invalid}`);
     return;
   }
-  const session = await coll.findOne({ _id: new ObjectId(sessionId) });
-  if (!session) {
-    await failTurn(sessionId, "session vanished mid-turn");
-    return;
-  }
-  const bundleId = await replaceDraftingBundle(
-    sessionId,
-    session.boardId,
-    proposal,
-  );
-  await coll.updateOne(
-    { _id: new ObjectId(sessionId) },
-    {
-      $set: {
-        turnStatus: "idle",
-        turnError: null,
-        pendingKind: null,
-        pendingUserMessageAt: null,
-        pid: null,
-        bundleId,
-        updatedAt: at,
-        ...sidPatch,
+  // The draft branch has a wider pre-finalize DB surface than the message
+  // branch (session re-load + bundle upsert). Fail closed: a transient DB throw
+  // here becomes an immediate retryable error, not a ≤STUCK_TURN_MS stuck turn.
+  try {
+    const session = await coll.findOne({ _id: new ObjectId(sessionId) });
+    if (!session) {
+      await failTurn(sessionId, "session vanished mid-turn");
+      return;
+    }
+    const bundleId = await replaceDraftingBundle(
+      sessionId,
+      session.boardId,
+      proposal,
+    );
+    await coll.updateOne(
+      { _id: new ObjectId(sessionId) },
+      {
+        $set: {
+          turnStatus: "idle",
+          turnError: null,
+          pendingKind: null,
+          pendingUserMessageAt: null,
+          pid: null,
+          bundleId,
+          updatedAt: at,
+          ...sidPatch,
+        },
       },
-    },
-  );
+    );
+  } catch {
+    await failTurn(sessionId, "could not save the proposed bundle");
+  }
 }
 
 // Claim a pending turn (throws on conflict/not-found BEFORE any side effect),
