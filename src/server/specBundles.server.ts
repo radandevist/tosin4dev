@@ -8,13 +8,18 @@ import {
   type SpecBundleProposal,
 } from "../domain/schemas";
 import { validateBundleMembers } from "./chatResult";
+import type { ChatSessionDoc } from "./chat.server";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
 import {
   SpecBundleDTOSchema,
-  type BundleRef,
   type SpecBundleDTO,
 } from "./specBundles";
+import {
+  createTicketCore,
+  deleteTicketsByIds,
+  setTicketDependsOn,
+} from "./tickets.server";
 
 export type SpecBundleDoc = SpecBundle & {
   createdAt: string;
@@ -188,7 +193,65 @@ export async function reorderBundleCore(input: {
   return { ok: true };
 }
 
-// Lock core is implemented in Task 6.
-export async function lockBundleCore(_input: BundleRef): Promise<never> {
-  throw new ServerResultError("conflict", "not implemented");
+export async function lockBundleCore(input: {
+  bundleId: string;
+}): Promise<{ tickets: { ticketId: string; seq: number }[] }> {
+  const coll = await specBundles();
+  const doc = await coll.findOne({ _id: new ObjectId(input.bundleId) });
+  if (!doc) throw new ServerResultError("not_found", `bundle not found: ${input.bundleId}`);
+  if (doc.status !== "drafting") {
+    throw new ServerResultError("conflict", "this bundle is already locked");
+  }
+  const invalid = validateBundleMembers(doc.members);
+  if (invalid) throw new ServerResultError("conflict", invalid);
+
+  // CAS claim drafting → locked (serializes concurrent locks).
+  const claim = await coll.updateOne(
+    { _id: new ObjectId(input.bundleId), status: "drafting" },
+    { $set: { status: "locked", lockedAt: now(), updatedAt: now() } },
+  );
+  if (claim.matchedCount === 0) {
+    throw new ServerResultError("conflict", "this bundle is already locked");
+  }
+
+  const created: { localKey: string; ticketId: string; seq: number }[] = [];
+  try {
+    // Pass 1: create tickets in members order.
+    for (const m of doc.members) {
+      const r = await createTicketCore({
+        boardId: doc.boardId, title: m.title, type: m.type, runner: m.runner, spec: m.spec,
+      });
+      created.push({ localKey: m.localKey, ticketId: r.id, seq: r.seq });
+    }
+    // Pass 2: resolve localKey → ticketId and set dependsOn.
+    const idByKey = new Map(created.map((c) => [c.localKey, c.ticketId]));
+    for (const m of doc.members) {
+      if (m.dependsOn.length === 0) continue;
+      const deps = m.dependsOn.map((k) => idByKey.get(k)!);
+      await setTicketDependsOn(idByKey.get(m.localKey)!, deps);
+    }
+    // Finalize: record lockedTicketIds (members order) + mark the session.
+    const lockedTicketIds = doc.members.map((m) => idByKey.get(m.localKey)!);
+    await coll.updateOne(
+      { _id: new ObjectId(input.bundleId) },
+      { $set: { lockedTicketIds, updatedAt: now() } },
+    );
+    const sessions = (await db()).collection<ChatSessionDoc>("chatSessions");
+    await sessions.updateOne(
+      { _id: new ObjectId(doc.sessionId) },
+      { $set: { status: "bundle_locked", updatedAt: now() } },
+    );
+    return { tickets: created.map((c) => ({ ticketId: c.ticketId, seq: c.seq })) };
+  } catch (error) {
+    // Compensation (no transactions): delete every ticket created in this lock,
+    // revert the bundle to drafting. All-or-nothing.
+    await deleteTicketsByIds(created.map((c) => c.ticketId)).catch(() => undefined);
+    await coll.updateOne(
+      { _id: new ObjectId(input.bundleId) },
+      { $set: { status: "drafting", lockedAt: null, lockedTicketIds: null, updatedAt: now() } },
+    );
+    throw error instanceof ServerResultError
+      ? error
+      : new ServerResultError("spawn_failed", "could not create all tickets; rolled back");
+  }
 }
