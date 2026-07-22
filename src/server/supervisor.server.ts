@@ -6,9 +6,10 @@ import {
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
-import type { PushOperator } from "mongodb";
+import type { Db, PushOperator } from "mongodb";
 import {
   BoardSchema,
+  EvidenceSchema,
   ObjectIdString,
   RunPhase,
   TicketSchema,
@@ -24,6 +25,7 @@ import type { RunnerAdapter, RunnerBrief } from "../runners/types";
 import { db, ObjectId } from "./db";
 import { notify } from "./notify.server";
 import { ServerResultError } from "./result";
+import { verifyRun } from "./verify.server";
 
 type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
@@ -273,6 +275,82 @@ export function parseSummary(output: string): string | null {
   return summary || null;
 }
 
+async function ticketLabel(database: Db, ticketId: string): Promise<string> {
+  const ticketDoc = await database
+    .collection<TicketDoc>("tickets")
+    .findOne({ _id: new ObjectId(ticketId) });
+  const boardDoc = ticketDoc
+    ? await database
+        .collection<BoardDoc>("boards")
+        .findOne({ _id: new ObjectId(ticketDoc.boardId) })
+    : null;
+  return `${boardDoc?.slug ?? "?"} #${ticketDoc?.seq ?? "?"} ${ticketDoc?.title ?? "ticket"}`;
+}
+
+async function transitionTicketSucceeded(
+  database: Db,
+  ticketId: string,
+  runId: string,
+  at: string,
+): Promise<void> {
+  const tickets = database.collection<TicketDoc>("tickets");
+  const nextStatus = transition("running", "run_succeeded");
+  const upd = await tickets.updateOne(
+    { _id: new ObjectId(ticketId), activeRunId: runId, status: "running" },
+    {
+      $set: { activeRunId: null, status: nextStatus, updatedAt: at },
+      $push: pushActivity("run", "run succeeded (verified)", at),
+    },
+  );
+  if (upd.matchedCount === 0) {
+    await tickets.updateOne(
+      { _id: new ObjectId(ticketId), activeRunId: runId },
+      { $set: { activeRunId: null, updatedAt: at } },
+    );
+  }
+}
+
+async function transitionTicketFailed(
+  database: Db,
+  ticketId: string,
+  runId: string,
+  at: string,
+  reason: string,
+): Promise<void> {
+  const tickets = database.collection<TicketDoc>("tickets");
+  const nextStatus = transition("running", "run_failed");
+  const upd = await tickets.updateOne(
+    { _id: new ObjectId(ticketId), activeRunId: runId, status: "running" },
+    {
+      $set: { activeRunId: null, status: nextStatus, updatedAt: at },
+      $push: pushActivity("run", reason, at),
+    },
+  );
+  if (upd.matchedCount === 0) {
+    await tickets.updateOne(
+      { _id: new ObjectId(ticketId), activeRunId: runId },
+      { $set: { activeRunId: null, updatedAt: at } },
+    );
+  }
+}
+
+async function notifyReviewReady(
+  database: Db,
+  ticketId: string,
+  summary: string | null,
+): Promise<void> {
+  await notify(`✅ review-ready: ${await ticketLabel(database, ticketId)}\n${summary ?? ""}`);
+}
+
+async function notifyBlocked(
+  database: Db,
+  ticketId: string,
+  reason: string,
+  logFile: string,
+): Promise<void> {
+  await notify(`⛔ blocked: ${await ticketLabel(database, ticketId)} — ${reason}. Log: ${logFile}`);
+}
+
 async function finishRun(
   runId: string,
   ticketId: string,
@@ -280,26 +358,30 @@ async function finishRun(
   exitCode: number,
   stdout: string,
   logFile: string,
+  board: Board,
+  runDir: string,
 ): Promise<void> {
   const database = await db();
   const at = now();
   const succeeded = exitCode === 0;
   const summary = parseSummary(stdout);
-  await database.collection<RunDoc>("runs").updateOne(
-    { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
-    {
-      $set: {
-        status: succeeded ? "succeeded" : "failed",
-        exitCode,
-        summary,
-        finishedAt: at,
-      },
-    },
-  );
+  const runs = database.collection<RunDoc>("runs");
+  const tickets = database.collection<TicketDoc>("tickets");
 
-  const ticketCollection = database.collection<TicketDoc>("tickets");
+  // spec_draft: read-only, no verification; ticket stays inbox.
   if (phase === "spec_draft") {
-    const ticketUpdate = await ticketCollection.updateOne(
+    await runs.updateOne(
+      { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
+      {
+        $set: {
+          status: succeeded ? "succeeded" : "failed",
+          exitCode,
+          summary,
+          finishedAt: at,
+        },
+      },
+    );
+    const upd = await tickets.updateOne(
       { _id: new ObjectId(ticketId), activeRunId: runId, status: "inbox" },
       {
         $set: { activeRunId: null, updatedAt: at },
@@ -310,8 +392,8 @@ async function finishRun(
         ),
       },
     );
-    if (ticketUpdate.matchedCount === 0) {
-      await ticketCollection.updateOne(
+    if (upd.matchedCount === 0) {
+      await tickets.updateOne(
         { _id: new ObjectId(ticketId), activeRunId: runId },
         { $set: { activeRunId: null, updatedAt: at } },
       );
@@ -319,42 +401,107 @@ async function finishRun(
     return;
   }
 
-  const outcome = succeeded ? "run_succeeded" : "run_failed";
-  const nextStatus = transition("running", outcome);
-  const ticketUpdate = await ticketCollection.updateOne(
-    { _id: new ObjectId(ticketId), activeRunId: runId, status: "running" },
-    {
-      $set: { activeRunId: null, status: nextStatus, updatedAt: at },
-      $push: pushActivity(
-        "run",
-        `run ${succeeded ? "succeeded" : `failed (exit ${exitCode})`}`,
-        at,
-      ),
-    },
-  );
-  if (ticketUpdate.matchedCount === 0) {
-    await ticketCollection.updateOne(
-      { _id: new ObjectId(ticketId), activeRunId: runId },
-      { $set: { activeRunId: null, updatedAt: at } },
+  // execute / review_fix — a nonzero runner exit fails fast, no verification.
+  if (!succeeded) {
+    await runs.updateOne(
+      { _id: new ObjectId(runId), status: { $in: ["queued", "running", "verifying"] } },
+      {
+        $set: {
+          status: "failed",
+          exitCode,
+          summary,
+          failureKind: "runner_exit",
+          finishedAt: at,
+        },
+      },
     );
+    await transitionTicketFailed(database, ticketId, runId, at, `run failed (exit ${exitCode})`);
+    await notifyBlocked(database, ticketId, `run failed (exit ${exitCode})`, logFile);
     return;
   }
 
-  const ticketDoc = await ticketCollection.findOne({
-    _id: new ObjectId(ticketId),
-  });
-  const boardDoc = ticketDoc
-    ? await database.collection<BoardDoc>("boards").findOne({
-        _id: new ObjectId(ticketDoc.boardId),
-      })
-    : null;
-  const label = `${boardDoc?.slug ?? "?"} #${ticketDoc?.seq ?? "?"} ${ticketDoc?.title ?? "ticket"}`;
-  if (nextStatus === "review_ready") {
-    await notify(`✅ review-ready: ${label}\n${summary ?? ""}`);
-  } else {
-    await notify(
-      `⛔ blocked: ${label} — run failed (exit ${exitCode}). Log: ${logFile}`,
+  // exit 0: Tosin4dev — not the runner — proves the work. Enter `verifying`.
+  await runs.updateOne(
+    { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
+    { $set: { status: "verifying" } },
+  );
+  const run = await runs.findOne({ _id: new ObjectId(runId) });
+  try {
+    const verifyAt = now();
+    const result = await verifyRun({
+      repoPath: board.repoPath,
+      workDir: run?.workDir ?? board.repoPath,
+      runDir,
+      branch: run?.branch ?? "",
+      baseSha: run?.baseSha ?? "",
+      checks: board.checks,
+      at: verifyAt,
+    });
+    const evidence = EvidenceSchema.parse({
+      runId,
+      ticketId,
+      commitSha: result.commitSha,
+      commitRef: result.commitRef,
+      checks: result.checks,
+      verdict: result.verdict,
+    });
+    await database.collection("evidence").insertOne({ ...evidence, createdAt: verifyAt });
+
+    if (result.verdict === "passed") {
+      await runs.updateOne(
+        { _id: new ObjectId(runId), status: "verifying" },
+        {
+          $set: {
+            status: "succeeded",
+            exitCode,
+            summary,
+            verdict: "passed",
+            finishedAt: verifyAt,
+          },
+        },
+      );
+      await transitionTicketSucceeded(database, ticketId, runId, verifyAt);
+      await notifyReviewReady(database, ticketId, summary);
+      return;
+    }
+    await runs.updateOne(
+      { _id: new ObjectId(runId), status: "verifying" },
+      {
+        $set: {
+          status: "failed",
+          exitCode,
+          summary,
+          verdict: "failed",
+          failureKind: result.failureKind,
+          finishedAt: verifyAt,
+        },
+      },
     );
+    await transitionTicketFailed(database, ticketId, runId, verifyAt, `verification ${result.failureKind}`);
+    await notifyBlocked(database, ticketId, `verification failed (${result.failureKind})`, logFile);
+  } catch (error) {
+    // verifyRun / Evidence parse crashed — treat as a FAILED verification, never
+    // leave the run stuck in `verifying`.
+    await appendFile(
+      logFile,
+      `\nVerification error: ${error instanceof Error ? error.message : "unknown error"}\n`,
+    ).catch(() => undefined);
+    const failAt = now();
+    await runs.updateOne(
+      { _id: new ObjectId(runId), status: "verifying" },
+      {
+        $set: {
+          status: "failed",
+          exitCode,
+          summary,
+          verdict: "failed",
+          failureKind: "verification_failed",
+          finishedAt: failAt,
+        },
+      },
+    );
+    await transitionTicketFailed(database, ticketId, runId, failAt, "verification error");
+    await notifyBlocked(database, ticketId, "verification error", logFile);
   }
 }
 
@@ -364,6 +511,8 @@ async function monitorChild(
   ticketId: string,
   phase: Phase,
   logFile: string,
+  board: Board,
+  runDir: string,
 ): Promise<void> {
   try {
     const [stdout, , exitCode] = await Promise.all([
@@ -371,13 +520,13 @@ async function monitorChild(
       child.stderr,
       child.exited,
     ]);
-    await finishRun(runId, ticketId, phase, exitCode, stdout, logFile);
+    await finishRun(runId, ticketId, phase, exitCode, stdout, logFile, board, runDir);
   } catch (error) {
     await appendFile(
       logFile,
       `\nSupervisor stream failure: ${error instanceof Error ? error.message : "unknown error"}\n`,
     ).catch(() => undefined);
-    await finishRun(runId, ticketId, phase, -1, "", logFile);
+    await finishRun(runId, ticketId, phase, -1, "", logFile, board, runDir);
   }
 }
 
@@ -529,6 +678,8 @@ export async function dispatchRun(
       ticketId,
       phase,
       paths.logFile,
+      board,
+      paths.runDir,
     ).catch((error) =>
       console.error(`Supervisor monitor failed for run ${runId}:`, error),
     );
