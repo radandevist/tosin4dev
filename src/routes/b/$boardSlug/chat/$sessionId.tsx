@@ -36,9 +36,16 @@ function ChatPage() {
         >
           ← Board
         </Link>
-        <h1 className="text-lg font-semibold tracking-tight text-zinc-900">
-          Brainstorm
-        </h1>
+        <div className="text-center">
+          <h1 className="text-lg font-semibold tracking-tight text-zinc-900">
+            Brainstorm
+          </h1>
+          {session.data ? (
+            <p className="text-xs text-zinc-500">
+              via {session.data.provider === "codex" ? "Codex" : "Claude"}
+            </p>
+          ) : null}
+        </div>
         <span className="w-16" />
       </header>
 
