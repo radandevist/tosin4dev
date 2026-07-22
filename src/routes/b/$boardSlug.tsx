@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   createFileRoute,
   Link,
@@ -21,6 +22,9 @@ function BoardPage() {
   const board = useBoard({ variables: { slug: boardSlug } });
   const navigate = useNavigate();
   const createChat = useCreateChatSession();
+  const [chatProvider, setChatProvider] = useState<"claude" | "codex">(
+    "claude",
+  );
 
   // The ticket list depends on the board's id, which only exists once the board
   // query resolves. `enabled` gates the dependent query until then and the typed
@@ -33,7 +37,7 @@ function BoardPage() {
   const startBrainstorm = () => {
     if (!boardId || createChat.isPending) return;
     createChat.mutate(
-      { boardId },
+      { boardId, provider: chatProvider },
       {
         onSuccess: ({ id }) =>
           navigate({
@@ -61,14 +65,28 @@ function BoardPage() {
         {board.data ? (
           <div className="flex gap-2">
             <div className="flex flex-col gap-2">
-              <button
-                type="button"
-                disabled={createChat.isPending}
-                onClick={startBrainstorm}
-                className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:opacity-50"
-              >
-                {createChat.isPending ? "Starting…" : "Brainstorm"}
-              </button>
+              <div className="flex gap-2">
+                <select
+                  aria-label="Brainstorm provider"
+                  value={chatProvider}
+                  disabled={createChat.isPending}
+                  onChange={(event) =>
+                    setChatProvider(event.target.value as "claude" | "codex")
+                  }
+                  className="rounded-lg border border-zinc-300 bg-white px-2 py-2 text-sm text-zinc-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:opacity-50"
+                >
+                  <option value="claude">Claude</option>
+                  <option value="codex">Codex</option>
+                </select>
+                <button
+                  type="button"
+                  disabled={createChat.isPending}
+                  onClick={startBrainstorm}
+                  className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:opacity-50"
+                >
+                  {createChat.isPending ? "Starting…" : "Brainstorm"}
+                </button>
+              </div>
               {createChat.isError ? (
                 <p role="alert" className="text-sm text-rose-600">
                   {createChat.error.message}
