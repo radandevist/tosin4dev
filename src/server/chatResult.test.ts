@@ -42,6 +42,25 @@ describe("parseTurn", () => {
     expect(parseTurn("codex", out)).toBeNull();
     expect(parseTurn("codex", "not json")).toBeNull();
   });
+
+  it("skips malformed JSON lines between valid codex events", () => {
+    const out = [
+      `{"type":"thread.started","thread_id":"thread-1"}`,
+      `{"type": this is malformed JSON`,
+      `{"type":"item.completed","item":{"type":"agent_message","text":"survived"}}`,
+    ].join("\n");
+    expect(parseTurn("codex", out)).toEqual({
+      result: "survived",
+      sessionId: "thread-1",
+    });
+  });
+
+  it("fails closed when a codex agent message has no string text", () => {
+    const missing = `{"type":"item.completed","item":{"type":"agent_message"}}`;
+    const nonString = `{"type":"item.completed","item":{"type":"agent_message","text":42}}`;
+    expect(parseTurn("codex", missing)).toBeNull();
+    expect(parseTurn("codex", nonString)).toBeNull();
+  });
 });
 
 describe("parseDraft", () => {
