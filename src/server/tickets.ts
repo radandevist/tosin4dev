@@ -13,6 +13,7 @@ import {
   createTicketCore,
   getTicketCore,
   listTicketsCore,
+  provideInputCore,
   setRunnerCore,
   transitionTicketCore,
   updateSpecCore,
@@ -31,6 +32,11 @@ export const TransitionInputSchema = z
   })
   .strict();
 export type TransitionInput = z.infer<typeof TransitionInputSchema>;
+
+export const ProvideInputInputSchema = z
+  .object({ ticketId: ObjectIdString, answer: z.string().min(1) })
+  .strict();
+export type ProvideInputInput = z.infer<typeof ProvideInputInputSchema>;
 
 const passthrough = (data: unknown): unknown => data;
 
@@ -76,4 +82,10 @@ export const transitionTicket = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ status: string }>> =>
     boundary(TransitionInputSchema, data, transitionTicketCore),
+  );
+
+export const provideInput = createServerFn({ method: "POST" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<{ status: string }>> =>
+    boundary(ProvideInputInputSchema, data, provideInputCore),
   );
