@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDispatch, useLogTail, useRuns } from "../queries/runs";
 import {
+  useDependencyStatus,
   useProvideInput,
   useTicket,
   useTickets,
@@ -25,6 +26,20 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
   const provideInput = useProvideInput();
   const [openRunId, setOpenRunId] = useState<string | null>(null);
   const [answer, setAnswer] = useState("");
+  const action = dispatchActionForTicket(
+    ticket.status,
+    ticket.runner,
+    ticket.activeRunId,
+  );
+  const dependencyStatus = useDependencyStatus({
+    variables: { ticketId: ticket._id },
+    enabled: action?.phase === "execute",
+  });
+  const blockingDependencies =
+    action?.phase === "execute" && dependencyStatus.data?.blocked
+      ? dependencyStatus.data.unmet
+      : null;
+  const executeBlocked = blockingDependencies !== null;
 
   const runs = useRuns({
     variables: { ticketId: ticket._id },
@@ -86,12 +101,6 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
     ticket.seq,
   ]);
 
-  const action = dispatchActionForTicket(
-    ticket.status,
-    ticket.runner,
-    ticket.activeRunId,
-  );
-
   const refreshTicketAndRuns = () =>
     Promise.all([
       queryClient.invalidateQueries({
@@ -103,7 +112,7 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
     ]);
 
   const dispatch = () => {
-    if (!action || dispatchRun.isPending) return;
+    if (!action || dispatchRun.isPending || executeBlocked) return;
     dispatchRun.mutate(
       { ticketId: ticket._id, phase: action.phase },
       {
@@ -170,7 +179,7 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
         {action ? (
           <button
             type="button"
-            disabled={dispatchRun.isPending}
+            disabled={dispatchRun.isPending || executeBlocked}
             onClick={dispatch}
             className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -178,6 +187,18 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
           </button>
         ) : null}
       </div>
+
+      {executeBlocked ? (
+        <p role="status" className="text-sm text-amber-700">
+          Blocked — waiting on:{" "}
+          {blockingDependencies
+            .map(
+              (dep) =>
+                `${dep.seq === null ? dep.ticketId : `#${dep.seq}`} (${dep.reason})`,
+            )
+            .join(", ")}
+        </p>
+      ) : null}
 
       {dispatchRun.isError ? (
         <p role="alert" className="text-sm text-rose-600">
