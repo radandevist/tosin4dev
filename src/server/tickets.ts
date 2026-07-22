@@ -4,6 +4,7 @@ import {
   CreateTicketInputSchema,
   ObjectIdString,
   SetRunnerInputSchema,
+  TicketStatus,
   UpdateSpecInputSchema,
   type Ticket,
 } from "../domain/schemas";
@@ -17,12 +18,34 @@ import {
   setRunnerCore,
   transitionTicketCore,
   updateSpecCore,
+  dependencyStatusCore,
 } from "./tickets.server";
 
 type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
 
 // Browser-safe wire contract. All referenced ids and `_id` are plain strings.
 export type TicketDTO = TicketDoc & { _id: string };
+
+export const TicketRefSchema = z.object({ ticketId: ObjectIdString }).strict();
+export type TicketRef = z.infer<typeof TicketRefSchema>;
+
+export const DependencyStatusDTOSchema = z
+  .object({
+    blocked: z.boolean(),
+    unmet: z.array(
+      z
+        .object({
+          ticketId: ObjectIdString,
+          seq: z.number().int().positive().nullable(),
+          title: z.string().nullable(),
+          status: TicketStatus.nullable(),
+          reason: z.enum(["pending", "archived", "missing"]),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+export type DependencyStatusDTO = z.infer<typeof DependencyStatusDTOSchema>;
 
 // Human UI events only; machine dispatch outcomes remain server-owned.
 export const TransitionInputSchema = z
@@ -58,6 +81,12 @@ export const getTicket = createServerFn({ method: "GET" })
       data,
       (input) => getTicketCore(input.boardId, input.seq),
     ),
+  );
+
+export const dependencyStatus = createServerFn({ method: "GET" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<DependencyStatusDTO>> =>
+    boundary(TicketRefSchema, data, dependencyStatusCore),
   );
 
 export const createTicket = createServerFn({ method: "POST" })

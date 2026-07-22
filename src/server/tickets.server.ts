@@ -7,11 +7,18 @@ import {
   type Ticket,
   type UpdateSpecInput,
 } from "../domain/schemas";
+import { unmetDependencies } from "../domain/dependencies";
 import { transition } from "../domain/stateMachine";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
 import { resumeRun } from "./supervisor.server";
-import type { TicketDTO, TransitionInput } from "./tickets";
+import {
+  DependencyStatusDTOSchema,
+  type DependencyStatusDTO,
+  type TicketDTO,
+  type TicketRef,
+  type TransitionInput,
+} from "./tickets";
 
 // Persisted ticket document: the validated ticket fields plus server-owned
 // audit timestamps. `_id` is added by Mongo and stripped to a string on the
@@ -81,6 +88,55 @@ export async function getTicketCore(
     );
   }
   return toDTO(doc);
+}
+
+export async function dependencyStatusCore(
+  input: TicketRef,
+): Promise<DependencyStatusDTO> {
+  const coll = await tickets();
+  const ticket = await coll.findOne({ _id: new ObjectId(input.ticketId) });
+  if (!ticket) {
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${input.ticketId}`,
+    );
+  }
+
+  if (ticket.dependsOn.length === 0) {
+    return DependencyStatusDTOSchema.parse({ blocked: false, unmet: [] });
+  }
+
+  const docs = await coll
+    .find({ _id: { $in: ticket.dependsOn.map((id) => new ObjectId(id)) } })
+    .project<{ _id: ObjectId; seq: number; status: Ticket["status"]; title: string }>({
+      seq: 1,
+      status: 1,
+      title: 1,
+    })
+    .toArray();
+  const loadedById = new Map(
+    docs.map((doc) => [doc._id.toString().toLowerCase(), doc]),
+  );
+  const present = docs.map((doc) => ({
+    ticketId: doc._id.toString(),
+    seq: doc.seq,
+    status: doc.status,
+  }));
+  const unmet = unmetDependencies(ticket.dependsOn, present).map((dep) => {
+    const loaded = loadedById.get(dep.ticketId.toLowerCase());
+    return {
+      ticketId: dep.ticketId,
+      seq: dep.seq,
+      title: loaded?.title ?? null,
+      status: loaded?.status ?? null,
+      reason: dep.reason,
+    };
+  });
+
+  return DependencyStatusDTOSchema.parse({
+    blocked: unmet.length > 0,
+    unmet,
+  });
 }
 
 export async function createTicketCore(
