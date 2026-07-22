@@ -24,6 +24,7 @@ import { codexAdapter } from "../runners/codex";
 import type { RunnerAdapter, RunnerBrief } from "../runners/types";
 import { db, ObjectId } from "./db";
 import { notify } from "./notify.server";
+import { parseSessionId, readOutcome } from "./outcome.server";
 import { ServerResultError } from "./result";
 import { verifyRun } from "./verify.server";
 
@@ -354,10 +355,51 @@ async function notifyBlocked(
   await notify(`⛔ blocked: ${await ticketLabel(database, ticketId)} — ${reason}. Log: ${logFile}`);
 }
 
+async function parkTicketNeedsInput(
+  database: Db,
+  runId: string,
+  ticketId: string,
+  question: string,
+  summary: string | null,
+  at: string,
+): Promise<void> {
+  await database.collection<RunDoc>("runs").updateOne(
+    {
+      _id: new ObjectId(runId),
+      status: { $in: ["queued", "running", "verifying"] },
+    },
+    {
+      $set: {
+        status: "awaiting_input",
+        awaitingQuestion: question,
+        summary,
+      },
+    },
+  );
+  const tickets = database.collection<TicketDoc>("tickets");
+  const nextStatus = transition("running", "run_needs_input");
+  // Keep activeRunId: the run is parked and provideInput will resume it.
+  await tickets.updateOne(
+    {
+      _id: new ObjectId(ticketId),
+      activeRunId: runId,
+      status: "running",
+    },
+    {
+      $set: { status: nextStatus, updatedAt: at },
+      $push: pushActivity("run", `needs input: ${question}`, at),
+    },
+  );
+}
+
 async function failVerifiedRun(
   database: Db,
   runId: string,
-  failureKind: "runner_exit" | "no_commit" | "verification_failed",
+  failureKind:
+    | "runner_exit"
+    | "no_commit"
+    | "verification_failed"
+    | "runner_reported_failure",
   exitCode: number,
   summary: string | null,
   at: string,
@@ -446,6 +488,54 @@ async function finishRun(
     return;
   }
 
+  // exit 0: capture the session id, then read the runner's declared outcome.
+  const runDoc = await runs.findOne({ _id: new ObjectId(runId) });
+  const sessionId = runDoc ? parseSessionId(runDoc.runner, stdout) : null;
+  if (sessionId) {
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $set: { executionSessionId: sessionId } },
+    );
+  }
+  const outcome = await readOutcome(runDir);
+  const outSummary = outcome.summary ?? summary;
+  if (outcome.outcome === "needs_input") {
+    const question = outcome.question ?? "(no question provided)";
+    await parkTicketNeedsInput(
+      database,
+      runId,
+      ticketId,
+      question,
+      outSummary,
+      now(),
+    );
+    await notify(
+      `⏸️ needs input: ${await ticketLabel(database, ticketId)} — ${outcome.question ?? ""}`,
+    );
+    return;
+  }
+  if (outcome.outcome === "failed") {
+    const failedAt = now();
+    await failVerifiedRun(
+      database,
+      runId,
+      "runner_reported_failure",
+      exitCode,
+      outSummary,
+      failedAt,
+    );
+    await transitionTicketFailed(
+      database,
+      ticketId,
+      runId,
+      failedAt,
+      `runner reported failure: ${outcome.reason ?? "unspecified"}`,
+    );
+    await notifyBlocked(database, ticketId, "runner reported failure", logFile);
+    return;
+  }
+
+  // outcome.outcome === "completed" falls through to the existing verification gate.
   // exit 0: Tosin4dev proves the work. Claim the `verifying` transition INSIDE the
   // try so any failure here is fail-closed. If we can't claim it, the run was
   // already terminalized (e.g. orphan recovery) — bail and touch nothing.
@@ -483,17 +573,24 @@ async function finishRun(
           $set: {
             status: "succeeded",
             exitCode,
-            summary,
+            summary: outSummary,
             verdict: "passed",
             finishedAt: doneAt,
           },
         },
       );
       await transitionTicketSucceeded(database, ticketId, runId, doneAt);
-      await notifyReviewReady(database, ticketId, summary);
+      await notifyReviewReady(database, ticketId, outSummary);
       return;
     }
-    await failVerifiedRun(database, runId, result.failureKind ?? "verification_failed", exitCode, summary, doneAt);
+    await failVerifiedRun(
+      database,
+      runId,
+      result.failureKind ?? "verification_failed",
+      exitCode,
+      outSummary,
+      doneAt,
+    );
     await transitionTicketFailed(database, ticketId, runId, doneAt, `verification ${result.failureKind}`);
     await notifyBlocked(database, ticketId, `verification failed (${result.failureKind})`, logFile);
   } catch (error) {
@@ -502,7 +599,14 @@ async function finishRun(
       `\nVerification error: ${error instanceof Error ? error.message : "unknown error"}\n`,
     ).catch(() => undefined);
     const failAt = now();
-    await failVerifiedRun(database, runId, "verification_failed", exitCode, summary, failAt);
+    await failVerifiedRun(
+      database,
+      runId,
+      "verification_failed",
+      exitCode,
+      outSummary,
+      failAt,
+    );
     await transitionTicketFailed(database, ticketId, runId, failAt, "verification error");
     await notifyBlocked(database, ticketId, "verification error", logFile);
   }
@@ -658,7 +762,11 @@ export async function dispatchRun(
     );
     const spawnedChild = spawn(command.cmd[0], command.cmd.slice(1), {
       cwd: paths.workDir,
-      env: { ...process.env, ...command.env },
+      env: {
+        ...process.env,
+        ...command.env,
+        T4D_OUTCOME_PATH: `${paths.runDir}/outcome.json`,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child = spawnedChild;
