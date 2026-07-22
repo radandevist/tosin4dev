@@ -111,6 +111,7 @@ describe("supervisor smoke", () => {
       name: "Supervisor Smoke",
       repoPath: repo,
       defaultBaseBranch: "main",
+      checks: [],
       createdAt: at,
       updatedAt: at,
     });

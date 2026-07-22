@@ -16,6 +16,36 @@ const BOARD_ID = "0123456789abcdef01234567";
 const TICKET_ID = "89abcdef0123456789abcdef";
 
 describe("schemas", () => {
+  describe("BoardSchema.checks", () => {
+    const base = {
+      slug: "publyapp",
+      name: "PublyApp",
+      repoPath: "/home/radan/Projects/PublyApp/publyapp",
+      defaultBaseBranch: "develop",
+    };
+    it("defaults checks to an empty array", () => {
+      const board = BoardSchema.parse(base);
+      expect(board.checks).toEqual([]);
+    });
+    it("accepts argv checks with a timeout", () => {
+      const board = BoardSchema.parse({
+        ...base,
+        checks: [
+          { key: "typecheck", label: "Typecheck", command: ["bun", "run", "typecheck"], timeoutMs: 120000 },
+        ],
+      });
+      expect(board.checks[0].command).toEqual(["bun", "run", "typecheck"]);
+    });
+    it("rejects a check with an empty command", () => {
+      expect(() =>
+        BoardSchema.parse({
+          ...base,
+          checks: [{ key: "x", label: "X", command: [], timeoutMs: 1000 }],
+        }),
+      ).toThrow();
+    });
+  });
+
   it("accepts a minimal valid ticket", () => {
     const t = TicketSchema.parse({
       boardId: BOARD_ID,

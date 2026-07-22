@@ -94,11 +94,24 @@ export const TicketSchema = z.object({
 });
 export type Ticket = z.infer<typeof TicketSchema>;
 
+// One acceptance command Tosin4dev runs itself to verify a ticket's work.
+// `command` is an argv array executed with no shell (execFile semantics), so a
+// board's stored check can never be a shell-injection vector. `key` is stable
+// and referenced by Evidence; `timeoutMs` bounds a hung check.
+export const BoardCheck = z.object({
+  key: z.string().min(1),
+  label: z.string().min(1),
+  command: z.array(z.string().min(1)).min(1),
+  timeoutMs: z.number().int().positive().default(120_000),
+});
+export type BoardCheck = z.infer<typeof BoardCheck>;
+
 export const BoardSchema = z.object({
   slug: z.string().regex(/^[a-z0-9-]+$/),
   name: z.string().min(1),
   repoPath: AbsolutePathString,
   defaultBaseBranch: z.string().min(1),
+  checks: z.array(BoardCheck).default([]),
 });
 export type Board = z.infer<typeof BoardSchema>;
 

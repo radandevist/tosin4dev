@@ -31,6 +31,7 @@ const board: Board = {
   name: "PublyApp",
   repoPath: "/repo",
   defaultBaseBranch: "develop",
+  checks: [],
 };
 
 const executablePhases: ("execute" | "review_fix")[] = [
