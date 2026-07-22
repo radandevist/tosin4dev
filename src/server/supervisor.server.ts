@@ -6,7 +6,8 @@ import {
 import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
-import type { Db, PushOperator } from "mongodb";
+import type { Collection, Db, PushOperator } from "mongodb";
+import { unmetDependencies } from "../domain/dependencies";
 import {
   BoardSchema,
   EvidenceSchema,
@@ -108,6 +109,40 @@ function phasePolicy(ticket: Ticket, phase: Phase): PhasePolicy {
     requiredStatus: "approved",
     claimedStatus: transition("approved", "dispatch"),
   };
+}
+
+async function assertDependenciesMet(
+  ticket: Ticket,
+  ticketCollection: Collection<TicketDoc>,
+): Promise<void> {
+  if (ticket.dependsOn.length === 0) return;
+  const ids = ticket.dependsOn.map((dependency) => new ObjectId(dependency));
+  const docs = await ticketCollection
+    .find({ _id: { $in: ids } })
+    .project<{ _id: ObjectId; seq: number; status: TicketStatus }>({
+      seq: 1,
+      status: 1,
+    })
+    .toArray();
+  const present = docs.map((dependency) => ({
+    ticketId: dependency._id.toString(),
+    seq: dependency.seq,
+    status: dependency.status,
+  }));
+  const unmet = unmetDependencies(ticket.dependsOn, present);
+  if (unmet.length > 0) {
+    const label = unmet
+      .map((dependency) =>
+        dependency.seq !== null
+          ? `#${dependency.seq} (${dependency.reason})`
+          : `${dependency.ticketId} (${dependency.reason})`,
+      )
+      .join(", ");
+    throw new ServerResultError(
+      "conflict",
+      `blocked: waiting on dependencies ${label}`,
+    );
+  }
 }
 
 function runPaths(board: Board, runId: string, phase: Phase) {
@@ -844,6 +879,9 @@ export async function dispatchRun(
     );
   }
   const policy = phasePolicy(ticket, phase);
+  if (phase === "execute") {
+    await assertDependenciesMet(ticket, ticketCollection);
+  }
 
   const rawBoard = await database.collection<BoardDoc>("boards").findOne({
     _id: new ObjectId(ticket.boardId),
