@@ -57,6 +57,9 @@ const adapters: Record<Ticket["runner"], RunnerAdapter> = {
   claude: claudeAdapter,
   codex: codexAdapter,
 };
+const globalForBoot = globalThis as typeof globalThis & {
+  __tosin4devRecovered?: Promise<void>;
+};
 
 const now = () => new Date().toISOString();
 
@@ -534,6 +537,7 @@ export async function dispatchRun(
   rawTicketId: string,
   rawPhase: Phase,
 ): Promise<{ runId: string }> {
+  await bootRecoveryOnce();
   const ticketId = ObjectIdString.parse(rawTicketId);
   const phase = RunPhase.parse(rawPhase);
   const database = await db();
@@ -707,22 +711,35 @@ export function isProcessAlive(pid: number | null): boolean {
   }
 }
 
+export function bootRecoveryOnce(): Promise<void> {
+  if (!globalForBoot.__tosin4devRecovered) {
+    globalForBoot.__tosin4devRecovered = recoverOrphans().catch((error) => {
+      globalForBoot.__tosin4devRecovered = undefined;
+      throw error;
+    });
+  }
+  return globalForBoot.__tosin4devRecovered;
+}
+
 export async function recoverOrphans(): Promise<void> {
   const database = await db();
   const runCollection = database.collection<RunDoc>("runs");
   const staleRuns = await runCollection
-    .find({ status: { $in: ["queued", "running"] } })
+    .find({ status: { $in: ["queued", "running", "verifying"] } })
     .toArray();
 
   for (const run of staleRuns) {
     if (isProcessAlive(run.pid)) continue;
     const at = now();
     const failed = await runCollection.updateOne(
-      { _id: run._id, status: { $in: ["queued", "running"] } },
+      { _id: run._id, status: { $in: ["queued", "running", "verifying"] } },
       {
         $set: {
           status: "failed",
           exitCode: null,
+          failureKind:
+            run.status === "verifying" ? "verification_failed" : "runner_exit",
+          verdict: run.status === "verifying" ? "failed" : null,
           summary: "Run orphaned after supervisor restart",
           finishedAt: at,
         },
