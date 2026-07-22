@@ -23,7 +23,7 @@ export function specBundles() {
   return db().then((d) => d.collection<SpecBundleDoc>("specBundles"));
 }
 
-// Explicit field-pick (never spread) — lockedAt/createdAt-internal never leak.
+// Explicit field-pick (never spread) — the server-only lockedAt never leaks.
 export function bundleToDTO(doc: WithId<SpecBundleDoc>): SpecBundleDTO {
   const validated = SpecBundleSchema.parse({
     sessionId: doc.sessionId,
@@ -46,7 +46,9 @@ export function bundleToDTO(doc: WithId<SpecBundleDoc>): SpecBundleDTO {
   });
 }
 
-async function loadDraftingBundle(bundleId: string): Promise<WithId<SpecBundleDoc>> {
+// Load a bundle by id regardless of status (readers may view a locked bundle).
+// Mutation cores in Tasks 5-6 must add their OWN drafting-status guard on top.
+async function loadBundle(bundleId: string): Promise<WithId<SpecBundleDoc>> {
   const coll = await specBundles();
   const doc = await coll.findOne({ _id: new ObjectId(bundleId) });
   if (!doc) throw new ServerResultError("not_found", `bundle not found: ${bundleId}`);
@@ -54,7 +56,7 @@ async function loadDraftingBundle(bundleId: string): Promise<WithId<SpecBundleDo
 }
 
 export async function getBundleCore(input: { bundleId: string }): Promise<SpecBundleDTO> {
-  return bundleToDTO(await loadDraftingBundle(input.bundleId));
+  return bundleToDTO(await loadBundle(input.bundleId));
 }
 
 // Edit + lock cores are implemented in Tasks 5 & 6.

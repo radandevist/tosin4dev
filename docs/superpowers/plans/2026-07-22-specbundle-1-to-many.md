@@ -615,7 +615,7 @@ export const useProposeBundleFromChat = createMutation<{ ok: true }, ChatSession
 
 ```ts
 async function requireDrafting(bundleId: string): Promise<WithId<SpecBundleDoc>> {
-  const doc = await loadDraftingBundle(bundleId);
+  const doc = await loadBundle(bundleId); // loadBundle: id-only lookup, no status guard
   if (doc.status !== "drafting") {
     throw new ServerResultError("conflict", "this bundle is locked");
   }
