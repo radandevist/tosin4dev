@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { transition, HUMAN_GATES, EventSchema } from "./stateMachine";
+import {
+  transition,
+  HUMAN_GATES,
+  EventSchema,
+  PublicEventSchema,
+} from "./stateMachine";
 import { TicketStatus } from "./schemas";
 
 describe("transition", () => {
@@ -11,8 +16,28 @@ describe("transition", () => {
     expect(transition("review_ready", "approve_final")).toBe("done");
   });
 
-  it("exposes exactly two human gates", () => {
-    expect(HUMAN_GATES).toEqual(["spec_review", "review_ready"]);
+  it("exposes exactly three human gates", () => {
+    expect(HUMAN_GATES).toEqual([
+      "spec_review",
+      "review_ready",
+      "needs_input",
+    ]);
+  });
+});
+
+describe("needs_input edges", () => {
+  it("running --run_needs_input--> needs_input", () => {
+    expect(transition("running", "run_needs_input")).toBe("needs_input");
+  });
+  it("needs_input --provide_input--> running", () => {
+    expect(transition("needs_input", "provide_input")).toBe("running");
+  });
+  it("needs_input is a human gate", () => {
+    expect(HUMAN_GATES).toContain("needs_input");
+  });
+  it("provide_input is public but run_needs_input is not", () => {
+    expect(PublicEventSchema.safeParse("provide_input").success).toBe(true);
+    expect(PublicEventSchema.safeParse("run_needs_input").success).toBe(false);
   });
 });
 
@@ -41,6 +66,8 @@ describe("transition matrix", () => {
     "approved:dispatch": "running",
     "running:run_succeeded": "review_ready",
     "running:run_failed": "blocked",
+    "running:run_needs_input": "needs_input",
+    "needs_input:provide_input": "running",
     "blocked:resume": "approved",
     "review_ready:approve_final": "done",
     "review_ready:request_changes": "running",
