@@ -1,5 +1,7 @@
 import type { WithId } from "mongodb";
+import { z } from "zod";
 import {
+  BundleMemberSchema,
   SpecBundleSchema,
   type BundleMember,
   type SpecBundle,
@@ -109,13 +111,22 @@ async function requireDrafting(bundleId: string): Promise<WithId<SpecBundleDoc>>
 
 // Persist edited members after re-validating structure; fail closed on invalid.
 async function saveMembers(bundleId: string, members: BundleMember[]): Promise<void> {
-  const invalid = validateBundleMembers(members);
+  // Validate the full member shape (not just the dependency graph) before persist,
+  // so no caller — even an untyped future one — can write a doc that later fails
+  // to read back through SpecBundleSchema.
+  const parsed = z.array(BundleMemberSchema).parse(members);
+  const invalid = validateBundleMembers(parsed);
   if (invalid) throw new ServerResultError("conflict", invalid);
   const coll = await specBundles();
-  await coll.updateOne(
+  const result = await coll.updateOne(
     { _id: new ObjectId(bundleId), status: "drafting" },
-    { $set: { members, updatedAt: now() } },
+    { $set: { members: parsed, updatedAt: now() } },
   );
+  // A concurrent lock in the requireDrafting-read → write gap matches 0 docs.
+  // Surface it as a conflict instead of reporting a silently-lost edit as success.
+  if (result.matchedCount === 0) {
+    throw new ServerResultError("conflict", "this bundle is locked");
+  }
 }
 
 export async function updateBundleMemberCore(input: {
@@ -158,7 +169,14 @@ export async function reorderBundleCore(input: {
   const doc = await requireDrafting(input.bundleId);
   const current = new Set(doc.members.map((m) => m.localKey));
   const next = new Set(input.orderedLocalKeys);
-  if (current.size !== next.size || [...current].some((k) => !next.has(k))) {
+  // Exact permutation: same length (rejects a superset with duplicates like
+  // ["t1","t1","t2"]) AND same key set (rejects subset/foreign keys). The
+  // length check is self-contained; it does not lean on the downstream validator.
+  if (
+    input.orderedLocalKeys.length !== doc.members.length ||
+    current.size !== next.size ||
+    [...current].some((k) => !next.has(k))
+  ) {
     throw new ServerResultError(
       "conflict",
       "reorder must be a permutation of current keys",
