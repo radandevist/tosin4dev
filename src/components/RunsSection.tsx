@@ -131,6 +131,9 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
             queryClient.invalidateQueries({
               queryKey: useTickets.getKey({ boardId: ticket.boardId }),
             }),
+            queryClient.invalidateQueries({
+              queryKey: useDependencyStatus.getKey(),
+            }),
           ]);
         },
         onSettled: () => {
