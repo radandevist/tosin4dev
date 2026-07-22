@@ -351,6 +351,29 @@ async function notifyBlocked(
   await notify(`⛔ blocked: ${await ticketLabel(database, ticketId)} — ${reason}. Log: ${logFile}`);
 }
 
+async function failVerifiedRun(
+  database: Db,
+  runId: string,
+  failureKind: "runner_exit" | "no_commit" | "verification_failed",
+  exitCode: number,
+  summary: string | null,
+  at: string,
+): Promise<void> {
+  await database.collection<RunDoc>("runs").updateOne(
+    { _id: new ObjectId(runId), status: { $in: ["queued", "running", "verifying"] } },
+    {
+      $set: {
+        status: "failed",
+        exitCode,
+        summary,
+        verdict: "failed",
+        failureKind,
+        finishedAt: at,
+      },
+    },
+  );
+}
+
 async function finishRun(
   runId: string,
   ticketId: string,
@@ -420,14 +443,17 @@ async function finishRun(
     return;
   }
 
-  // exit 0: Tosin4dev — not the runner — proves the work. Enter `verifying`.
-  await runs.updateOne(
-    { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
-    { $set: { status: "verifying" } },
-  );
-  const run = await runs.findOne({ _id: new ObjectId(runId) });
+  // exit 0: Tosin4dev proves the work. Claim the `verifying` transition INSIDE the
+  // try so any failure here is fail-closed. If we can't claim it, the run was
+  // already terminalized (e.g. orphan recovery) — bail and touch nothing.
+  const verifyAt = now();
   try {
-    const verifyAt = now();
+    const claimed = await runs.updateOne(
+      { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
+      { $set: { status: "verifying" } },
+    );
+    if (claimed.matchedCount === 0) return;
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
     const result = await verifyRun({
       repoPath: board.repoPath,
       workDir: run?.workDir ?? board.repoPath,
@@ -445,8 +471,8 @@ async function finishRun(
       checks: result.checks,
       verdict: result.verdict,
     });
-    await database.collection("evidence").insertOne({ ...evidence, createdAt: verifyAt });
-
+    const doneAt = now();
+    await database.collection("evidence").insertOne({ ...evidence, createdAt: doneAt });
     if (result.verdict === "passed") {
       await runs.updateOne(
         { _id: new ObjectId(runId), status: "verifying" },
@@ -456,50 +482,24 @@ async function finishRun(
             exitCode,
             summary,
             verdict: "passed",
-            finishedAt: verifyAt,
+            finishedAt: doneAt,
           },
         },
       );
-      await transitionTicketSucceeded(database, ticketId, runId, verifyAt);
+      await transitionTicketSucceeded(database, ticketId, runId, doneAt);
       await notifyReviewReady(database, ticketId, summary);
       return;
     }
-    await runs.updateOne(
-      { _id: new ObjectId(runId), status: "verifying" },
-      {
-        $set: {
-          status: "failed",
-          exitCode,
-          summary,
-          verdict: "failed",
-          failureKind: result.failureKind,
-          finishedAt: verifyAt,
-        },
-      },
-    );
-    await transitionTicketFailed(database, ticketId, runId, verifyAt, `verification ${result.failureKind}`);
+    await failVerifiedRun(database, runId, result.failureKind ?? "verification_failed", exitCode, summary, doneAt);
+    await transitionTicketFailed(database, ticketId, runId, doneAt, `verification ${result.failureKind}`);
     await notifyBlocked(database, ticketId, `verification failed (${result.failureKind})`, logFile);
   } catch (error) {
-    // verifyRun / Evidence parse crashed — treat as a FAILED verification, never
-    // leave the run stuck in `verifying`.
     await appendFile(
       logFile,
       `\nVerification error: ${error instanceof Error ? error.message : "unknown error"}\n`,
     ).catch(() => undefined);
     const failAt = now();
-    await runs.updateOne(
-      { _id: new ObjectId(runId), status: "verifying" },
-      {
-        $set: {
-          status: "failed",
-          exitCode,
-          summary,
-          verdict: "failed",
-          failureKind: "verification_failed",
-          finishedAt: failAt,
-        },
-      },
-    );
+    await failVerifiedRun(database, runId, "verification_failed", exitCode, summary, failAt);
     await transitionTicketFailed(database, ticketId, runId, failAt, "verification error");
     await notifyBlocked(database, ticketId, "verification error", logFile);
   }
