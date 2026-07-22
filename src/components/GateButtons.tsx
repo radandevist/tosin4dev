@@ -1,6 +1,11 @@
 import { useQueryClient } from "@tanstack/react-query";
 import type { TicketDTO, TransitionInput } from "../server/tickets";
-import { useTicket, useTickets, useTransition } from "../queries/tickets";
+import {
+  useDependencyStatus,
+  useTicket,
+  useTickets,
+  useTransition,
+} from "../queries/tickets";
 import type { TicketStatus } from "./TicketCard";
 
 // The public gate a human may trigger from a given status. `event` is typed as
@@ -61,13 +66,16 @@ export function GateButtons({ ticket }: { ticket: TicketDTO }) {
   const gates = gatesForStatus(ticket.status);
 
   // A gate moves the ticket, so both the ticket detail and its board list are
-  // now stale. Invalidate exactly those two cache entries by their typed keys.
+  // now stale. Invalidate the ticket caches and all dependency status entries.
   const invalidate = () => {
     queryClient.invalidateQueries({
       queryKey: useTicket.getKey({ boardId: ticket.boardId, seq: ticket.seq }),
     });
     queryClient.invalidateQueries({
       queryKey: useTickets.getKey({ boardId: ticket.boardId }),
+    });
+    queryClient.invalidateQueries({
+      queryKey: useDependencyStatus.getKey(),
     });
   };
 
