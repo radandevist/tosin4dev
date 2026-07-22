@@ -244,12 +244,31 @@ export async function lockBundleCore(input: {
     return { tickets: created.map((c) => ({ ticketId: c.ticketId, seq: c.seq })) };
   } catch (error) {
     // Compensation (no transactions): delete every ticket created in this lock,
-    // revert the bundle to drafting. All-or-nothing.
-    await deleteTicketsByIds(created.map((c) => c.ticketId)).catch(() => undefined);
-    await coll.updateOne(
-      { _id: new ObjectId(input.bundleId) },
-      { $set: { status: "drafting", lockedAt: null, lockedTicketIds: null, updatedAt: now() } },
+    // then revert the bundle to drafting. Delete-then-revert deliberately fails
+    // toward "stuck but no orphans" rather than "drafting with live orphans a
+    // retry would duplicate". Both cleanup steps swallow-and-log their own errors
+    // so the ORIGINAL failure is what surfaces to the caller (more actionable).
+    await deleteTicketsByIds(created.map((c) => c.ticketId)).catch((e) =>
+      // Silent orphan leak otherwise (tickets carry no back-ref to the bundle).
+      console.error(
+        `lockBundle compensation: ticket delete failed for bundle ${input.bundleId} (possible orphans):`,
+        e,
+      ),
     );
+    // Known non-atomic edge: if this revert throws, the bundle is stranded
+    // `locked` with null lockedTicketIds and cannot re-lock. Swallow+log so the
+    // original error still propagates instead of being masked by the revert throw.
+    await coll
+      .updateOne(
+        { _id: new ObjectId(input.bundleId) },
+        { $set: { status: "drafting", lockedAt: null, lockedTicketIds: null, updatedAt: now() } },
+      )
+      .catch((e) =>
+        console.error(
+          `lockBundle compensation: bundle revert failed for ${input.bundleId} (stranded locked):`,
+          e,
+        ),
+      );
     throw error instanceof ServerResultError
       ? error
       : new ServerResultError("spawn_failed", "could not create all tickets; rolled back");
