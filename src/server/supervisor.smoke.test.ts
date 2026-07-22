@@ -83,7 +83,10 @@ async function writeRunner(
     ? `echo "artifact $$" > verify-artifact.txt\ngit add -A\ngit commit -m "runner work" >/dev/null 2>&1\n`
     : "";
   const executable = join(binDirectory, "claude");
-  await writeFile(executable, `#!/bin/sh\n${body}\n${commitBody}exit ${exitCode}\n`);
+  await writeFile(
+    executable,
+    `#!/bin/sh\n${body}\n${commitBody}printf '%s' '{"outcome":"completed","summary":"smoke ok"}' > "$T4D_OUTCOME_PATH"\nexit ${exitCode}\n`,
+  );
   await chmod(executable, 0o755);
 }
 

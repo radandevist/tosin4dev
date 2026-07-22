@@ -39,7 +39,7 @@ async function writeRunner(commit: boolean, exitCode = 0): Promise<void> {
   const exe = join(binDirectory, "claude");
   await writeFile(
     exe,
-    `#!/bin/sh\nprintf '%s\\n' 'out'\nprintf '%s\\n' '## SUMMARY'\nprintf '%s\\n' 'ok'\n${commitBody}exit ${exitCode}\n`,
+    `#!/bin/sh\nprintf '%s\\n' 'out'\nprintf '%s\\n' '## SUMMARY'\nprintf '%s\\n' 'ok'\n${commitBody}printf '%s' '{"outcome":"completed"}' > "$T4D_OUTCOME_PATH"\nexit ${exitCode}\n`,
   );
   await chmod(exe, 0o755);
 }
