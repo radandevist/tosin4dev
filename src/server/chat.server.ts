@@ -12,7 +12,7 @@ import { ChatSessionDTOSchema, type ChatSessionDTO } from "./chat";
 import { buildChatCommand } from "./chatCommand";
 import {
   parseBundle,
-  parseChatResult,
+  parseTurn,
   validateBundleMembers,
 } from "./chatResult";
 import { db, ObjectId } from "./db";
@@ -97,12 +97,17 @@ async function monitorChatTurn(
     await failTurn(sessionId, `the assistant exited with code ${code}`);
     return;
   }
-  const parsed = parseChatResult(stdout);
+  const coll = await chatSessions();
+  const session = await coll.findOne({ _id: new ObjectId(sessionId) });
+  if (!session) {
+    await failTurn(sessionId, "session vanished mid-turn");
+    return;
+  }
+  const parsed = parseTurn(session.provider, stdout);
   if (!parsed) {
     await failTurn(sessionId, "the assistant returned no parseable reply");
     return;
   }
-  const coll = await chatSessions();
   const at = now();
   const sidPatch = parsed.sessionId ? { sessionId: parsed.sessionId } : {};
 
@@ -137,14 +142,9 @@ async function monitorChatTurn(
     return;
   }
   // The draft branch has a wider pre-finalize DB surface than the message
-  // branch (session re-load + bundle upsert). Fail closed: a transient DB throw
-  // here becomes an immediate retryable error, not a ≤STUCK_TURN_MS stuck turn.
+  // branch (bundle upsert). Fail closed: a transient DB throw here becomes an
+  // immediate retryable error, not a ≤STUCK_TURN_MS stuck turn.
   try {
-    const session = await coll.findOne({ _id: new ObjectId(sessionId) });
-    if (!session) {
-      await failTurn(sessionId, "session vanished mid-turn");
-      return;
-    }
     const bundleId = await replaceDraftingBundle(
       sessionId,
       session.boardId,

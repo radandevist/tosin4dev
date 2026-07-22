@@ -26,6 +26,33 @@ export function parseChatResult(
   return null;
 }
 
+export function parseTurn(
+  provider: "claude" | "codex",
+  stdout: string,
+): { result: string; sessionId: string | null } | null {
+  if (provider === "claude") return parseChatResult(stdout);
+  let text: string | null = null;
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      const item = obj?.item as Record<string, unknown> | undefined;
+      if (
+        obj?.type === "item.completed" &&
+        item?.type === "agent_message" &&
+        typeof item.text === "string"
+      ) {
+        text = item.text;
+      }
+    } catch {
+      continue;
+    }
+  }
+  if (text === null) return null;
+  return { result: text, sessionId: parseSessionId("codex", stdout) };
+}
+
 // Parse the model's drafted spec text into a validated ChatDraft. Tolerates a
 // ```json fence; anything not matching the schema fails closed (null).
 export function parseDraft(text: string): ChatDraft | null {
