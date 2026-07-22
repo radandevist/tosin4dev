@@ -1,6 +1,12 @@
-import { createFileRoute, Link, Outlet } from "@tanstack/react-router";
+import {
+  createFileRoute,
+  Link,
+  Outlet,
+  useNavigate,
+} from "@tanstack/react-router";
 import type { TicketDTO } from "../../server/tickets";
 import { useBoard } from "../../queries/boards";
+import { useCreateChatSession } from "../../queries/chat";
 import { useTickets } from "../../queries/tickets";
 import {
   BOARD_COLUMNS,
@@ -13,6 +19,8 @@ export const Route = createFileRoute("/b/$boardSlug")({ component: BoardPage });
 function BoardPage() {
   const { boardSlug } = Route.useParams();
   const board = useBoard({ variables: { slug: boardSlug } });
+  const navigate = useNavigate();
+  const createChat = useCreateChatSession();
 
   // The ticket list depends on the board's id, which only exists once the board
   // query resolves. `enabled` gates the dependent query until then and the typed
@@ -22,6 +30,19 @@ function BoardPage() {
     variables: { boardId: boardId ?? "" },
     enabled: Boolean(boardId),
   });
+  const startBrainstorm = () => {
+    if (!boardId || createChat.isPending) return;
+    createChat.mutate(
+      { boardId },
+      {
+        onSuccess: ({ id }) =>
+          navigate({
+            to: "/b/$boardSlug/chat/$sessionId",
+            params: { boardSlug, sessionId: id },
+          }),
+      },
+    );
+  };
 
   return (
     <main className="mx-auto max-w-[100rem] p-4 sm:p-6">
@@ -38,13 +59,23 @@ function BoardPage() {
           </h1>
         </div>
         {board.data ? (
-          <Link
-            to="/b/$boardSlug/new"
-            params={{ boardSlug }}
-            className="rounded-lg bg-zinc-900 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
-          >
-            New ticket
-          </Link>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              disabled={createChat.isPending}
+              onClick={startBrainstorm}
+              className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:opacity-50"
+            >
+              {createChat.isPending ? "Starting…" : "Brainstorm"}
+            </button>
+            <Link
+              to="/b/$boardSlug/new"
+              params={{ boardSlug }}
+              className="rounded-lg bg-zinc-900 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
+            >
+              New ticket
+            </Link>
+          </div>
         ) : null}
       </header>
 

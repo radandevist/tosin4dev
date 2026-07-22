@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as BBoardSlugRouteImport } from './routes/b/$boardSlug'
 import { Route as BBoardSlugNewRouteImport } from './routes/b/$boardSlug/new'
+import { Route as BBoardSlugChatSessionIdRouteImport } from './routes/b/$boardSlug/chat/$sessionId'
 import { Route as BBoardSlugTTicketSeqRouteImport } from './routes/b/$boardSlug/t/$ticketSeq'
 
 const IndexRoute = IndexRouteImport.update({
@@ -29,6 +30,11 @@ const BBoardSlugNewRoute = BBoardSlugNewRouteImport.update({
   path: '/new',
   getParentRoute: () => BBoardSlugRoute,
 } as any)
+const BBoardSlugChatSessionIdRoute = BBoardSlugChatSessionIdRouteImport.update({
+  id: '/chat/$sessionId',
+  path: '/chat/$sessionId',
+  getParentRoute: () => BBoardSlugRoute,
+} as any)
 const BBoardSlugTTicketSeqRoute = BBoardSlugTTicketSeqRouteImport.update({
   id: '/t/$ticketSeq',
   path: '/t/$ticketSeq',
@@ -39,12 +45,14 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/b/$boardSlug': typeof BBoardSlugRouteWithChildren
   '/b/$boardSlug/new': typeof BBoardSlugNewRoute
+  '/b/$boardSlug/chat/$sessionId': typeof BBoardSlugChatSessionIdRoute
   '/b/$boardSlug/t/$ticketSeq': typeof BBoardSlugTTicketSeqRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/b/$boardSlug': typeof BBoardSlugRouteWithChildren
   '/b/$boardSlug/new': typeof BBoardSlugNewRoute
+  '/b/$boardSlug/chat/$sessionId': typeof BBoardSlugChatSessionIdRoute
   '/b/$boardSlug/t/$ticketSeq': typeof BBoardSlugTTicketSeqRoute
 }
 export interface FileRoutesById {
@@ -52,19 +60,30 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/b/$boardSlug': typeof BBoardSlugRouteWithChildren
   '/b/$boardSlug/new': typeof BBoardSlugNewRoute
+  '/b/$boardSlug/chat/$sessionId': typeof BBoardSlugChatSessionIdRoute
   '/b/$boardSlug/t/$ticketSeq': typeof BBoardSlugTTicketSeqRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/b/$boardSlug' | '/b/$boardSlug/new' | '/b/$boardSlug/t/$ticketSeq'
+    | '/'
+    | '/b/$boardSlug'
+    | '/b/$boardSlug/new'
+    | '/b/$boardSlug/chat/$sessionId'
+    | '/b/$boardSlug/t/$ticketSeq'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/b/$boardSlug' | '/b/$boardSlug/new' | '/b/$boardSlug/t/$ticketSeq'
+  to:
+    | '/'
+    | '/b/$boardSlug'
+    | '/b/$boardSlug/new'
+    | '/b/$boardSlug/chat/$sessionId'
+    | '/b/$boardSlug/t/$ticketSeq'
   id:
     | '__root__'
     | '/'
     | '/b/$boardSlug'
     | '/b/$boardSlug/new'
+    | '/b/$boardSlug/chat/$sessionId'
     | '/b/$boardSlug/t/$ticketSeq'
   fileRoutesById: FileRoutesById
 }
@@ -96,6 +115,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof BBoardSlugNewRouteImport
       parentRoute: typeof BBoardSlugRoute
     }
+    '/b/$boardSlug/chat/$sessionId': {
+      id: '/b/$boardSlug/chat/$sessionId'
+      path: '/chat/$sessionId'
+      fullPath: '/b/$boardSlug/chat/$sessionId'
+      preLoaderRoute: typeof BBoardSlugChatSessionIdRouteImport
+      parentRoute: typeof BBoardSlugRoute
+    }
     '/b/$boardSlug/t/$ticketSeq': {
       id: '/b/$boardSlug/t/$ticketSeq'
       path: '/t/$ticketSeq'
@@ -108,11 +134,13 @@ declare module '@tanstack/react-router' {
 
 interface BBoardSlugRouteChildren {
   BBoardSlugNewRoute: typeof BBoardSlugNewRoute
+  BBoardSlugChatSessionIdRoute: typeof BBoardSlugChatSessionIdRoute
   BBoardSlugTTicketSeqRoute: typeof BBoardSlugTTicketSeqRoute
 }
 
 const BBoardSlugRouteChildren: BBoardSlugRouteChildren = {
   BBoardSlugNewRoute: BBoardSlugNewRoute,
+  BBoardSlugChatSessionIdRoute: BBoardSlugChatSessionIdRoute,
   BBoardSlugTTicketSeqRoute: BBoardSlugTTicketSeqRoute,
 }
 
