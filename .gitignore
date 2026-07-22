@@ -20,6 +20,9 @@ dist-ssr/
 .env.*.local
 !.env.example
 
+# brainstorm visual companion mockups
+.superpowers/
+
 # misc
 .dump/
 *.log
