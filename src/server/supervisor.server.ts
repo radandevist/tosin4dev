@@ -605,6 +605,8 @@ export async function dispatchRun(
     baseSha: null,
     verdict: null,
     failureKind: null,
+    executionSessionId: null,
+    awaitingQuestion: null,
     queuedAt: claimAt,
     startedAt: null,
     finishedAt: null,

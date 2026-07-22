@@ -12,6 +12,7 @@ export const TicketStatus = z.enum([
   "spec_review",
   "approved",
   "running",
+  "needs_input",
   "blocked",
   "review_ready",
   "done",
@@ -119,6 +120,7 @@ export const RunPhase = z.enum(["spec_draft", "execute", "review_fix"]);
 export const RunStatus = z.enum([
   "queued",
   "running",
+  "awaiting_input",
   "verifying",
   "succeeded",
   "failed",
@@ -146,11 +148,32 @@ export const RunSchema = z.object({
   // Distinguishes WHY a run failed: a nonzero runner exit vs. a runner that
   // exited 0 but produced no reachable commit / failed an acceptance check.
   failureKind: z
-    .enum(["runner_exit", "no_commit", "verification_failed"])
+    .enum([
+      "runner_exit",
+      "no_commit",
+      "verification_failed",
+      "runner_reported_failure",
+    ])
     .nullable()
     .default(null),
+  // Provider conversation id captured from the runner's structured output, so
+  // a later turn can resume the SAME session. null for legacy/uncaptured runs.
+  executionSessionId: z.string().nullable().default(null),
+  // The question a `needs_input` run is parked on; null otherwise.
+  awaitingQuestion: z.string().nullable().default(null),
 });
 export type Run = z.infer<typeof RunSchema>;
+
+// The structured outcome an execute/review_fix runner writes to
+// <runDir>/outcome.json to declare a semantic result. Missing/invalid is
+// treated as `failed` by the supervisor (fail-closed).
+export const RunOutcomeSchema = z.object({
+  outcome: z.enum(["completed", "needs_input", "failed"]),
+  question: z.string().nullable().default(null),
+  reason: z.string().nullable().default(null),
+  summary: z.string().nullable().default(null),
+});
+export type RunOutcome = z.infer<typeof RunOutcomeSchema>;
 
 export const EvidenceCheck = z.object({
   key: z.string().min(1),
