@@ -1,8 +1,34 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type { WithId } from "mongodb";
-import { ChatSessionSchema, type ChatSession } from "../domain/schemas";
+import {
+  BoardSchema,
+  ChatSessionSchema,
+  type Board,
+  type ChatSession,
+} from "../domain/schemas";
 import { ChatSessionDTOSchema, type ChatSessionDTO } from "./chat";
+import { buildChatCommand } from "./chatCommand";
+import { parseChatResult, parseDraft } from "./chatResult";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
+import {
+  drainStream,
+  isProcessAlive,
+  settledExit,
+  waitForSpawn,
+} from "./supervisor.server";
+
+type BoardDoc = Board & { createdAt: string; updatedAt: string };
+
+const STUCK_TURN_MS = 5 * 60 * 1000;
+
+interface RunningTurn {
+  stdout: Promise<string>;
+  stderr: Promise<string>;
+  exited: Promise<number>;
+}
 
 // Persisted chat session document: validated fields + server-owned bookkeeping.
 export type ChatSessionDoc = ChatSession & {
@@ -18,6 +44,199 @@ export const now = () => new Date().toISOString();
 
 export function chatSessions() {
   return db().then((d) => d.collection<ChatSessionDoc>("chatSessions"));
+}
+
+async function loadBoard(boardId: string): Promise<Board> {
+  const database = await db();
+  const raw = await database
+    .collection<BoardDoc>("boards")
+    .findOne({ _id: new ObjectId(boardId) });
+  if (!raw) throw new ServerResultError("not_found", `board not found: ${boardId}`);
+  return BoardSchema.parse(raw);
+}
+
+async function failTurn(sessionId: string, message: string): Promise<void> {
+  const coll = await chatSessions();
+  await coll.updateOne(
+    { _id: new ObjectId(sessionId) },
+    {
+      $set: {
+        turnStatus: "error",
+        turnError: message,
+        pendingKind: null,
+        pendingUserMessageAt: null,
+        pid: null,
+        updatedAt: now(),
+      },
+    },
+  );
+}
+
+async function monitorChatTurn(
+  running: RunningTurn,
+  sessionId: string,
+  kind: "message" | "draft",
+): Promise<void> {
+  let stdout: string;
+  let code: number;
+  try {
+    [stdout, , code] = await Promise.all([
+      running.stdout,
+      running.stderr,
+      running.exited,
+    ]);
+  } catch {
+    await failTurn(sessionId, "the assistant process errored");
+    return;
+  }
+  if (code !== 0) {
+    await failTurn(sessionId, `the assistant exited with code ${code}`);
+    return;
+  }
+  const parsed = parseChatResult(stdout);
+  if (!parsed) {
+    await failTurn(sessionId, "the assistant returned no parseable reply");
+    return;
+  }
+  const coll = await chatSessions();
+  const at = now();
+  const sidPatch = parsed.sessionId ? { sessionId: parsed.sessionId } : {};
+
+  if (kind === "message") {
+    await coll.updateOne(
+      { _id: new ObjectId(sessionId) },
+      {
+        $set: {
+          turnStatus: "idle",
+          pendingKind: null,
+          pendingUserMessageAt: null,
+          pid: null,
+          updatedAt: at,
+          ...sidPatch,
+        },
+        $push: { messages: { role: "assistant", text: parsed.result, at } },
+      },
+    );
+    return;
+  }
+
+  const draft = parseDraft(parsed.result);
+  if (!draft) {
+    await failTurn(sessionId, "the drafted spec was not valid JSON");
+    return;
+  }
+  await coll.updateOne(
+    { _id: new ObjectId(sessionId) },
+    {
+      $set: {
+        turnStatus: "idle",
+        pendingKind: null,
+        pendingUserMessageAt: null,
+        pid: null,
+        proposedSpec: draft,
+        updatedAt: at,
+        ...sidPatch,
+      },
+    },
+  );
+}
+
+// Claim a pending turn (throws on conflict/not-found BEFORE any side effect),
+// then spawn the assistant. Once claimed, all execution failures resolve into
+// turnStatus:"error" (retryable) rather than throwing — the poll surfaces it.
+export async function startChatTurn(
+  sessionId: string,
+  text: string,
+  kind: "message" | "draft",
+): Promise<void> {
+  const coll = await chatSessions();
+  const doc = await coll.findOne({ _id: new ObjectId(sessionId) });
+  if (!doc) {
+    throw new ServerResultError("not_found", `chat session not found: ${sessionId}`);
+  }
+  if (doc.turnStatus === "pending") {
+    throw new ServerResultError("conflict", "a turn is already in progress");
+  }
+  const board = await loadBoard(doc.boardId);
+
+  const at = now();
+  const logFile = `${board.repoPath}/.tosin4dev/chat/${sessionId}/turn.log`;
+  await mkdir(dirname(logFile), { recursive: true });
+  await writeFile(logFile, "");
+
+  const claim = await coll.updateOne(
+    { _id: new ObjectId(sessionId), turnStatus: { $ne: "pending" } },
+    {
+      $set: {
+        turnStatus: "pending",
+        pendingKind: kind,
+        pendingUserMessageAt: at,
+        turnError: null,
+        logFile,
+        pid: null,
+        updatedAt: at,
+      },
+      ...(kind === "message"
+        ? { $push: { messages: { role: "user", text, at } } }
+        : {}),
+    },
+  );
+  if (claim.matchedCount === 0) {
+    throw new ServerResultError("conflict", "a turn is already in progress");
+  }
+
+  let child: ChildProcess | undefined;
+  let running: RunningTurn | undefined;
+  try {
+    const cmd = buildChatCommand(text, doc.sessionId);
+    const spawned = spawn(cmd[0], cmd.slice(1), {
+      cwd: board.repoPath,
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child = spawned;
+    running = {
+      stdout: drainStream(spawned.stdout, logFile, true),
+      stderr: drainStream(spawned.stderr, logFile, false),
+      exited: settledExit(spawned),
+    };
+    void Promise.all([running.stdout, running.stderr, running.exited]).catch(
+      () => undefined,
+    );
+    await waitForSpawn(spawned);
+    await coll.updateOne(
+      { _id: new ObjectId(sessionId) },
+      { $set: { pid: spawned.pid ?? null } },
+    );
+    void monitorChatTurn(running, sessionId, kind).catch((error) =>
+      console.error(`Chat monitor failed for session ${sessionId}:`, error),
+    );
+  } catch {
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await running?.exited.catch(() => undefined);
+    }
+    await failTurn(sessionId, "could not start the assistant");
+  }
+}
+
+// Light boot/stuck reconcile: a session left `pending` by a crash (dead pid or
+// a turn older than STUCK_TURN_MS) is failed so it becomes retryable. Called on
+// read; full daemon recovery is out of scope (a stuck brainstorm is low-stakes).
+export async function reconcileChatSession(
+  doc: WithId<ChatSessionDoc>,
+): Promise<void> {
+  if (doc.turnStatus !== "pending") return;
+  const stale =
+    doc.pendingUserMessageAt !== null &&
+    Date.now() - new Date(doc.pendingUserMessageAt).getTime() > STUCK_TURN_MS;
+  // A null pid means the turn is still starting: claimed (turnStatus:"pending")
+  // but the pid is written only AFTER waitForSpawn resolves. A concurrent poll
+  // hitting that window must NOT reap a healthy turn — treat null pid as alive
+  // unless it has gone stale. Only reap a turn whose RECORDED pid is dead, or
+  // any pending turn past STUCK_TURN_MS (the crash-during-startup backstop).
+  if (!stale && (doc.pid === null || isProcessAlive(doc.pid))) return;
+  await failTurn(doc._id.toString(), "the previous turn was interrupted");
 }
 
 // Explicit field-pick (never spread) so growth of ChatSessionDoc can never
@@ -54,12 +273,16 @@ export async function getChatSessionCore(input: {
   sessionId: string;
 }): Promise<ChatSessionDTO> {
   const coll = await chatSessions();
-  const doc = await coll.findOne({ _id: new ObjectId(input.sessionId) });
+  let doc = await coll.findOne({ _id: new ObjectId(input.sessionId) });
   if (!doc) {
     throw new ServerResultError(
       "not_found",
       `chat session not found: ${input.sessionId}`,
     );
+  }
+  if (doc.turnStatus === "pending") {
+    await reconcileChatSession(doc);
+    doc = (await coll.findOne({ _id: new ObjectId(input.sessionId) })) ?? doc;
   }
   return chatToDTO(doc);
 }
