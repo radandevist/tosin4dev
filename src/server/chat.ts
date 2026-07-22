@@ -8,6 +8,7 @@ import {
 import {
   createChatSessionCore,
   getChatSessionCore,
+  proposeBundleFromChatCore,
   sendChatMessageCore,
 } from "./chat.server";
 import { boundary, type ServerResult } from "./result";
@@ -71,4 +72,10 @@ export const sendChatMessage = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
     boundary(SendChatMessageInputSchema, data, sendChatMessageCore),
+  );
+
+export const proposeBundleFromChat = createServerFn({ method: "POST" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
+    boundary(ChatSessionRefSchema, data, proposeBundleFromChatCore),
   );

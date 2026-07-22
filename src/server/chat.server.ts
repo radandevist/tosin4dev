@@ -10,9 +10,14 @@ import {
 } from "../domain/schemas";
 import { ChatSessionDTOSchema, type ChatSessionDTO } from "./chat";
 import { buildChatCommand } from "./chatCommand";
-import { parseChatResult } from "./chatResult";
+import {
+  parseBundle,
+  parseChatResult,
+  validateBundleMembers,
+} from "./chatResult";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
+import { replaceDraftingBundle } from "./specBundles.server";
 import {
   drainStream,
   settledExit,
@@ -120,8 +125,42 @@ async function monitorChatTurn(
     return;
   }
 
-  await failTurn(sessionId, "bundle proposal not yet wired");
-  return;
+  // kind === "draft": propose a SpecBundle.
+  const proposal = parseBundle(parsed.result);
+  if (!proposal) {
+    await failTurn(sessionId, "the proposal was not valid JSON");
+    return;
+  }
+  const invalid = validateBundleMembers(proposal.members);
+  if (invalid) {
+    await failTurn(sessionId, `the proposal is invalid: ${invalid}`);
+    return;
+  }
+  const session = await coll.findOne({ _id: new ObjectId(sessionId) });
+  if (!session) {
+    await failTurn(sessionId, "session vanished mid-turn");
+    return;
+  }
+  const bundleId = await replaceDraftingBundle(
+    sessionId,
+    session.boardId,
+    proposal,
+  );
+  await coll.updateOne(
+    { _id: new ObjectId(sessionId) },
+    {
+      $set: {
+        turnStatus: "idle",
+        turnError: null,
+        pendingKind: null,
+        pendingUserMessageAt: null,
+        pid: null,
+        bundleId,
+        updatedAt: at,
+        ...sidPatch,
+      },
+    },
+  );
 }
 
 // Claim a pending turn (throws on conflict/not-found BEFORE any side effect),
@@ -313,5 +352,40 @@ export async function sendChatMessageCore(input: {
   text: string;
 }): Promise<{ ok: true }> {
   await startChatTurn(input.sessionId, input.text, "message");
+  return { ok: true };
+}
+
+const BUNDLE_INSTRUCTION = [
+  "Based on our conversation, decompose the work into one or more tickets.",
+  "Respond with ONLY a JSON object, no prose, matching exactly:",
+  '{"rationale":string,"members":[{"localKey":string,',
+  '"title":string,"type":"research"|"spec"|"implement"|"bugfix"|"review",',
+  '"runner":"claude"|"codex",',
+  '"spec":{"intent":string,"scope":string,"nonGoals":string,',
+  '"acceptance":string[],"links":string[],"risk":"low"|"medium"|"high"},',
+  '"dependsOn":string[]}]}',
+  "localKey is a short unique id per ticket (t1,t2,…); dependsOn lists the",
+  "localKeys this ticket depends on. No cycles. Prefer one ticket unless the",
+  "work is genuinely separable.",
+].join(" ");
+
+export async function proposeBundleFromChatCore(input: {
+  sessionId: string;
+}): Promise<{ ok: true }> {
+  const coll = await chatSessions();
+  const doc = await coll.findOne({ _id: new ObjectId(input.sessionId) });
+  if (!doc) {
+    throw new ServerResultError(
+      "not_found",
+      `chat session not found: ${input.sessionId}`,
+    );
+  }
+  if (doc.status !== "active") {
+    throw new ServerResultError(
+      "conflict",
+      "this session has already locked its tickets",
+    );
+  }
+  await startChatTurn(input.sessionId, BUNDLE_INSTRUCTION, "draft");
   return { ok: true };
 }

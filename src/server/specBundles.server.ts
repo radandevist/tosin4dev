@@ -1,5 +1,9 @@
 import type { WithId } from "mongodb";
-import { SpecBundleSchema, type SpecBundle } from "../domain/schemas";
+import {
+  SpecBundleSchema,
+  type SpecBundle,
+  type SpecBundleProposal,
+} from "../domain/schemas";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
 import {
@@ -21,6 +25,43 @@ export const now = () => new Date().toISOString();
 
 export function specBundles() {
   return db().then((d) => d.collection<SpecBundleDoc>("specBundles"));
+}
+
+// Upsert THE drafting bundle for a session (one per session): replace any
+// existing drafting bundle's contents, or insert a new one. Returns the bundle id.
+export async function replaceDraftingBundle(
+  sessionId: string,
+  boardId: string,
+  proposal: SpecBundleProposal,
+): Promise<string> {
+  const coll = await specBundles();
+  const at = now();
+  const existing = await coll.findOne({ sessionId, status: "drafting" });
+  if (existing) {
+    await coll.updateOne(
+      { _id: existing._id },
+      {
+        $set: {
+          rationale: proposal.rationale,
+          members: proposal.members,
+          updatedAt: at,
+        },
+      },
+    );
+    return existing._id.toString();
+  }
+  const r = await coll.insertOne({
+    sessionId,
+    boardId,
+    status: "drafting",
+    rationale: proposal.rationale,
+    members: proposal.members,
+    lockedTicketIds: null,
+    createdAt: at,
+    updatedAt: at,
+    lockedAt: null,
+  });
+  return r.insertedId.toString();
 }
 
 // Explicit field-pick (never spread) — the server-only lockedAt never leaks.
