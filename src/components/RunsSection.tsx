@@ -11,8 +11,9 @@ import type { TicketDTO } from "../server/tickets";
 import {
   dispatchActionForTicket,
   formatRunTimestamp,
-  isTerminalRunStatus,
+  isTicketAdvancingRunStatus,
   shouldPollLog,
+  shouldPollRun,
 } from "./runsUi";
 
 const EMPTY_RUN_ID = "000000000000000000000000";
@@ -32,9 +33,9 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
       const activeRun = query.state.data?.find(
         (run) => run._id === ticket.activeRunId,
       );
-      return activeRun && isTerminalRunStatus(activeRun.status)
-        ? false
-        : POLL_INTERVAL_MS;
+      return activeRun && shouldPollRun(activeRun.status)
+        ? POLL_INTERVAL_MS
+        : false;
     },
   });
 
@@ -59,7 +60,7 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
     if (activeRunId === null) return;
 
     const activeRun = runs.data?.find((run) => run._id === activeRunId);
-    if (!activeRun || !isTerminalRunStatus(activeRun.status)) return;
+    if (!activeRun || !isTicketAdvancingRunStatus(activeRun.status)) return;
 
     void Promise.all([
       queryClient.invalidateQueries({
