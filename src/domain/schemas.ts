@@ -274,7 +274,7 @@ export type ChatDraft = z.infer<typeof ChatDraftSchema>;
 // documents always hydrate with every field present (as with TicketSchema).
 export const ChatSessionSchema = z.object({
   boardId: ObjectIdString,
-  provider: z.literal("claude").default("claude"),
+  provider: z.enum(["claude", "codex"]).default("claude"),
   sessionId: z.string().nullable().default(null),
   status: z.enum(["active", "bundle_locked", "abandoned"]).default("active"),
   turnStatus: ChatTurnStatus.default("idle"),

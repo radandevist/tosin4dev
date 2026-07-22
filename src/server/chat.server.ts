@@ -330,13 +330,14 @@ export async function getChatSessionCore(input: {
 
 export async function createChatSessionCore(input: {
   boardId: string;
+  provider?: "claude" | "codex";
 }): Promise<{ id: string }> {
   await loadBoard(input.boardId); // validates the board exists
   const coll = await chatSessions();
   const at = now();
   const doc: ChatSessionDoc = {
     boardId: input.boardId,
-    provider: "claude",
+    provider: input.provider ?? "claude",
     sessionId: null,
     status: "active",
     turnStatus: "idle",
