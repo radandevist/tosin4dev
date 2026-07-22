@@ -118,22 +118,30 @@ function runPaths(board: Board, runId: string, phase: Phase) {
   };
 }
 
-async function runGitWorktree(
-  board: Board,
+export function runBranchName(runId: string): string {
+  return `tosin4dev/run/${runId}`;
+}
+
+// Create the execution worktree on a fresh named branch off `baseBranch`, and
+// return the branch name plus the base commit sha the branch started from. The
+// named branch (unlike v1's --detach) gives verification a reachable ref.
+export async function createRunBranch(
+  repoPath: string,
   workDir: string,
-): Promise<void> {
+  baseBranch: string,
+  runId: string,
+): Promise<{ branch: string; baseSha: string }> {
+  const branch = runBranchName(runId);
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", repoPath, "rev-parse", baseBranch],
+    { encoding: "utf8" },
+  );
+  const baseSha = stdout.trim();
   try {
     await execFileAsync(
       "git",
-      [
-        "-C",
-        board.repoPath,
-        "worktree",
-        "add",
-        "--detach",
-        workDir,
-        board.defaultBaseBranch,
-      ],
+      ["-C", repoPath, "worktree", "add", "-b", branch, workDir, baseBranch],
       { encoding: "utf8" },
     );
   } catch (error) {
@@ -142,17 +150,26 @@ async function runGitWorktree(
       { cause: error },
     );
   }
+  return { branch, baseSha };
 }
 
 async function removeUnusedWorktree(
-  board: Board,
+  repoPath: string,
   workDir: string,
+  branch: string | null,
 ): Promise<void> {
   await execFileAsync(
     "git",
-    ["-C", board.repoPath, "worktree", "remove", workDir],
+    ["-C", repoPath, "worktree", "remove", "--force", workDir],
     { encoding: "utf8" },
   ).catch(() => undefined);
+  if (branch) {
+    await execFileAsync(
+      "git",
+      ["-C", repoPath, "branch", "-D", branch],
+      { encoding: "utf8" },
+    ).catch(() => undefined);
+  }
 }
 
 async function recordSetupFailure(
@@ -451,13 +468,24 @@ export async function dispatchRun(
   }
 
   let worktreeCreated = false;
+  let runBranch: string | null = null;
   let child: ChildProcess | undefined;
   let runningChild: RunningChild | undefined;
   try {
     await mkdir(paths.runDir, { recursive: true });
     if (phase !== "spec_draft") {
       await mkdir(`${board.repoPath}/.tosin4dev/worktrees`, { recursive: true });
-      await runGitWorktree(board, paths.workDir);
+      const created = await createRunBranch(
+        board.repoPath,
+        paths.workDir,
+        board.defaultBaseBranch,
+        runId,
+      );
+      runBranch = created.branch;
+      await database.collection<RunDoc>("runs").updateOne(
+        { _id: new ObjectId(runId) },
+        { $set: { branch: created.branch, baseSha: created.baseSha } },
+      );
       worktreeCreated = true;
     }
 
@@ -510,7 +538,9 @@ export async function dispatchRun(
       child.kill("SIGKILL");
       await runningChild?.exited.catch(() => undefined);
     }
-    if (worktreeCreated) await removeUnusedWorktree(board, paths.workDir);
+    if (worktreeCreated) {
+      await removeUnusedWorktree(board.repoPath, paths.workDir, runBranch);
+    }
     await recordSetupFailure(runId, ticketId, policy.requiredStatus);
     throw new ServerResultError("spawn_failed", "run could not be started");
   }
