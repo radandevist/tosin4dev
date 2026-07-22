@@ -13,6 +13,7 @@ import { buildChatCommand } from "./chatCommand";
 import { parseChatResult, parseDraft } from "./chatResult";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
+import { createTicketCore } from "./tickets.server";
 import {
   drainStream,
   settledExit,
@@ -300,4 +301,93 @@ export async function getChatSessionCore(input: {
     doc = (await coll.findOne({ _id: new ObjectId(input.sessionId) })) ?? doc;
   }
   return chatToDTO(doc);
+}
+
+// The instruction that turns brainstorm context into a machine-parseable draft.
+const DRAFT_INSTRUCTION = [
+  "Based on our conversation so far, produce ONE ticket spec.",
+  "Respond with ONLY a JSON object, no prose, matching exactly:",
+  '{"title":string,"type":"research"|"spec"|"implement"|"bugfix"|"review",',
+  '"runner":"claude"|"codex",',
+  '"spec":{"intent":string,"scope":string,"nonGoals":string,',
+  '"acceptance":string[],"links":string[],"risk":"low"|"medium"|"high"}}',
+].join(" ");
+
+export async function createChatSessionCore(input: {
+  boardId: string;
+}): Promise<{ id: string }> {
+  await loadBoard(input.boardId); // validates the board exists
+  const coll = await chatSessions();
+  const at = now();
+  const doc: ChatSessionDoc = {
+    boardId: input.boardId,
+    provider: "claude",
+    sessionId: null,
+    status: "active",
+    turnStatus: "idle",
+    turnError: null,
+    messages: [],
+    proposedSpec: null,
+    ticketId: null,
+    createdAt: at,
+    updatedAt: at,
+    pid: null,
+    logFile: null,
+    pendingKind: null,
+    pendingUserMessageAt: null,
+  };
+  const r = await coll.insertOne(doc);
+  return { id: r.insertedId.toString() };
+}
+
+export async function sendChatMessageCore(input: {
+  sessionId: string;
+  text: string;
+}): Promise<{ ok: true }> {
+  await startChatTurn(input.sessionId, input.text, "message");
+  return { ok: true };
+}
+
+export async function draftSpecFromChatCore(input: {
+  sessionId: string;
+}): Promise<{ ok: true }> {
+  await startChatTurn(input.sessionId, DRAFT_INSTRUCTION, "draft");
+  return { ok: true };
+}
+
+export async function createTicketFromChatCore(input: {
+  sessionId: string;
+}): Promise<{ ticketId: string; seq: number }> {
+  const coll = await chatSessions();
+  const doc = await coll.findOne({ _id: new ObjectId(input.sessionId) });
+  if (!doc) {
+    throw new ServerResultError(
+      "not_found",
+      `chat session not found: ${input.sessionId}`,
+    );
+  }
+  if (!doc.proposedSpec) {
+    throw new ServerResultError(
+      "conflict",
+      "no drafted spec to create a ticket from",
+    );
+  }
+  const created = await createTicketCore({
+    boardId: doc.boardId,
+    title: doc.proposedSpec.title,
+    type: doc.proposedSpec.type,
+    runner: doc.proposedSpec.runner,
+    spec: doc.proposedSpec.spec,
+  });
+  await coll.updateOne(
+    { _id: new ObjectId(input.sessionId) },
+    {
+      $set: {
+        status: "ticket_created",
+        ticketId: created.id,
+        updatedAt: now(),
+      },
+    },
+  );
+  return { ticketId: created.id, seq: created.seq };
 }
