@@ -186,6 +186,21 @@ describe("chat slice", () => {
     expect(run.phase).toBe("spec_draft");
   });
 
+  it("rejects creating a second ticket from the same session", async () => {
+    const { id } = await createChatSessionCore({ boardId });
+    await draftSpecFromChatCore({ sessionId: id });
+    await waitForIdle(id);
+    const tickets = database.collection("tickets");
+    const countBefore = await tickets.countDocuments({ boardId });
+
+    await createTicketFromChatCore({ sessionId: id });
+    await expect(
+      createTicketFromChatCore({ sessionId: id }),
+    ).rejects.toThrow(/already been created/);
+
+    expect(await tickets.countDocuments({ boardId })).toBe(countBefore + 1);
+  });
+
   it("rejects overlap, records an error turn, and remains usable", async () => {
     const { id: pendingId } = await createChatSessionCore({ boardId });
     await sendChatMessageCore({ sessionId: pendingId, text: "hold" });

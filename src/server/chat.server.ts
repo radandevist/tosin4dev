@@ -372,22 +372,39 @@ export async function createTicketFromChatCore(input: {
       "no drafted spec to create a ticket from",
     );
   }
-  const created = await createTicketCore({
-    boardId: doc.boardId,
-    title: doc.proposedSpec.title,
-    type: doc.proposedSpec.type,
-    runner: doc.proposedSpec.runner,
-    spec: doc.proposedSpec.spec,
-  });
-  await coll.updateOne(
-    { _id: new ObjectId(input.sessionId) },
+  const claim = await coll.updateOne(
     {
-      $set: {
-        status: "ticket_created",
-        ticketId: created.id,
-        updatedAt: now(),
-      },
+      _id: new ObjectId(input.sessionId),
+      status: "active",
+      proposedSpec: { $ne: null },
     },
+    { $set: { status: "ticket_created", updatedAt: now() } },
   );
-  return { ticketId: created.id, seq: created.seq };
+  if (claim.matchedCount === 0) {
+    throw new ServerResultError(
+      "conflict",
+      "a ticket has already been created from this session",
+    );
+  }
+
+  try {
+    const created = await createTicketCore({
+      boardId: doc.boardId,
+      title: doc.proposedSpec.title,
+      type: doc.proposedSpec.type,
+      runner: doc.proposedSpec.runner,
+      spec: doc.proposedSpec.spec,
+    });
+    await coll.updateOne(
+      { _id: new ObjectId(input.sessionId) },
+      { $set: { ticketId: created.id, updatedAt: now() } },
+    );
+    return { ticketId: created.id, seq: created.seq };
+  } catch (error) {
+    await coll.updateOne(
+      { _id: new ObjectId(input.sessionId) },
+      { $set: { status: "active", updatedAt: now() } },
+    );
+    throw error;
+  }
 }
