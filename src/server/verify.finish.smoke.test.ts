@@ -58,7 +58,7 @@ async function insertApproved(seq: number): Promise<string> {
   const r = await tickets.insertOne({
     boardId, seq, title: `verify ${seq}`, type: "implement", status: "approved", runner: "claude",
     spec: { intent: "verify", scope: "", nonGoals: "", acceptance: [], links: [], risk: "low", approvedAt: at, approvedBy: "radan" },
-    activeRunId: null, prUrl: null, activity: [], createdAt: at, updatedAt: at,
+    activeRunId: null, prUrl: null, activity: [], dependsOn: [], createdAt: at, updatedAt: at,
   });
   return r.insertedId.toString();
 }

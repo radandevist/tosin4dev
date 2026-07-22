@@ -24,6 +24,7 @@ const ticket: Ticket = {
   activeRunId: null,
   prUrl: null,
   activity: [],
+  dependsOn: [],
 };
 
 const board: Board = {

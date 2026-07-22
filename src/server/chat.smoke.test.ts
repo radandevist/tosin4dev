@@ -12,15 +12,12 @@ const ORIGINAL_WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 process.env.DISCORD_WEBHOOK_URL = "";
 
-const { db, closeDb, ObjectId } = await import("./db");
+const { db, closeDb } = await import("./db");
 const {
   createChatSessionCore,
   sendChatMessageCore,
   getChatSessionCore,
-  draftSpecFromChatCore,
-  createTicketFromChatCore,
 } = await import("./chat.server");
-const { dispatchRun } = await import("./supervisor.server");
 
 let database: Db;
 let repo: string;
@@ -82,18 +79,6 @@ async function waitForIdle(sessionId: string, timeoutMs = 15_000) {
   throw new Error("chat turn did not settle");
 }
 
-async function waitForRun(runId: string, timeoutMs = 15_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await database
-      .collection("runs")
-      .findOne({ _id: new ObjectId(runId) });
-    if (run?.status === "succeeded") return run;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new Error(`run ${runId} did not succeed`);
-}
-
 beforeAll(async () => {
   repo = await mkdtemp(join(tmpdir(), "t4d-chat-repo-"));
   binDir = await mkdtemp(join(tmpdir(), "t4d-chat-bin-"));
@@ -144,61 +129,6 @@ describe("chat slice", () => {
     expect(second.turnStatus).toBe("idle");
     expect(second.messages).toHaveLength(4);
     expect(second.messages[3].text).toContain("reply to: again");
-  });
-
-  it("drafts a spec and creates a dispatchable inbox ticket", async () => {
-    const { id } = await createChatSessionCore({ boardId });
-    await sendChatMessageCore({ sessionId: id, text: "let's build login" });
-    await waitForIdle(id);
-    await draftSpecFromChatCore({ sessionId: id });
-    const drafted = await waitForIdle(id);
-    expect(drafted.proposedSpec).toEqual({
-      title: "Add login",
-      type: "implement",
-      runner: "claude",
-      spec: {
-        intent: "add login",
-        scope: "",
-        nonGoals: "",
-        acceptance: [],
-        links: [],
-        risk: "low",
-      },
-    });
-
-    const { ticketId, seq } = await createTicketFromChatCore({ sessionId: id });
-    expect(seq).toBeGreaterThan(0);
-    const ticket = await database
-      .collection("tickets")
-      .findOne({ _id: new ObjectId(ticketId) });
-    expect(ticket?.status).toBe("inbox");
-    expect(ticket?.title).toBe("Add login");
-    expect(ticket?.type).toBe("implement");
-    expect(ticket?.runner).toBe("claude");
-    expect(ticket?.spec).toMatchObject(drafted.proposedSpec?.spec ?? {});
-    const session = await getChatSessionCore({ sessionId: id });
-    expect(session.status).toBe("ticket_created");
-    expect(session.ticketId).toBe(ticketId);
-
-    const { runId } = await dispatchRun(ticketId, "spec_draft");
-    const run = await waitForRun(runId);
-    expect(run.ticketId).toBe(ticketId);
-    expect(run.phase).toBe("spec_draft");
-  });
-
-  it("rejects creating a second ticket from the same session", async () => {
-    const { id } = await createChatSessionCore({ boardId });
-    await draftSpecFromChatCore({ sessionId: id });
-    await waitForIdle(id);
-    const tickets = database.collection("tickets");
-    const countBefore = await tickets.countDocuments({ boardId });
-
-    await createTicketFromChatCore({ sessionId: id });
-    await expect(
-      createTicketFromChatCore({ sessionId: id }),
-    ).rejects.toThrow(/already been created/);
-
-    expect(await tickets.countDocuments({ boardId })).toBe(countBefore + 1);
   });
 
   it("rejects overlap, records an error turn, and remains usable", async () => {

@@ -116,6 +116,7 @@ async function insertTicket(
     activeRunId,
     prUrl: null,
     activity: [],
+    dependsOn: [],
     createdAt: at,
     updatedAt: at,
   });

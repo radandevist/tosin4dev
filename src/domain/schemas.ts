@@ -92,6 +92,9 @@ export const TicketSchema = z.object({
   activeRunId: ObjectIdString.nullable().default(null),
   prUrl: HttpUrlString.nullable().default(null),
   activity: z.array(ActivityEntry).default([]),
+  // Resolved dependency ticket ids (set at bundle lock; [] for standalone/legacy
+  // tickets). Recorded and surfaced but NOT yet enforced at dispatch.
+  dependsOn: z.array(ObjectIdString).default([]),
 });
 export type Ticket = z.infer<typeof TicketSchema>;
 
@@ -273,11 +276,47 @@ export const ChatSessionSchema = z.object({
   boardId: ObjectIdString,
   provider: z.literal("claude").default("claude"),
   sessionId: z.string().nullable().default(null),
-  status: z.enum(["active", "ticket_created", "abandoned"]).default("active"),
+  status: z.enum(["active", "bundle_locked", "abandoned"]).default("active"),
   turnStatus: ChatTurnStatus.default("idle"),
   turnError: z.string().nullable().default(null),
   messages: z.array(ChatMessageSchema).default([]),
-  proposedSpec: ChatDraftSchema.nullable().default(null),
-  ticketId: ObjectIdString.nullable().default(null),
+  bundleId: ObjectIdString.nullable().default(null),
 });
 export type ChatSession = z.infer<typeof ChatSessionSchema>;
+
+// --- SpecBundle (one brainstorm → many tickets) --------------------------
+// A single proposed ticket within a bundle. `localKey` is the bundle-local
+// dependency currency (unique within the bundle); it resolves to a real
+// ticketId at lock. `.strict()` so a stray key fails closed.
+export const BundleMemberSchema = z
+  .object({
+    localKey: z.string().min(1),
+    title: z.string().min(1),
+    type: TicketType,
+    runner: RunnerName,
+    spec: SpecInputSchema,
+    dependsOn: z.array(z.string()).default([]),
+  })
+  .strict();
+export type BundleMember = z.infer<typeof BundleMemberSchema>;
+
+// What proposeBundle asks the model to emit: rationale + ordered members.
+export const SpecBundleProposalSchema = z
+  .object({
+    rationale: z.string(),
+    members: z.array(BundleMemberSchema).min(1),
+  })
+  .strict();
+export type SpecBundleProposal = z.infer<typeof SpecBundleProposalSchema>;
+
+// Persisted bundle. `members` array order IS the ticket order. `lockedTicketIds`
+// (aligned to members order) is set at lock; null while drafting.
+export const SpecBundleSchema = z.object({
+  sessionId: ObjectIdString,
+  boardId: ObjectIdString,
+  status: z.enum(["drafting", "locked"]).default("drafting"),
+  rationale: z.string().default(""),
+  members: z.array(BundleMemberSchema).default([]),
+  lockedTicketIds: z.array(ObjectIdString).nullable().default(null),
+});
+export type SpecBundle = z.infer<typeof SpecBundleSchema>;

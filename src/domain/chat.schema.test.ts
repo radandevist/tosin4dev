@@ -17,8 +17,9 @@ describe("chat schemas", () => {
     expect(s.turnStatus).toBe("idle");
     expect(s.turnError).toBeNull();
     expect(s.messages).toEqual([]);
-    expect(s.proposedSpec).toBeNull();
-    expect(s.ticketId).toBeNull();
+    expect(s.bundleId).toBeNull();
+    expect(s).not.toHaveProperty("proposedSpec");
+    expect(s).not.toHaveProperty("ticketId");
   });
 
   it("validates message role + turn status enum", () => {

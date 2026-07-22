@@ -10,10 +10,9 @@ import {
 } from "../domain/schemas";
 import { ChatSessionDTOSchema, type ChatSessionDTO } from "./chat";
 import { buildChatCommand } from "./chatCommand";
-import { parseChatResult, parseDraft } from "./chatResult";
+import { parseChatResult } from "./chatResult";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
-import { createTicketCore } from "./tickets.server";
 import {
   drainStream,
   settledExit,
@@ -121,26 +120,8 @@ async function monitorChatTurn(
     return;
   }
 
-  const draft = parseDraft(parsed.result);
-  if (!draft) {
-    await failTurn(sessionId, "the drafted spec was not valid JSON");
-    return;
-  }
-  await coll.updateOne(
-    { _id: new ObjectId(sessionId) },
-    {
-      $set: {
-        turnStatus: "idle",
-        turnError: null,
-        pendingKind: null,
-        pendingUserMessageAt: null,
-        pid: null,
-        proposedSpec: draft,
-        updatedAt: at,
-        ...sidPatch,
-      },
-    },
-  );
+  await failTurn(sessionId, "bundle proposal not yet wired");
+  return;
 }
 
 // Claim a pending turn (throws on conflict/not-found BEFORE any side effect),
@@ -266,8 +247,7 @@ export function chatToDTO(doc: WithId<ChatSessionDoc>): ChatSessionDTO {
     turnStatus: doc.turnStatus,
     turnError: doc.turnError,
     messages: doc.messages,
-    proposedSpec: doc.proposedSpec,
-    ticketId: doc.ticketId,
+    bundleId: doc.bundleId,
   });
   return ChatSessionDTOSchema.parse({
     _id: doc._id.toString(),
@@ -278,8 +258,7 @@ export function chatToDTO(doc: WithId<ChatSessionDoc>): ChatSessionDTO {
     turnStatus: validated.turnStatus,
     turnError: validated.turnError,
     messages: validated.messages,
-    proposedSpec: validated.proposedSpec,
-    ticketId: validated.ticketId,
+    bundleId: validated.bundleId,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   });
@@ -303,16 +282,6 @@ export async function getChatSessionCore(input: {
   return chatToDTO(doc);
 }
 
-// The instruction that turns brainstorm context into a machine-parseable draft.
-const DRAFT_INSTRUCTION = [
-  "Based on our conversation so far, produce ONE ticket spec.",
-  "Respond with ONLY a JSON object, no prose, matching exactly:",
-  '{"title":string,"type":"research"|"spec"|"implement"|"bugfix"|"review",',
-  '"runner":"claude"|"codex",',
-  '"spec":{"intent":string,"scope":string,"nonGoals":string,',
-  '"acceptance":string[],"links":string[],"risk":"low"|"medium"|"high"}}',
-].join(" ");
-
 export async function createChatSessionCore(input: {
   boardId: string;
 }): Promise<{ id: string }> {
@@ -327,8 +296,7 @@ export async function createChatSessionCore(input: {
     turnStatus: "idle",
     turnError: null,
     messages: [],
-    proposedSpec: null,
-    ticketId: null,
+    bundleId: null,
     createdAt: at,
     updatedAt: at,
     pid: null,
@@ -346,65 +314,4 @@ export async function sendChatMessageCore(input: {
 }): Promise<{ ok: true }> {
   await startChatTurn(input.sessionId, input.text, "message");
   return { ok: true };
-}
-
-export async function draftSpecFromChatCore(input: {
-  sessionId: string;
-}): Promise<{ ok: true }> {
-  await startChatTurn(input.sessionId, DRAFT_INSTRUCTION, "draft");
-  return { ok: true };
-}
-
-export async function createTicketFromChatCore(input: {
-  sessionId: string;
-}): Promise<{ ticketId: string; seq: number }> {
-  const coll = await chatSessions();
-  const doc = await coll.findOne({ _id: new ObjectId(input.sessionId) });
-  if (!doc) {
-    throw new ServerResultError(
-      "not_found",
-      `chat session not found: ${input.sessionId}`,
-    );
-  }
-  if (!doc.proposedSpec) {
-    throw new ServerResultError(
-      "conflict",
-      "no drafted spec to create a ticket from",
-    );
-  }
-  const claim = await coll.updateOne(
-    {
-      _id: new ObjectId(input.sessionId),
-      status: "active",
-      proposedSpec: { $ne: null },
-    },
-    { $set: { status: "ticket_created", updatedAt: now() } },
-  );
-  if (claim.matchedCount === 0) {
-    throw new ServerResultError(
-      "conflict",
-      "a ticket has already been created from this session",
-    );
-  }
-
-  try {
-    const created = await createTicketCore({
-      boardId: doc.boardId,
-      title: doc.proposedSpec.title,
-      type: doc.proposedSpec.type,
-      runner: doc.proposedSpec.runner,
-      spec: doc.proposedSpec.spec,
-    });
-    await coll.updateOne(
-      { _id: new ObjectId(input.sessionId) },
-      { $set: { ticketId: created.id, updatedAt: now() } },
-    );
-    return { ticketId: created.id, seq: created.seq };
-  } catch (error) {
-    await coll.updateOne(
-      { _id: new ObjectId(input.sessionId) },
-      { $set: { status: "active", updatedAt: now() } },
-    );
-    throw error;
-  }
 }
