@@ -40,8 +40,7 @@ function TicketDetailPage() {
     enabled: Boolean(boardId) && seqValid,
   });
 
-  const close = () =>
-    navigate({ to: "/b/$boardSlug", params: { boardSlug } });
+  const close = () => navigate({ to: "/b/$boardSlug", params: { boardSlug } });
 
   return (
     <OverlayPanel title={`Ticket #${ticketSeq}`} onClose={close}>
@@ -83,6 +82,11 @@ function TicketDetail({ ticket }: { ticket: TicketDTO }) {
         <h3 className="mt-2 text-xl font-semibold text-zinc-900">
           {ticket.title}
         </h3>
+        {ticket.dependsOn.length > 0 ? (
+          <p className="mt-2 text-xs text-zinc-500">
+            depends on: {ticket.dependsOn.map((id) => `#${id}`).join(", ")}
+          </p>
+        ) : null}
       </div>
 
       <GateButtons ticket={ticket} />
@@ -213,13 +217,7 @@ function SectionHeading({
   );
 }
 
-function Meta({
-  label,
-  value,
-}: {
-  label: string;
-  value: React.ReactNode;
-}) {
+function Meta({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div>
       <dt className="text-xs text-zinc-400">{label}</dt>

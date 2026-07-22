@@ -116,6 +116,12 @@ export function TicketCard({
         {ticket.title}
       </p>
 
+      {ticket.dependsOn.length > 0 ? (
+        <p className="mt-2 text-xs text-zinc-400">
+          depends on: {ticket.dependsOn.map((id) => `#${id}`).join(", ")}
+        </p>
+      ) : null}
+
       <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
         <span className="inline-flex items-center gap-1.5">
           <RiskLabel risk={ticket.spec.risk} />
