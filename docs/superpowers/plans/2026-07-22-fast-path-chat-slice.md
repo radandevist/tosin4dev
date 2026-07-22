@@ -713,7 +713,9 @@ export async function startChatTurn(
 // Light boot/stuck reconcile: a session left `pending` by a crash (dead pid or
 // a turn older than STUCK_TURN_MS) is failed so it becomes retryable. Called on
 // read; full daemon recovery is out of scope (a stuck brainstorm is low-stakes).
-export async function reconcileChatSession(doc: ChatSessionDoc): Promise<void> {
+export async function reconcileChatSession(
+  doc: WithId<ChatSessionDoc>,
+): Promise<void> {
   if (doc.turnStatus !== "pending") return;
   const stale =
     doc.pendingUserMessageAt !== null &&
