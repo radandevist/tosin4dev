@@ -5,9 +5,13 @@ import { TicketStatus } from "./schemas";
 // so the machine can never drift from the persisted vocabulary.
 type Status = z.infer<typeof TicketStatus>;
 
-// The two — and only two — states that wait on a human decision: spec approval
-// and final review. Everything else is driven by the supervisor or the machine.
-export const HUMAN_GATES: readonly Status[] = ["spec_review", "review_ready"];
+// The states that wait on a human decision: spec approval, final review, or a
+// question raised by an active run. Everything else is supervisor/machine-driven.
+export const HUMAN_GATES: readonly Status[] = [
+  "spec_review",
+  "review_ready",
+  "needs_input",
+];
 
 // The set of events the machine understands, expressed as a Zod enum so server
 // boundaries can validate an incoming event with `EventSchema.parse(...)` rather
@@ -21,6 +25,8 @@ export const EventSchema = z.enum([
   "dispatch",
   "run_succeeded",
   "run_failed",
+  "run_needs_input",
+  "provide_input",
   "resume",
   "approve_final",
   "request_changes",
@@ -29,16 +35,17 @@ export const EventSchema = z.enum([
 export type Event = z.infer<typeof EventSchema>;
 
 // The subset of events a human may trigger from the UI. Derived from
-// `EventSchema` (never hand-listed) by excluding the three machine/supervisor
-// events — `dispatch`, `run_succeeded`, `run_failed` — so a browser can request
-// a spec submit/approval, a resume, a final approval/changes, or an archive,
-// but can never forge a run outcome or a dispatch. The server boundary
+// `EventSchema` (never hand-listed) by excluding the machine/supervisor events
+// so a browser can request a spec submit/approval, provide input, resume, approve
+// final changes, or archive, but can never forge a run outcome or a dispatch.
+// The server boundary
 // (`transitionTicket`) validates its `event` input against this, while the
 // supervisor keeps calling `transition` with the full `Event` vocabulary.
 export const PublicEventSchema = EventSchema.exclude([
   "dispatch",
   "run_succeeded",
   "run_failed",
+  "run_needs_input",
 ]);
 export type PublicEvent = z.infer<typeof PublicEventSchema>;
 
@@ -57,6 +64,8 @@ const TABLE: Partial<Record<TransitionKey, Status>> = {
   "approved:dispatch": "running",
   "running:run_succeeded": "review_ready",
   "running:run_failed": "blocked",
+  "running:run_needs_input": "needs_input",
+  "needs_input:provide_input": "running",
   "blocked:resume": "approved",
   "review_ready:approve_final": "done",
   // request_changes re-enters `running`; the supervisor dispatches the
