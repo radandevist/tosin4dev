@@ -42,6 +42,16 @@ export function isTerminalRunStatus(status: RunDTO["status"]): boolean {
   );
 }
 
+export function shouldPollRun(status: RunDTO["status"]): boolean {
+  return status === "queued" || status === "running" || status === "verifying";
+}
+
+export function isTicketAdvancingRunStatus(
+  status: RunDTO["status"],
+): boolean {
+  return isTerminalRunStatus(status) || status === "awaiting_input";
+}
+
 export function shouldPollLog(
   openRunId: string | null,
   selectedStatus: RunDTO["status"] | undefined,

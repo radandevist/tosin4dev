@@ -3,7 +3,9 @@ import {
   dispatchActionForTicket,
   formatRunTimestamp,
   isLiveRunStatus,
+  isTicketAdvancingRunStatus,
   isTerminalRunStatus,
+  shouldPollRun,
   shouldPollLog,
 } from "./runsUi";
 
@@ -59,6 +61,28 @@ describe("run polling helpers", () => {
     expect(isTerminalRunStatus("failed")).toBe(true);
     expect(isTerminalRunStatus("blocked")).toBe(true);
     expect(isTerminalRunStatus("cancelled")).toBe(true);
+  });
+
+  it("polls runs only while they can advance autonomously", () => {
+    expect(shouldPollRun("queued")).toBe(true);
+    expect(shouldPollRun("running")).toBe(true);
+    expect(shouldPollRun("verifying")).toBe(true);
+    expect(shouldPollRun("awaiting_input")).toBe(false);
+    expect(shouldPollRun("succeeded")).toBe(false);
+    expect(shouldPollRun("failed")).toBe(false);
+    expect(shouldPollRun("blocked")).toBe(false);
+    expect(shouldPollRun("cancelled")).toBe(false);
+  });
+
+  it("invalidates ticket queries when a run parks or terminates", () => {
+    expect(isTicketAdvancingRunStatus("queued")).toBe(false);
+    expect(isTicketAdvancingRunStatus("running")).toBe(false);
+    expect(isTicketAdvancingRunStatus("verifying")).toBe(false);
+    expect(isTicketAdvancingRunStatus("awaiting_input")).toBe(true);
+    expect(isTicketAdvancingRunStatus("succeeded")).toBe(true);
+    expect(isTicketAdvancingRunStatus("failed")).toBe(true);
+    expect(isTicketAdvancingRunStatus("blocked")).toBe(true);
+    expect(isTicketAdvancingRunStatus("cancelled")).toBe(true);
   });
 
   it("polls a selected log until its run is known to be terminal", () => {
