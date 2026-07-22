@@ -1,15 +1,12 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import {
-  ChatDraftSchema,
   ChatMessageSchema,
   ChatTurnStatus,
   ObjectIdString,
 } from "../domain/schemas";
 import {
   createChatSessionCore,
-  createTicketFromChatCore,
-  draftSpecFromChatCore,
   getChatSessionCore,
   sendChatMessageCore,
 } from "./chat.server";
@@ -26,12 +23,11 @@ export const ChatSessionDTOSchema = z
     boardId: ObjectIdString,
     provider: z.literal("claude"),
     sessionId: z.string().nullable(),
-    status: z.enum(["active", "ticket_created", "abandoned"]),
+    status: z.enum(["active", "bundle_locked", "abandoned"]),
     turnStatus: ChatTurnStatus,
     turnError: z.string().nullable(),
     messages: z.array(ChatMessageSchema),
-    proposedSpec: ChatDraftSchema.nullable(),
-    ticketId: ObjectIdString.nullable(),
+    bundleId: ObjectIdString.nullable(),
     createdAt: timestamp,
     updatedAt: timestamp,
   })
@@ -75,17 +71,4 @@ export const sendChatMessage = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
     boundary(SendChatMessageInputSchema, data, sendChatMessageCore),
-  );
-
-export const draftSpecFromChat = createServerFn({ method: "POST" })
-  .validator(passthrough)
-  .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
-    boundary(ChatSessionRefSchema, data, draftSpecFromChatCore),
-  );
-
-export const createTicketFromChat = createServerFn({ method: "POST" })
-  .validator(passthrough)
-  .handler(
-    ({ data }): Promise<ServerResult<{ ticketId: string; seq: number }>> =>
-      boundary(ChatSessionRefSchema, data, createTicketFromChatCore),
   );

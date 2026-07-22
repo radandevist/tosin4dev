@@ -42,5 +42,8 @@ describe("chat DTO mapping", () => {
     expect(dto).not.toHaveProperty("pid");
     expect(dto).not.toHaveProperty("logFile");
     expect(dto).not.toHaveProperty("pendingKind");
+    expect(dto.bundleId).toBeNull();
+    expect(dto).not.toHaveProperty("proposedSpec");
+    expect(dto).not.toHaveProperty("ticketId");
   });
 });

@@ -76,6 +76,7 @@ async function insertApproved(seq: number): Promise<string> {
     activeRunId: null,
     prUrl: null,
     activity: [],
+    dependsOn: [],
     createdAt: at,
     updatedAt: at,
   });

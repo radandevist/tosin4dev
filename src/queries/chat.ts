@@ -1,8 +1,6 @@
 import { createMutation, createQuery } from "react-query-kit";
 import {
   createChatSession,
-  createTicketFromChat,
-  draftSpecFromChat,
   getChatSession,
   sendChatMessage,
   type ChatSessionDTO,
@@ -35,17 +33,4 @@ export const useCreateChatSession = createMutation<
 export const useSendChatMessage = createMutation<{ ok: true }, SendChatMessageInput>({
   mutationFn: (variables) =>
     sendChatMessage({ data: variables }).then(unwrapResult),
-});
-
-export const useDraftSpecFromChat = createMutation<{ ok: true }, ChatSessionRef>({
-  mutationFn: (variables) =>
-    draftSpecFromChat({ data: variables }).then(unwrapResult),
-});
-
-export const useCreateTicketFromChat = createMutation<
-  { ticketId: string; seq: number },
-  ChatSessionRef
->({
-  mutationFn: (variables) =>
-    createTicketFromChat({ data: variables }).then(unwrapResult),
 });

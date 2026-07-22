@@ -112,6 +112,7 @@ export async function createTicketCore(
       activeRunId: null,
       prUrl: null,
       activity: [{ at, kind: "lifecycle", message: "ticket created" }],
+      dependsOn: [],
       createdAt: at,
       updatedAt: at,
     };
