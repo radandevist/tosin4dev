@@ -11,6 +11,7 @@ export const DEFAULT_BOARD: Board = {
   name: "",
   repoPath: "",
   defaultBaseBranch: "develop",
+  checks: [],
 };
 
 function Home() {

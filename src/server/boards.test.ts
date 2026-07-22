@@ -15,6 +15,7 @@ const BOARD = {
   name: "PublyApp",
   repoPath: "/home/radan/Projects/PublyApp",
   defaultBaseBranch: "develop",
+  checks: [],
 };
 
 describe("boards server functions", () => {
