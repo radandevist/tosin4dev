@@ -30,12 +30,27 @@ describe("spec bundle schemas", () => {
   it("rejects a member with an unknown top-level key (strict)", () => {
     expect(() => BundleMemberSchema.parse({ ...member, extra: 1 })).toThrow();
   });
+  it("rejects a member missing a required field", () => {
+    const { title: _title, ...noTitle } = member;
+    expect(() => BundleMemberSchema.parse(noTitle)).toThrow();
+  });
+  it("rejects a member with an invalid enum value", () => {
+    expect(() => BundleMemberSchema.parse({ ...member, type: "nope" })).toThrow();
+    expect(() =>
+      BundleMemberSchema.parse({ ...member, runner: "gpt" }),
+    ).toThrow();
+  });
   it("accepts a proposal of rationale + members", () => {
     const p = SpecBundleProposalSchema.parse({
       rationale: "split by concern",
       members: [member],
     });
     expect(p.members).toHaveLength(1);
+  });
+  it("rejects a proposal with no members (min 1)", () => {
+    expect(() =>
+      SpecBundleProposalSchema.parse({ rationale: "r", members: [] }),
+    ).toThrow();
   });
   it("accepts a persisted bundle and defaults lockedTicketIds to null", () => {
     const b = SpecBundleSchema.parse({
