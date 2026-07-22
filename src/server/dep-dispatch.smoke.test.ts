@@ -191,15 +191,22 @@ describe("dependency-serialized dispatch", () => {
     await expect(dispatchRun(independentId, "execute")).resolves.toEqual({
       runId: expect.any(String),
     });
+    await waitForRunsToSettle();
 
     const draftId = await insertTicket(5, "inbox", [missingId]);
-    try {
-      await dispatchRun(draftId, "spec_draft");
-    } catch (error) {
-      expect(error).not.toMatchObject({
-        message: expect.stringContaining("waiting on dependencies"),
-      });
-    }
+    const draftDispatch = await dispatchRun(draftId, "spec_draft");
+    expect(draftDispatch).toEqual({ runId: expect.any(String) });
+    await expect(
+      runs.findOne({ _id: new ObjectId(draftDispatch.runId) }),
+    ).resolves.toMatchObject({ ticketId: draftId, phase: "spec_draft" });
+    await waitForRunsToSettle();
+
+    const reviewFixId = await insertTicket(6, "running", [missingId]);
+    const reviewFixDispatch = await dispatchRun(reviewFixId, "review_fix");
+    expect(reviewFixDispatch).toEqual({ runId: expect.any(String) });
+    await expect(
+      runs.findOne({ _id: new ObjectId(reviewFixDispatch.runId) }),
+    ).resolves.toMatchObject({ ticketId: reviewFixId, phase: "review_fix" });
     await waitForRunsToSettle();
   }, 20_000);
 });
