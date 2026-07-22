@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   BoardSchema,
   CreateTicketInputSchema,
+  EvidenceSchema,
   RunSchema,
   SetRunnerInputSchema,
   SpecInputSchema,
@@ -98,6 +99,41 @@ describe("schemas", () => {
     });
     expect(r.exitCode).toBeNull();
   });
+
+describe("EvidenceSchema", () => {
+  it("parses a passed verdict with check results", () => {
+    const ev = EvidenceSchema.parse({
+      runId: "a".repeat(24),
+      ticketId: "b".repeat(24),
+      commitSha: "0".repeat(40),
+      commitRef: "tosin4dev/run/abc",
+      checks: [
+        {
+          key: "typecheck",
+          command: ["bun", "run", "typecheck"],
+          exitCode: 0,
+          outputRef: "/x/checks/typecheck.log",
+          passedAt: "2026-07-22T00:00:00.000Z",
+        },
+      ],
+      verdict: "passed",
+    });
+    expect(ev.verdict).toBe("passed");
+  });
+
+  it("rejects an unknown verdict", () => {
+    expect(() =>
+      EvidenceSchema.parse({
+        runId: "a".repeat(24),
+        ticketId: "b".repeat(24),
+        commitSha: "0".repeat(40),
+        commitRef: "r",
+        checks: [],
+        verdict: "maybe",
+      }),
+    ).toThrow();
+  });
+});
 
   it("applies embedded spec defaults", () => {
     const t = TicketSchema.parse({

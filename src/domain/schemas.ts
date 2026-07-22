@@ -139,6 +139,24 @@ export const RunSchema = z.object({
 });
 export type Run = z.infer<typeof RunSchema>;
 
+export const EvidenceCheck = z.object({
+  key: z.string().min(1),
+  command: z.array(z.string()),
+  exitCode: z.number().int(),
+  outputRef: z.string(),
+  passedAt: z.string().datetime(),
+});
+export const EvidenceVerdict = z.enum(["passed", "failed"]);
+export const EvidenceSchema = z.object({
+  runId: ObjectIdString,
+  ticketId: ObjectIdString,
+  commitSha: z.string().regex(/^[0-9a-f]{40}$/),
+  commitRef: z.string().min(1),
+  checks: z.array(EvidenceCheck).default([]),
+  verdict: EvidenceVerdict,
+});
+export type Evidence = z.infer<typeof EvidenceSchema>;
+
 // --- Client input schemas (consumed by Task 4) --------------------------
 // These are the shapes the browser is allowed to submit. They are `.strict()`
 // so a client cannot smuggle server-owned fields, and they intentionally drop
