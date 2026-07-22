@@ -205,7 +205,7 @@ async function recordSetupFailure(
   );
 }
 
-async function drainStream(
+export async function drainStream(
   stream: Readable,
   logFile: string,
   collect: boolean,
@@ -225,7 +225,7 @@ async function drainStream(
   return collected;
 }
 
-function settledExit(child: ChildProcess): Promise<number> {
+export function settledExit(child: ChildProcess): Promise<number> {
   const exited = new Promise<number>((resolve, reject) => {
     let settled = false;
     const settle = (result: { code: number } | { error: Error }) => {
@@ -245,7 +245,7 @@ function settledExit(child: ChildProcess): Promise<number> {
   return exited;
 }
 
-function waitForSpawn(child: ChildProcess): Promise<void> {
+export function waitForSpawn(child: ChildProcess): Promise<void> {
   return new Promise((resolve, reject) => {
     const onSpawn = () => {
       child.off("error", onError);
