@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDispatch, useLogTail, useRuns } from "../queries/runs";
-import { useTicket, useTickets } from "../queries/tickets";
+import {
+  useProvideInput,
+  useTicket,
+  useTickets,
+} from "../queries/tickets";
 import type { RunDTO } from "../server/runs";
 import type { TicketDTO } from "../server/tickets";
 import {
@@ -17,7 +21,9 @@ const POLL_INTERVAL_MS = 2_000;
 export function RunsSection({ ticket }: { ticket: TicketDTO }) {
   const queryClient = useQueryClient();
   const dispatchRun = useDispatch();
+  const provideInput = useProvideInput();
   const [openRunId, setOpenRunId] = useState<string | null>(null);
+  const [answer, setAnswer] = useState("");
 
   const runs = useRuns({
     variables: { ticketId: ticket._id },
@@ -32,6 +38,13 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
     },
   });
 
+  const parkedRun =
+    ticket.status === "needs_input"
+      ? runs.data?.find(
+          (run) =>
+            run._id === ticket.activeRunId && run.status === "awaiting_input",
+        )
+      : undefined;
   const selectedRun = runs.data?.find((run) => run._id === openRunId);
   const log = useLogTail({
     variables: { runId: openRunId ?? EMPTY_RUN_ID },
@@ -117,6 +130,33 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
     );
   };
 
+  const submitInput = () => {
+    const trimmedAnswer = answer.trim();
+    if (provideInput.isPending || trimmedAnswer.length === 0) return;
+    provideInput.mutate(
+      { ticketId: ticket._id, answer: trimmedAnswer },
+      {
+        onSuccess: () => {
+          setAnswer("");
+          void Promise.all([
+            queryClient.invalidateQueries({
+              queryKey: useRuns.getKey({ ticketId: ticket._id }),
+            }),
+            queryClient.invalidateQueries({
+              queryKey: useTicket.getKey({
+                boardId: ticket.boardId,
+                seq: ticket.seq,
+              }),
+            }),
+            queryClient.invalidateQueries({
+              queryKey: useTickets.getKey({ boardId: ticket.boardId }),
+            }),
+          ]);
+        },
+      },
+    );
+  };
+
   return (
     <section aria-labelledby="ticket-runs-heading" className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -142,6 +182,50 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
         <p role="alert" className="text-sm text-rose-600">
           Could not dispatch run: {dispatchRun.error.message}
         </p>
+      ) : null}
+
+      {parkedRun ? (
+        <form
+          className="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            submitInput();
+          }}
+        >
+          <div className="space-y-1">
+            <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+              Input needed
+            </p>
+            <p className="text-sm text-zinc-800">
+              {parkedRun.awaitingQuestion}
+            </p>
+          </div>
+          <label
+            htmlFor={`run-answer-${parkedRun._id}`}
+            className="block text-xs font-medium text-zinc-600"
+          >
+            Your answer
+          </label>
+          <textarea
+            id={`run-answer-${parkedRun._id}`}
+            value={answer}
+            onChange={(event) => setAnswer(event.target.value)}
+            rows={3}
+            className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
+          />
+          <button
+            type="submit"
+            disabled={provideInput.isPending || answer.trim().length === 0}
+            className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {provideInput.isPending ? "Submitting…" : "Provide input"}
+          </button>
+          {provideInput.isError ? (
+            <p role="alert" className="text-sm text-rose-600">
+              Could not provide input: {provideInput.error.message}
+            </p>
+          ) : null}
+        </form>
       ) : null}
 
       {runs.isPending ? (
