@@ -300,11 +300,24 @@ Add these fields inside `RunSchema` (after `summary`):
 Run: `bunx vitest run src/domain/schemas.test.ts -t "RunSchema verification fields"`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Fix existing run-doc literals broken by the new required fields**
+
+Zod `.default(null)` makes `branch`/`baseSha`/`verdict`/`failureKind` part of the `Run` **output** type, so raw `runs.insertOne({...})` literals no longer typecheck. Update the two literal inserts in the orphan-recovery test in `src/server/supervisor.smoke.test.ts` (around lines 236 and 264) to include:
+
+```ts
+      branch: null,
+      baseSha: null,
+      verdict: null,
+      failureKind: null,
+```
+
+(Add these four keys alongside the existing `pid`/`exitCode`/`summary`/`queuedAt`/… keys in each `runs.insertOne(...)` object.)
+
+- [ ] **Step 6: Typecheck (catches any other stale literal) + commit**
 
 ```bash
 bun run typecheck
-git add src/domain/schemas.ts src/domain/schemas.test.ts
+git add src/domain/schemas.ts src/domain/schemas.test.ts src/server/supervisor.smoke.test.ts
 git commit -m "feat: run verification fields + verifying status"
 ```
 
@@ -723,42 +736,171 @@ git commit -m "feat: run verification module (reachable commit + acceptance chec
 Wire verification into the run-completion path. A nonzero runner exit still fails immediately (`failureKind: "runner_exit"`). On exit 0 for an execute/review_fix run, set the run `verifying`, run `verifyRun`, persist `Evidence`, and only emit `run_succeeded` when the verdict is `passed`; otherwise emit `run_failed` with the verdict's `failureKind`. `spec_draft` is unchanged (no verification). The board is loaded for its `checks`.
 
 **Files:**
-- Modify: `src/server/supervisor.server.ts` (`finishRun`, its callers pass `board`/`runDir`)
-- Test: `src/server/verify.finish.smoke.test.ts` (new, DB-backed)
+- Modify: `src/server/supervisor.server.ts` (`finishRun`, thread `board`/`runDir` through `monitorChild`/`dispatchRun`)
+- Modify: `src/server/supervisor.smoke.test.ts` (commit-capable runner; fix the two execute-path tests the gate flips)
+- Create: `src/server/verify.finish.smoke.test.ts` (DB-backed, drives the real `dispatchRun` path)
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing gate test (full, concrete)**
 
-Create `src/server/verify.finish.smoke.test.ts`. It mirrors the existing DB setup in `src/server/supervisor.smoke.test.ts` — open that file and reuse its Mongo bootstrap (env `MONGODB_URI`, `db()`, `closeDb()`), then assert the branching. Skeleton:
+Create `src/server/verify.finish.smoke.test.ts`. It drives the real `dispatchRun` execute path against a temp git repo and a fake `claude` runner that optionally commits:
 
 ```ts
-import { describe, expect, it } from "vitest";
-// Reuse the DB harness pattern from supervisor.smoke.test.ts (import db/closeDb,
-// seed a board + running ticket + queued run in a temp git repo worktree).
-import { finishExecuteForTest } from "./supervisor.server";
+import { execFileSync } from "node:child_process";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Collection, Db } from "mongodb";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { Board, Run, Ticket } from "../domain/schemas";
 
-describe("finishRun verification gate", () => {
-  it("routes exit 0 + passing checks to review_ready with Evidence", async () => {
-    // Arrange: temp repo, worktree on tosin4dev/run/<id> with one commit,
-    //          board.checks = [{ git --version }], ticket status "running".
-    // Act: await finishExecuteForTest(runId, ticketId)  // exitCode 0 path
-    // Assert: ticket.status === "review_ready"; run.verdict === "passed";
-    //         evidence doc exists with verdict "passed".
-    expect(true).toBe(true); // replace with real assertions per harness
+type BoardDoc = Board & { createdAt: string; updatedAt: string };
+type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
+type RunDoc = Run & { pid: number | null; queuedAt: string; startedAt: string | null; finishedAt: string | null };
+type EvidenceDoc = { runId: string; verdict: string; commitSha: string };
+
+const TEST_DB = `tosin4dev-test-verify-${process.pid}-${Date.now()}`;
+const ORIGINAL_PATH = process.env.PATH;
+const ORIGINAL_MONGODB_URI = process.env.MONGODB_URI;
+const ORIGINAL_WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
+process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
+process.env.DISCORD_WEBHOOK_URL = "";
+
+const { db, closeDb, ObjectId } = await import("./db");
+const { dispatchRun } = await import("./supervisor.server");
+
+let database: Db;
+let boards: Collection<BoardDoc>;
+let tickets: Collection<TicketDoc>;
+let runs: Collection<RunDoc>;
+let evidence: Collection<EvidenceDoc>;
+let repo: string;
+let binDirectory: string;
+let boardId: string;
+
+const timestamp = () => new Date().toISOString();
+
+async function writeRunner(commit: boolean, exitCode = 0): Promise<void> {
+  const commitBody = commit
+    ? `echo "artifact $$" > artifact.txt\ngit add -A\ngit commit -m "work" >/dev/null 2>&1\n`
+    : "";
+  const exe = join(binDirectory, "claude");
+  await writeFile(
+    exe,
+    `#!/bin/sh\nprintf '%s\\n' 'out'\nprintf '%s\\n' '## SUMMARY'\nprintf '%s\\n' 'ok'\n${commitBody}exit ${exitCode}\n`,
+  );
+  await chmod(exe, 0o755);
+}
+
+async function seedBoard(checks: Board["checks"]): Promise<void> {
+  const at = timestamp();
+  const b = await boards.insertOne({
+    slug: `verify-${process.pid}-${Date.now()}`, name: "Verify", repoPath: repo,
+    defaultBaseBranch: "main", checks, createdAt: at, updatedAt: at,
+  });
+  boardId = b.insertedId.toString();
+}
+
+async function insertApproved(seq: number): Promise<string> {
+  const at = timestamp();
+  const r = await tickets.insertOne({
+    boardId, seq, title: `verify ${seq}`, type: "implement", status: "approved", runner: "claude",
+    spec: { intent: "verify", scope: "", nonGoals: "", acceptance: [], links: [], risk: "low", approvedAt: at, approvedBy: "radan" },
+    activeRunId: null, prUrl: null, activity: [], createdAt: at, updatedAt: at,
+  });
+  return r.insertedId.toString();
+}
+
+async function waitForRun(runId: string, expected: Run["status"], timeoutMs = 15_000): Promise<RunDoc> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    if (run?.status === expected) return run;
+    await new Promise((res) => setTimeout(res, 25));
+  }
+  throw new Error(`run ${runId} did not reach ${expected}`);
+}
+
+describe("verification gate", () => {
+  beforeAll(async () => {
+    repo = await mkdtemp(join(tmpdir(), "t4d-vrepo-"));
+    binDirectory = await mkdtemp(join(tmpdir(), "t4d-vbin-"));
+    execFileSync("git", ["init", "-b", "main", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "t"]);
+    await writeFile(join(repo, "README.md"), "x\n");
+    execFileSync("git", ["-C", repo, "add", "README.md"]);
+    execFileSync("git", ["-C", repo, "commit", "-m", "init"]);
+    process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
+    database = await db();
+    boards = database.collection<BoardDoc>("boards");
+    tickets = database.collection<TicketDoc>("tickets");
+    runs = database.collection<RunDoc>("runs");
+    evidence = database.collection<EvidenceDoc>("evidence");
   });
 
-  it("routes exit 0 + no commit to blocked with failureKind no_commit", async () => {
-    // worktree with NO new commit -> ticket "blocked", run.failureKind "no_commit"
-    expect(true).toBe(true);
+  beforeEach(async () => {
+    process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
+    await tickets.deleteMany({});
+    await runs.deleteMany({});
+    await evidence.deleteMany({});
+    await boards.deleteMany({});
+  });
+
+  afterAll(async () => {
+    await database?.dropDatabase();
+    await closeDb();
+    process.env.PATH = ORIGINAL_PATH;
+    process.env.MONGODB_URI = ORIGINAL_MONGODB_URI;
+    process.env.DISCORD_WEBHOOK_URL = ORIGINAL_WEBHOOK;
+    await Promise.all([
+      rm(repo, { recursive: true, force: true }),
+      rm(binDirectory, { recursive: true, force: true }),
+    ]);
+  });
+
+  it("passes to review_ready with Evidence when the runner commits and checks pass", async () => {
+    await seedBoard([{ key: "v", label: "v", command: ["git", "--version"], timeoutMs: 10_000 }]);
+    await writeRunner(true);
+    const ticketId = await insertApproved(1);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const run = await waitForRun(runId, "succeeded");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.status).toBe("review_ready");
+    expect(run.verdict).toBe("passed");
+    const ev = await evidence.findOne({ runId });
+    expect(ev?.verdict).toBe("passed");
+    expect(ev?.commitSha).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it("blocks with failureKind no_commit when the runner exits 0 but commits nothing", async () => {
+    await seedBoard([]);
+    await writeRunner(false);
+    const ticketId = await insertApproved(2);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const run = await waitForRun(runId, "failed");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.status).toBe("blocked");
+    expect(run.failureKind).toBe("no_commit");
+    expect((await evidence.findOne({ runId }))?.verdict).toBe("failed");
+  });
+
+  it("blocks with failureKind verification_failed when a check fails", async () => {
+    await seedBoard([{ key: "bad", label: "bad", command: ["git", "rev-parse", "no-such-ref"], timeoutMs: 10_000 }]);
+    await writeRunner(true);
+    const ticketId = await insertApproved(3);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const run = await waitForRun(runId, "failed");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.status).toBe("blocked");
+    expect(run.failureKind).toBe("verification_failed");
   });
 });
 ```
 
-> Implementer note: build the real Mongo + temp-git harness by copying the setup helpers already in `supervisor.smoke.test.ts` (it constructs boards/tickets/runs and a worktree). Assert on the `tickets`, `runs`, and new `evidence` collections. Replace the `expect(true)` placeholders with those assertions before Step 2 — a green test here means the gate works end-to-end.
-
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `bunx vitest run src/server/verify.finish.smoke.test.ts`
-Expected: FAIL — `finishExecuteForTest` not exported / assertions unmet.
+Expected: FAIL — the un-gated `finishRun` marks the no-commit run `succeeded`/`review_ready`, and no `evidence` doc is written, so the assertions fail.
 
 - [ ] **Step 3: Rework `finishRun`**
 
@@ -826,31 +968,44 @@ Replace the execute/review_fix branch of `finishRun` (the block after the `spec_
 
 Extract the ticket-transition + notify code currently inline in `finishRun` into small local helpers `transitionTicketSucceeded`, `transitionTicketFailed`, `notifyReviewReady`, `notifyBlocked` (they already exist as inline logic — the `updateOne(... status "running" ...)` + `notify(...)` calls; move them verbatim into named functions so both branches reuse them). Both transition helpers must keep the existing `matchedCount === 0` fallback that clears `activeRunId` on a lost race.
 
-Thread the new params through `monitorChild` (add `board: Board`, `runDir: string`) and its call site in `dispatchRun` (pass `board` and `paths.runDir`). Export a test hook:
+Thread the new params through `monitorChild` (add `board: Board`, `runDir: string`) and its call site in `dispatchRun` (pass `board` and `paths.runDir`). No test-only export is needed — the new test drives the real `dispatchRun` path.
+
+- [ ] **Step 4: Fix the two existing execute-path tests the gate now flips**
+
+The verification gate turns any execute run that commits nothing into `blocked`, so the two existing execute tests in `src/server/supervisor.smoke.test.ts` that expect `review_ready` must now use a runner that actually commits. First make the harness runner commit-capable — replace `writeRunner` (around line 38):
 
 ```ts
-// Test-only: drive the execute-completion path deterministically.
-export function finishExecuteForTest(
-  runId: string, ticketId: string, board: Board, runDir: string, exitCode: number, stdout: string, logFile: string,
-): Promise<void> {
-  return finishRun(runId, ticketId, "execute", exitCode, stdout, logFile, board, runDir);
+async function writeRunner(lines: readonly string[], exitCode = 0, commit = false): Promise<void> {
+  const body = lines.map((line) => `printf '%s\\n' '${line}'`).join("\n");
+  const commitBody = commit
+    ? `echo "artifact $$" > verify-artifact.txt\ngit add -A\ngit commit -m "runner work" >/dev/null 2>&1\n`
+    : "";
+  const executable = join(binDirectory, "claude");
+  await writeFile(executable, `#!/bin/sh\n${body}\n${commitBody}exit ${exitCode}\n`);
+  await chmod(executable, 0o755);
 }
 ```
 
-- [ ] **Step 4: Run tests**
+Then in the two tests that dispatch `"execute"`/`"review_fix"` and expect `review_ready`:
+- **"executes end-to-end in a detached worktree"** — rename to `"executes end-to-end on a named run branch"`; add as its first line `await writeRunner(["runner output", "## SUMMARY", "smoke ok"], 0, true);`; keep the `review_ready` assertion and add `expect(run.verdict).toBe("passed");`.
+- **"accepts review fixes only from the already-running state"** — add `await writeRunner(["runner output", "## SUMMARY", "smoke ok"], 0, true);` before the `dispatchRun(ticketId, "review_fix")` call (review_fix verifies too); keep the `review_ready` assertion.
+
+The exit-7 test (`"records a failed runner and blocks an execute ticket"`) is unaffected — a nonzero exit still blocks (now `failureKind: "runner_exit"`, which it doesn't assert).
+
+- [ ] **Step 5: Run tests**
 
 Run: `bunx vitest run src/server/verify.finish.smoke.test.ts src/server/supervisor.smoke.test.ts`
-Expected: PASS. The existing supervisor smoke test must still pass — if its execute-path assertions changed (a run that commits nothing now goes `blocked`, not `review_ready`), update those assertions to seed a real commit in the worktree so the run legitimately verifies. Document any such change in the commit body.
+Expected: PASS (new gate test green; existing smoke tests green with the committing runner).
 
-- [ ] **Step 5: Full suite + typecheck**
+- [ ] **Step 6: Full suite + typecheck**
 
 Run: `bun run test && bun run typecheck`
 Expected: PASS + clean.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/server/supervisor.server.ts src/server/verify.finish.smoke.test.ts
+git add src/server/supervisor.server.ts src/server/supervisor.smoke.test.ts src/server/verify.finish.smoke.test.ts
 git commit -m "feat: gate review_ready on orchestrator-run verification + Evidence"
 ```
 
@@ -864,21 +1019,45 @@ git commit -m "feat: gate review_ready on orchestrator-run verification + Eviden
 - Modify: `src/server/supervisor.server.ts`
 - Test: `src/server/supervisor.smoke.test.ts` (add a case)
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test (full, concrete)**
 
-Add to `src/server/supervisor.smoke.test.ts`:
+Add to `src/server/supervisor.smoke.test.ts` (inside the `describe("supervisor smoke", …)` block, so it reuses `runs`/`tickets`/`ObjectId`/`timestamp`/`boardId`/`repo`/`insertTicket`). It proves recovery fires exactly once: an orphan seeded before the first call is recovered; one seeded after is not.
 
 ```ts
-it("runs orphan recovery exactly once across dispatches", async () => {
+type BootGlobal = typeof globalThis & { __tosin4devRecovered?: Promise<void> };
+
+async function seedOrphan(seq: number): Promise<{ ticketId: string; runId: import("mongodb").ObjectId }> {
+  const ticketId = await insertTicket("running", seq);
+  const runId = new ObjectId();
+  const at = timestamp();
+  await tickets.updateOne({ _id: new ObjectId(ticketId) }, { $set: { activeRunId: runId.toString() } });
+  await runs.insertOne({
+    _id: runId, ticketId, boardId, runner: "claude", phase: "execute", status: "running",
+    workDir: repo, promptFile: join(repo, `p-${seq}.md`), logFile: join(repo, `o-${seq}.log`),
+    pid: 2_147_483_647, exitCode: null, summary: null,
+    branch: null, baseSha: null, verdict: null, failureKind: null,
+    queuedAt: at, startedAt: at, finishedAt: null,
+  });
+  return { ticketId, runId };
+}
+
+it("runs orphan recovery exactly once per process", async () => {
+  (globalThis as BootGlobal).__tosin4devRecovered = undefined;
   const { bootRecoveryOnce } = await import("./supervisor.server");
-  // Seed a stale run (status "running", pid of a dead process) + its ticket "running".
-  // ... use the file's existing seed helpers ...
+
+  const first = await seedOrphan(30);
   await bootRecoveryOnce();
-  await bootRecoveryOnce(); // second call is a no-op
-  // Assert the stale run is now "failed" and its ticket is "blocked",
-  // and that a fresh stale run seeded AFTER the first call is NOT recovered
-  // (proving the guard fired once).
-  expect(true).toBe(true); // replace with real assertions per harness
+  await bootRecoveryOnce(); // second call is a no-op (same cached promise)
+
+  expect((await runs.findOne({ _id: first.runId }))?.status).toBe("failed");
+  expect((await tickets.findOne({ _id: new ObjectId(first.ticketId) }))?.status).toBe("blocked");
+
+  // Seeded AFTER the guard resolved -> a later call must NOT recover it.
+  const later = await seedOrphan(31);
+  await bootRecoveryOnce();
+  expect((await runs.findOne({ _id: later.runId }))?.status).toBe("running");
+
+  (globalThis as BootGlobal).__tosin4devRecovered = undefined; // leave the guard clean for other tests
 });
 ```
 
@@ -915,7 +1094,7 @@ At the very top of `dispatchRun`, before the ticket lookup:
   await bootRecoveryOnce();
 ```
 
-> Test note: the "recovered exactly once" assertion relies on the guard; because other tests in the suite may already have set the global, the new test should reset it via `(globalThis as any).__tosin4devRecovered = undefined` in its `beforeEach` so it exercises a clean first-call. Replace the `expect(true)` with the real assertions described in Step 1.
+> Note: the Step 1 test already resets `__tosin4devRecovered` to `undefined` at its start and end, so it exercises a clean first-call regardless of suite ordering and leaves the guard clean for other tests.
 
 - [ ] **Step 4: Run tests**
 
