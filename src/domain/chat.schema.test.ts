@@ -22,6 +22,21 @@ describe("chat schemas", () => {
     expect(s).not.toHaveProperty("ticketId");
   });
 
+  it("accepts codex and rejects an invalid provider", () => {
+    expect(
+      ChatSessionSchema.parse({
+        boardId: "507f1f77bcf86cd799439011",
+        provider: "codex",
+      }).provider,
+    ).toBe("codex");
+    expect(() =>
+      ChatSessionSchema.parse({
+        boardId: "507f1f77bcf86cd799439011",
+        provider: "other",
+      }),
+    ).toThrow();
+  });
+
   it("validates message role + turn status enum", () => {
     expect(() =>
       ChatMessageSchema.parse({ role: "user", text: "hi", at: new Date().toISOString() }),

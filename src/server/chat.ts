@@ -22,7 +22,7 @@ export const ChatSessionDTOSchema = z
   .object({
     _id: ObjectIdString,
     boardId: ObjectIdString,
-    provider: z.literal("claude"),
+    provider: z.enum(["claude", "codex"]),
     sessionId: z.string().nullable(),
     status: z.enum(["active", "bundle_locked", "abandoned"]),
     turnStatus: ChatTurnStatus,
@@ -36,7 +36,10 @@ export const ChatSessionDTOSchema = z
 export type ChatSessionDTO = z.infer<typeof ChatSessionDTOSchema>;
 
 export const CreateChatSessionInputSchema = z
-  .object({ boardId: ObjectIdString })
+  .object({
+    boardId: ObjectIdString,
+    provider: z.enum(["claude", "codex"]).optional(),
+  })
   .strict();
 export type CreateChatSessionInput = z.infer<
   typeof CreateChatSessionInputSchema
