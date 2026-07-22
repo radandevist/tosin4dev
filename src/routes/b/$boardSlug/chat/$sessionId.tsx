@@ -11,6 +11,11 @@ import {
 import { useTickets } from "../../../../queries/tickets";
 import type { ChatSessionDTO } from "../../../../server/chat";
 
+const RUNNER_LABELS: Record<"claude" | "codex", string> = {
+  claude: "Claude",
+  codex: "Codex",
+};
+
 export const Route = createFileRoute("/b/$boardSlug/chat/$sessionId")({
   component: ChatPage,
 });
@@ -160,6 +165,7 @@ function ChatBody({
         }}
       >
         <textarea
+          aria-label="Message"
           value={text}
           onChange={(event) => setText(event.target.value)}
           rows={2}
@@ -230,7 +236,7 @@ function ProposedSpecCard({
       <p className="text-sm font-medium text-zinc-900">{draft.title}</p>
       <p className="text-xs text-zinc-500">
         {TYPE_LABELS[draft.type]} · {RISK_LABELS[draft.spec.risk]} ·{" "}
-        {draft.runner}
+        {RUNNER_LABELS[draft.runner]}
       </p>
       <dl className="space-y-1 text-sm text-zinc-700">
         <div>
