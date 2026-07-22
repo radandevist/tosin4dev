@@ -482,11 +482,11 @@ export async function dispatchRun(
         runId,
       );
       runBranch = created.branch;
+      worktreeCreated = true;
       await database.collection<RunDoc>("runs").updateOne(
         { _id: new ObjectId(runId) },
         { $set: { branch: created.branch, baseSha: created.baseSha } },
       );
-      worktreeCreated = true;
     }
 
     const brief: RunnerBrief = {
