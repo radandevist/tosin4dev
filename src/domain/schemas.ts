@@ -119,6 +119,7 @@ export const RunPhase = z.enum(["spec_draft", "execute", "review_fix"]);
 export const RunStatus = z.enum([
   "queued",
   "running",
+  "verifying",
   "succeeded",
   "failed",
   "blocked",
@@ -136,6 +137,18 @@ export const RunSchema = z.object({
   logFile: AbsolutePathString,
   exitCode: z.number().int().nullable().default(null),
   summary: z.string().nullable().default(null),
+  // Execution worktree branch + its base commit. spec_draft runs work in the
+  // repo root with no branch, so both are null there.
+  branch: z.string().nullable().default(null),
+  baseSha: z.string().nullable().default(null),
+  // Verification outcome, set during the `verifying` stage. null until verified.
+  verdict: z.enum(["passed", "failed"]).nullable().default(null),
+  // Distinguishes WHY a run failed: a nonzero runner exit vs. a runner that
+  // exited 0 but produced no reachable commit / failed an acceptance check.
+  failureKind: z
+    .enum(["runner_exit", "no_commit", "verification_failed"])
+    .nullable()
+    .default(null),
 });
 export type Run = z.infer<typeof RunSchema>;
 

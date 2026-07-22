@@ -4,6 +4,7 @@ import {
   CreateTicketInputSchema,
   EvidenceSchema,
   RunSchema,
+  RunStatus,
   SetRunnerInputSchema,
   SpecInputSchema,
   SpecSchema,
@@ -99,6 +100,35 @@ describe("schemas", () => {
     });
     expect(r.exitCode).toBeNull();
   });
+
+describe("RunSchema verification fields", () => {
+  const base = {
+    ticketId: "a".repeat(24),
+    boardId: "b".repeat(24),
+    runner: "claude",
+    phase: "execute",
+    status: "queued",
+    workDir: "/repo/.tosin4dev/worktrees/x",
+    promptFile: "/repo/.tosin4dev/runs/x/prompt.md",
+    logFile: "/repo/.tosin4dev/runs/x/output.log",
+  };
+  it("defaults new verification fields to null", () => {
+    const run = RunSchema.parse(base);
+    expect(run.branch).toBeNull();
+    expect(run.baseSha).toBeNull();
+    expect(run.verdict).toBeNull();
+    expect(run.failureKind).toBeNull();
+  });
+  it("accepts a verifying status and a verification failureKind", () => {
+    expect(RunStatus.parse("verifying")).toBe("verifying");
+    const run = RunSchema.parse({
+      ...base,
+      status: "failed",
+      failureKind: "verification_failed",
+    });
+    expect(run.failureKind).toBe("verification_failed");
+  });
+});
 
 describe("EvidenceSchema", () => {
   it("parses a passed verdict with check results", () => {
