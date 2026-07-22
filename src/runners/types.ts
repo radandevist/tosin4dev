@@ -5,6 +5,10 @@ export interface RunnerBrief {
   board: Board;
   workDir: string;
   phase: Run["phase"];
+  // Absolute path the runner must write its outcome JSON to (execute/review_fix).
+  outcomePath?: string;
+  // Present on a resume turn: the captured session id + the human's answer.
+  resume?: { sessionId: string; answer: string };
 }
 
 export interface RunnerCommand {

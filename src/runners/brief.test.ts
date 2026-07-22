@@ -60,9 +60,32 @@ describe("buildPrompt", () => {
       );
       expect(prompt).toContain("Links:\nnone");
       expect(prompt).toContain("do not push");
-      expect(prompt).toContain("SUMMARY");
     },
   );
+
+  it("instructs the runner to write outcome.json on execute", () => {
+    const text = buildPrompt({
+      ticket,
+      board,
+      workDir: "/wt",
+      phase: "execute",
+      outcomePath: "/r/outcome.json",
+    });
+    expect(text).toContain("/r/outcome.json");
+    expect(text).toContain('"outcome"');
+  });
+
+  it("carries the human answer on a resume turn", () => {
+    const text = buildPrompt({
+      ticket,
+      board,
+      workDir: "/wt",
+      phase: "execute",
+      outcomePath: "/r/outcome.json",
+      resume: { sessionId: "s1", answer: "use lucia" },
+    });
+    expect(text).toContain("use lucia");
+  });
 
   it("uses explicit fallbacks for an underspecified execution brief", () => {
     const prompt = buildPrompt({
@@ -107,7 +130,7 @@ describe("buildPrompt", () => {
 });
 
 describe("runner adapters", () => {
-  it("builds a safe Claude print-mode command without environment overrides", () => {
+  it("builds a safe Claude structured command without environment overrides", () => {
     const command = claudeAdapter.buildCommand(
       { ticket, board, workDir: "/wt/7", phase: "execute" },
       "/wt/7/.tosin/prompt.md",
@@ -118,9 +141,9 @@ describe("runner adapters", () => {
       cmd: [
         "claude",
         "-p",
-        "Read /wt/7/.tosin/prompt.md and follow it exactly. End with the required SUMMARY section.",
+        "Read /wt/7/.tosin/prompt.md and follow it exactly. Finish by writing the outcome JSON.",
         "--output-format",
-        "text",
+        "json",
       ],
       env: {},
     });
@@ -162,12 +185,13 @@ describe("runner adapters", () => {
       expect(command).toEqual({
         cmd: [
           "codex",
-          "exec",
-          "--sandbox",
-          "workspace-write",
-          "--cd",
+          "-C",
           "/wt/7",
-          "Read /wt/7/.tosin/prompt.md and follow it exactly. End with the required SUMMARY section.",
+          "-s",
+          "workspace-write",
+          "exec",
+          "--json",
+          "Read /wt/7/.tosin/prompt.md and follow it exactly. Finish by writing the outcome JSON.",
         ],
         env: {},
       });
