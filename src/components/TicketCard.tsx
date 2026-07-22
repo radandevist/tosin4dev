@@ -116,6 +116,7 @@ export function TicketCard({
         {ticket.title}
       </p>
 
+      {/* Board cards keep dependencies plain; detail view shows live block status. */}
       {ticket.dependsOn.length > 0 ? (
         <p className="mt-2 text-xs text-zinc-400">
           depends on: {ticket.dependsOn.map((id) => `#${id}`).join(", ")}
