@@ -15,10 +15,12 @@ export function unmetDependencies(
   deps: string[],
   present: { ticketId: string; seq: number; status: DepStatus }[],
 ): UnmetDependency[] {
-  const presentById = new Map(present.map((dep) => [dep.ticketId, dep]));
+  const presentById = new Map(
+    present.map((dep) => [dep.ticketId.toLowerCase(), dep]),
+  );
 
   return deps.flatMap<UnmetDependency>((ticketId) => {
-    const dep = presentById.get(ticketId);
+    const dep = presentById.get(ticketId.toLowerCase());
     if (!dep) {
       return [{ ticketId, seq: null, status: null, reason: "missing" }];
     }

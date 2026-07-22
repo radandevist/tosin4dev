@@ -880,6 +880,8 @@ export async function dispatchRun(
   }
   const policy = phasePolicy(ticket, phase);
   if (phase === "execute") {
+    // Intentional snapshot before the CAS claim: no lock is taken, so a dependency
+    // changing or being archived in the tiny gap is tolerated for this low-stakes run.
     await assertDependenciesMet(ticket, ticketCollection);
   }
 
