@@ -217,7 +217,12 @@ export async function startChatTurn(
   let child: ChildProcess | undefined;
   let running: RunningTurn | undefined;
   try {
-    const cmd = buildChatCommand(text, doc.sessionId);
+    const cmd = buildChatCommand(
+      text,
+      doc.sessionId,
+      doc.provider,
+      board.repoPath,
+    );
     const spawned = spawn(cmd[0], cmd.slice(1), {
       cwd: board.repoPath,
       env: { ...process.env },

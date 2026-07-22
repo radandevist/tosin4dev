@@ -4,7 +4,14 @@
 export function buildChatCommand(
   text: string,
   sessionId: string | null,
+  provider: "claude" | "codex",
+  repoPath: string,
 ): string[] {
+  if (provider === "codex") {
+    const root = ["codex", "-C", repoPath, "-s", "read-only", "exec"];
+    const resume = sessionId ? ["resume", sessionId] : [];
+    return [...root, ...resume, "--json", text];
+  }
   const cmd = ["claude", "-p", text, "--output-format", "json"];
   if (sessionId) cmd.push("--resume", sessionId);
   return cmd;
