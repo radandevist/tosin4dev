@@ -128,6 +128,23 @@ export async function createTicketCore(
   }
 }
 
+export async function deleteTicketsByIds(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const coll = await tickets();
+  await coll.deleteMany({ _id: { $in: ids.map((id) => new ObjectId(id)) } });
+}
+
+export async function setTicketDependsOn(
+  ticketId: string,
+  dependsOn: string[],
+): Promise<void> {
+  const coll = await tickets();
+  await coll.updateOne(
+    { _id: new ObjectId(ticketId) },
+    { $set: { dependsOn, updatedAt: now() } },
+  );
+}
+
 export async function updateSpecCore(input: UpdateSpecInput): Promise<void> {
   const coll = await tickets();
   const at = now();
