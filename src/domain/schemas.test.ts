@@ -3,6 +3,7 @@ import {
   BoardSchema,
   CreateTicketInputSchema,
   EvidenceSchema,
+  RunOutcomeSchema,
   RunSchema,
   RunStatus,
   SetRunnerInputSchema,
@@ -305,6 +306,38 @@ describe("input schemas (client boundary)", () => {
         spec: validSpecInput,
       }),
     ).toThrow();
+  });
+});
+
+describe("slice B domain", () => {
+  it("parses a needs_input outcome with a question", () => {
+    const o = RunOutcomeSchema.parse({
+      outcome: "needs_input",
+      question: "Which auth lib?",
+    });
+    expect(o.outcome).toBe("needs_input");
+    expect(o.question).toBe("Which auth lib?");
+  });
+  it("rejects an unknown outcome", () => {
+    expect(() => RunOutcomeSchema.parse({ outcome: "maybe" })).toThrow();
+  });
+  it("adds needs_input ticket status and awaiting_input run status", () => {
+    expect(TicketStatus.parse("needs_input")).toBe("needs_input");
+    expect(RunStatus.parse("awaiting_input")).toBe("awaiting_input");
+  });
+  it("defaults new run fields to null", () => {
+    const run = RunSchema.parse({
+      ticketId: "a".repeat(24),
+      boardId: "b".repeat(24),
+      runner: "claude",
+      phase: "execute",
+      status: "queued",
+      workDir: "/r/.tosin4dev/worktrees/x",
+      promptFile: "/r/.tosin4dev/runs/x/prompt.md",
+      logFile: "/r/.tosin4dev/runs/x/output.log",
+    });
+    expect(run.executionSessionId).toBeNull();
+    expect(run.awaitingQuestion).toBeNull();
   });
 });
 
