@@ -135,6 +135,7 @@ describe("runner outcomes", () => {
   beforeEach(async () => {
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
     delete process.env.T4D_OUTCOME;
+    await writeRunner();
     await tickets.deleteMany({});
     await runs.deleteMany({});
   });
@@ -169,9 +170,60 @@ describe("runner outcomes", () => {
     expect(run.executionSessionId).toBe("s-smoke");
   }, 20_000);
 
+  it("resumes a needs_input ticket and completes on the answer", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Which auth library?",
+    });
+    const ticketId = await insertApproved(2);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const parkedRun = await waitForRun(runId, "awaiting_input");
+    const originalWorkDir = parkedRun.workDir;
+    const originalBranch = parkedRun.branch;
+
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "completed",
+      summary: "done",
+    });
+    await provideInputCore({ ticketId, answer: "use lucia" });
+
+    const run = await waitForRun(runId, "succeeded");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.status).toBe("review_ready");
+    expect(run.verdict).toBe("passed");
+    expect(run.workDir).toBe(originalWorkDir);
+    expect(run.branch).toBe(originalBranch);
+    expect(run.executionSessionId).toBe("s-smoke");
+  }, 20_000);
+
+  it("leaves a failed resume parked and retryable when spawn fails", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Which auth library?",
+    });
+    const ticketId = await insertApproved(3);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    await rm(join(binDirectory, "claude"), { force: true });
+    process.env.PATH = binDirectory;
+    await expect(
+      provideInputCore({ ticketId, answer: "use lucia" }),
+    ).rejects.toThrow();
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.status).toBe("needs_input");
+    expect(ticket?.activeRunId).toBe(runId);
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.awaitingQuestion).toBe("Which auth library?");
+  }, 20_000);
+
   it("sends a completed outcome through verification", async () => {
     process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
-    const ticketId = await insertApproved(2);
+    const ticketId = await insertApproved(4);
     const { runId } = await dispatchRun(ticketId, "execute");
 
     const run = await waitForRun(runId, "succeeded");
@@ -182,7 +234,7 @@ describe("runner outcomes", () => {
   }, 20_000);
 
   it("blocks a missing outcome as runner_reported_failure", async () => {
-    const ticketId = await insertApproved(3);
+    const ticketId = await insertApproved(5);
     const { runId } = await dispatchRun(ticketId, "execute");
 
     const run = await waitForRun(runId, "failed");

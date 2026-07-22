@@ -8,10 +8,12 @@ import {
   createTicket,
   getTicket,
   listTickets,
+  provideInput,
   setRunner,
   transitionTicket,
   updateSpec,
   type TicketDTO,
+  type ProvideInputInput,
   type TransitionInput,
 } from "../server/tickets";
 import { unwrapResult } from "../server/result";
@@ -55,3 +57,11 @@ export const useTransition = createMutation<{ status: string }, TransitionInput>
       transitionTicket({ data: variables }).then(unwrapResult),
   },
 );
+
+export const useProvideInput = createMutation<
+  { status: string },
+  ProvideInputInput
+>({
+  mutationFn: (variables) =>
+    provideInput({ data: variables }).then(unwrapResult),
+});

@@ -10,6 +10,7 @@ import {
 import { transition } from "../domain/stateMachine";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
+import { resumeRun } from "./supervisor.server";
 import type { TicketDTO, TransitionInput } from "./tickets";
 
 // Persisted ticket document: the validated ticket fields plus server-owned
@@ -220,4 +221,29 @@ export async function transitionTicketCore(
   }
 
   return { status: to };
+}
+
+export async function provideInputCore(input: {
+  ticketId: string;
+  answer: string;
+}): Promise<{ status: string }> {
+  const coll = await tickets();
+  const doc = await coll.findOne({ _id: new ObjectId(input.ticketId) });
+  if (!doc) {
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${input.ticketId}`,
+    );
+  }
+  if (doc.status !== "needs_input") {
+    throw new ServerResultError("conflict", "ticket is not awaiting input");
+  }
+  if (!doc.activeRunId) {
+    throw new ServerResultError("conflict", "ticket has no parked run");
+  }
+
+  // resumeRun owns the coordinated state change: it confirms the spawn before
+  // committing needs_input -> running and compensates both documents on error.
+  await resumeRun(doc.activeRunId, input.answer);
+  return { status: transition("needs_input", "provide_input") };
 }

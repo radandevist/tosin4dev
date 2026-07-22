@@ -3,7 +3,7 @@ import {
   spawn,
   type ChildProcess,
 } from "node:child_process";
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 import type { Db, PushOperator } from "mongodb";
@@ -634,6 +634,190 @@ async function monitorChild(
       `\nSupervisor stream failure: ${error instanceof Error ? error.message : "unknown error"}\n`,
     ).catch(() => undefined);
     await finishRun(runId, ticketId, phase, -1, "", logFile, board, runDir);
+  }
+}
+
+async function restoreParkedResume(
+  database: Db,
+  run: RunDoc,
+  runId: string,
+  question: string | null,
+): Promise<void> {
+  const at = now();
+  const updates = [
+    database.collection<RunDoc>("runs").updateOne(
+      { _id: new ObjectId(runId) },
+      {
+        $set: {
+          status: "awaiting_input",
+          awaitingQuestion: question,
+          pid: null,
+          startedAt: run.startedAt,
+        },
+      },
+    ),
+    database.collection<TicketDoc>("tickets").updateOne(
+      { _id: new ObjectId(run.ticketId), activeRunId: runId },
+      {
+        $set: {
+          status: "needs_input",
+          activeRunId: runId,
+          updatedAt: at,
+        },
+      },
+    ),
+  ];
+  const results = await Promise.allSettled(updates);
+  const failed = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failed) throw failed.reason;
+}
+
+export async function resumeRun(runId: string, answer: string): Promise<void> {
+  const database = await db();
+  const runs = database.collection<RunDoc>("runs");
+  const run = await runs.findOne({ _id: new ObjectId(runId) });
+  if (!run || run.status !== "awaiting_input") {
+    throw new ServerResultError("conflict", "run is not awaiting input");
+  }
+  if (!run.executionSessionId) {
+    throw new ServerResultError(
+      "conflict",
+      "run has no captured session to resume",
+    );
+  }
+
+  const rawBoard = await database.collection<BoardDoc>("boards").findOne({
+    _id: new ObjectId(run.boardId),
+  });
+  if (!rawBoard) {
+    throw new ServerResultError("not_found", `board not found: ${run.boardId}`);
+  }
+  const board = BoardSchema.parse(rawBoard);
+  const rawTicket = await database.collection<TicketDoc>("tickets").findOne({
+    _id: new ObjectId(run.ticketId),
+  });
+  if (!rawTicket) {
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${run.ticketId}`,
+    );
+  }
+  const ticket = TicketSchema.parse(rawTicket);
+  if (ticket.status !== "needs_input" || ticket.activeRunId !== runId) {
+    throw new ServerResultError(
+      "conflict",
+      "ticket is not parked on this run",
+    );
+  }
+
+  const runDir = `${board.repoPath}/.tosin4dev/runs/${runId}`;
+  const outcomePath = `${runDir}/outcome.json`;
+  const brief: RunnerBrief = {
+    ticket,
+    board,
+    workDir: run.workDir,
+    phase: run.phase,
+    outcomePath,
+    resume: { sessionId: run.executionSessionId, answer },
+  };
+
+  let child: ChildProcess | undefined;
+  let runningChild: RunningChild | undefined;
+  const claimed = await runs
+    .updateOne(
+      { _id: new ObjectId(runId), status: "awaiting_input" },
+      { $set: { status: "running", startedAt: now() } },
+    )
+    .catch(async () => {
+      await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+      throw new ServerResultError("spawn_failed", "run could not be resumed");
+    });
+  if (claimed.matchedCount === 0) {
+    throw new ServerResultError("conflict", "run left awaiting_input");
+  }
+
+  try {
+    // The run claim serializes answers. Clear the stale outcome and rewrite
+    // the prompt before spawn; any failure below restores the parked pair.
+    await rm(outcomePath, { force: true });
+    await writeFile(run.promptFile, buildPrompt(brief));
+
+    const command = adapters[run.runner].buildCommand(brief, run.promptFile);
+    const spawnedChild = spawn(command.cmd[0], command.cmd.slice(1), {
+      cwd: run.workDir,
+      env: {
+        ...process.env,
+        ...command.env,
+        T4D_OUTCOME_PATH: outcomePath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child = spawnedChild;
+    runningChild = {
+      stdout: drainStream(spawnedChild.stdout, run.logFile, true),
+      stderr: drainStream(spawnedChild.stderr, run.logFile, false),
+      exited: settledExit(spawnedChild),
+    };
+    void Promise.all([
+      runningChild.stdout,
+      runningChild.stderr,
+      runningChild.exited,
+    ]).catch(() => undefined);
+    await waitForSpawn(spawnedChild);
+
+    const runStarted = await runs.updateOne(
+      { _id: new ObjectId(runId), status: "running" },
+      { $set: { pid: spawnedChild.pid, awaitingQuestion: null } },
+    );
+    if (runStarted.matchedCount === 0) {
+      throw new ServerResultError("conflict", "run left running");
+    }
+
+    // The public ticket transition becomes final only after spawn is live and
+    // the run record carries its pid. Until this update, the ticket stays
+    // needs_input with activeRunId intact.
+    const at = now();
+    const to = transition("needs_input", "provide_input");
+    const ticketStarted = await database
+      .collection<TicketDoc>("tickets")
+      .updateOne(
+        {
+          _id: new ObjectId(run.ticketId),
+          status: "needs_input",
+          activeRunId: runId,
+        },
+        {
+          $set: { status: to, updatedAt: at },
+          $push: pushActivity("input", `answered: ${answer}`, at),
+        },
+      );
+    if (ticketStarted.matchedCount === 0) {
+      throw new ServerResultError(
+        "conflict",
+        "ticket is no longer awaiting input",
+      );
+    }
+
+    void monitorChild(
+      runningChild,
+      runId,
+      run.ticketId,
+      run.phase,
+      run.logFile,
+      board,
+      runDir,
+    ).catch((error) =>
+      console.error(`Resume monitor failed for run ${runId}:`, error),
+    );
+  } catch {
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await runningChild?.exited.catch(() => undefined);
+    }
+    await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+    throw new ServerResultError("spawn_failed", "run could not be resumed");
   }
 }
 
