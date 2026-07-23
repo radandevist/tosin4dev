@@ -233,6 +233,114 @@ describe("runner outcomes", () => {
     expect(run.executionSessionId).toBe("s-smoke");
   }, 20_000);
 
+  it("records the answer on the open exchange atomically with the claim", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Which base branch?",
+    });
+    const ticketId = await insertApproved(7);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "completed",
+      summary: "done",
+    });
+    await provideInputCore({ ticketId, answer: "use develop" });
+
+    const claimedRun = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(claimedRun?.exchanges[0]?.answer).toBe("use develop");
+    expect(claimedRun?.exchanges[0]?.answeredAt).not.toBeNull();
+    expect(claimedRun?.awaitingQuestion).toBeNull();
+    await waitForRun(runId, "succeeded");
+  }, 20_000);
+
+  it("lets exactly one of two concurrent answers win", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Which answer?",
+    });
+    const ticketId = await insertApproved(8);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+    const results = await Promise.allSettled([
+      provideInputCore({ ticketId, answer: "A" }),
+      provideInputCore({ ticketId, answer: "B" }),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
+      1,
+    );
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    const answered =
+      run?.exchanges.filter((exchange) => exchange.answer !== null) ?? [];
+    expect(answered).toHaveLength(1);
+    expect(["A", "B"]).toContain(answered[0]?.answer);
+    await waitForRun(runId, "succeeded");
+  }, 20_000);
+
+  it("resumes a legacy parked run that has no exchanges", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Legacy question?",
+    });
+    const ticketId = await insertApproved(9);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $set: { exchanges: [] } },
+    );
+
+    process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+    await expect(
+      provideInputCore({ ticketId, answer: "ok" }),
+    ).resolves.toBeTruthy();
+    await waitForRun(runId, "succeeded");
+  }, 20_000);
+
+  it("keeps at most one exchange open across answer and re-park", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    const openExchanges = (run: WithId<RunDoc> | null) =>
+      run?.exchanges.filter((exchange) => exchange.answer === null) ?? [];
+
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Q1?",
+    });
+    const ticketId = await insertApproved(10);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const firstPark = await waitForRun(runId, "awaiting_input");
+    expect(openExchanges(firstPark)).toHaveLength(1);
+
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Q2?",
+    });
+    await provideInputCore({ ticketId, answer: "A1" });
+
+    const afterAnswer = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(openExchanges(afterAnswer).length).toBeLessThanOrEqual(1);
+    expect(afterAnswer?.exchanges[0]?.answer).toBe("A1");
+
+    const secondPark = await waitForRun(runId, "awaiting_input");
+    expect(openExchanges(secondPark)).toHaveLength(1);
+    expect(secondPark.exchanges).toHaveLength(2);
+    expect(secondPark.exchanges[0]).toMatchObject({
+      question: "Q1?",
+      answer: "A1",
+    });
+    expect(secondPark.exchanges[1]).toMatchObject({
+      question: "Q2?",
+      answer: null,
+    });
+  }, 20_000);
+
   it("leaves a failed resume parked and retryable when spawn fails", async () => {
     const { provideInputCore } = await import("./tickets.server");
     process.env.T4D_OUTCOME = JSON.stringify({
@@ -260,6 +368,17 @@ describe("runner outcomes", () => {
     expect(run?.awaitingQuestion).toBe("Which auth library?");
     expect(run?.pid).toBeNull();
     expect(run?.startedAt).toBe(parkedRun.startedAt);
+    expect(run?.exchanges).toHaveLength(2);
+    expect(run?.exchanges[0]).toMatchObject({
+      question: "Which auth library?",
+      answer: "use lucia",
+    });
+    expect(run?.exchanges[0]?.answeredAt).not.toBeNull();
+    expect(run?.exchanges[1]).toMatchObject({
+      question: "Which auth library?",
+      answer: null,
+      answeredAt: null,
+    });
 
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
     await writeRunner();
