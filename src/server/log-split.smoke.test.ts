@@ -30,7 +30,7 @@ process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 process.env.DISCORD_WEBHOOK_URL = "";
 
 const { db, closeDb, ObjectId } = await import("./db");
-const { logTailCore } = await import("./runs.server");
+const { listRunsCore, logTailCore } = await import("./runs.server");
 const { dispatchRun } = await import("./supervisor.server");
 
 let database: Db;
@@ -42,6 +42,54 @@ let binDirectory: string;
 let boardId: string;
 
 const timestamp = () => new Date().toISOString();
+
+function runDocument(
+  ticketId: string,
+  logFile: string,
+): Omit<RunDoc, "stderrFile"> {
+  const at = timestamp();
+  return {
+    ticketId,
+    boardId,
+    runner: "claude",
+    phase: "spec_draft",
+    status: "succeeded",
+    workDir: repo,
+    promptFile: join(repo, "prompt.md"),
+    logFile,
+    pid: null,
+    exitCode: 0,
+    summary: null,
+    branch: null,
+    baseSha: null,
+    verdict: null,
+    failureKind: null,
+    executionSessionId: null,
+    awaitingQuestion: null,
+    queuedAt: at,
+    startedAt: at,
+    finishedAt: at,
+  };
+}
+
+async function insertRunWithLogs(
+  stdout: string,
+  stderr: string,
+): Promise<string> {
+  const id = new ObjectId();
+  const logFile = join(repo, `${id.toString()}-output.log`);
+  const stderrFile = join(repo, `${id.toString()}-stderr.log`);
+  await Promise.all([
+    writeFile(logFile, stdout),
+    writeFile(stderrFile, stderr),
+  ]);
+  await runs.insertOne({
+    _id: id,
+    ...runDocument(new ObjectId().toString(), logFile),
+    stderrFile,
+  });
+  return id.toString();
+}
 
 async function writeRunner(): Promise<void> {
   const executable = join(binDirectory, "claude");
@@ -172,31 +220,11 @@ describe("split run logs", () => {
   });
 
   it("tails a legacy run without adding a stderr delimiter", async () => {
-    const at = timestamp();
     const logFile = join(repo, "legacy-output.log");
     await writeFile(logFile, "legacy stdout content\n");
     const result = await runs.insertOne({
-      ticketId: new ObjectId().toString(),
-      boardId,
-      runner: "claude",
-      phase: "spec_draft",
-      status: "succeeded",
-      workDir: repo,
-      promptFile: join(repo, "legacy-prompt.md"),
-      logFile,
+      ...runDocument(new ObjectId().toString(), logFile),
       stderrFile: null,
-      pid: null,
-      exitCode: 0,
-      summary: null,
-      branch: null,
-      baseSha: null,
-      verdict: null,
-      failureKind: null,
-      executionSessionId: null,
-      awaitingQuestion: null,
-      queuedAt: at,
-      startedAt: at,
-      finishedAt: at,
     });
 
     const tail = await logTailCore({
@@ -205,5 +233,58 @@ describe("split run logs", () => {
     });
     expect(tail.text).toContain("legacy stdout content");
     expect(tail.text).not.toContain("──── stderr ────");
+  });
+
+  it("lists and tails a legacy run with no stderrFile key", async () => {
+    const ticketId = new ObjectId().toString();
+    const logFile = join(repo, "key-absent-stderr-output.log");
+    await writeFile(logFile, "key-absent legacy stdout\n");
+    const result = await database
+      .collection<Omit<RunDoc, "stderrFile">>("runs")
+      .insertOne(runDocument(ticketId, logFile));
+
+    const listed = await listRunsCore({ ticketId });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.stderrFile).toBeNull();
+
+    const tail = await logTailCore({
+      runId: result.insertedId.toString(),
+      bytes: 20_000,
+    });
+    expect(tail.text).toBe("key-absent legacy stdout\n");
+  });
+
+  it("uses the full budget for stdout when stderr is empty", async () => {
+    const runId = await insertRunWithLogs("s".repeat(50_000), "");
+
+    const tail = await logTailCore({ runId, bytes: 20_000 });
+
+    expect(Buffer.byteLength(tail.text, "utf8")).toBe(20_000);
+    expect(tail.text).toBe("s".repeat(20_000));
+  });
+
+  it("charges both streams and the delimiter against the byte budget", async () => {
+    const runId = await insertRunWithLogs(
+      "s".repeat(50_000),
+      "e".repeat(50_000),
+    );
+
+    const tail = await logTailCore({ runId, bytes: 20_000 });
+
+    expect(Buffer.byteLength(tail.text, "utf8")).toBeLessThanOrEqual(20_000);
+    expect(tail.text).toContain("──── stderr ────");
+    expect(tail.text).toContain("s");
+    expect(tail.text).toContain("e");
+  });
+
+  it("handles a one-byte budget when stderr is non-empty", async () => {
+    const runId = await insertRunWithLogs(
+      "s".repeat(50_000),
+      "e".repeat(50_000),
+    );
+
+    await expect(logTailCore({ runId, bytes: 1 })).resolves.toEqual({
+      text: "s",
+    });
   });
 });
