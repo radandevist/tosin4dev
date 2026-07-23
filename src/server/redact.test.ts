@@ -34,7 +34,6 @@ describe("redactSecrets", () => {
     ["sk-abcdefghijklmnopqrstuvwx"],
     ["ghp_abcdefghijklmnopqrstuvwxyz12"],
     ["AKIAIOSFODNN7EXAMPLE"],
-    ["Bearer abcdefghijklmnopqrstuvwxyz"],
     [
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NX0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
     ],
@@ -44,8 +43,55 @@ describe("redactSecrets", () => {
     expect(out).toBe("before token=[REDACTED] after");
   });
 
+  it("scrubs a lowercase bearer authorization header", () => {
+    expect(
+      redactSecrets(
+        "before authorization: bearer abcdefghijklmnopqrstuvwxyz012345 after",
+      ),
+    ).toBe("before authorization: [REDACTED] after");
+  });
+
+  it("still scrubs an uppercase Bearer token", () => {
+    expect(
+      redactSecrets("before Bearer abcdefghijklmnopqrstuvwxyz012345 after"),
+    ).toBe("before [REDACTED] after");
+  });
+
+  it.each([
+    ["Slack", "xoxb-1234567890-abcdefghij"],
+    ["Google", "AIzaabcdefghijklmnopqrstuvwxyz123456789"],
+    ["Stripe secret", "sk_live_1234567890abcdef"],
+    ["Stripe webhook", "whsec_1234567890abcdef"],
+    ["GitLab", "glpat-1234567890abcdefghij"],
+    ["SendGrid", "SG.1234567890abcdef.abcdefghijklmnop"],
+  ])("scrubs a %s credential while preserving surrounding text", (_, secret) => {
+    const out = redactSecrets(`before ${secret} after`);
+
+    expect(out).toBe("before [REDACTED] after");
+    expect(out).not.toContain(secret);
+  });
+
+  it("scrubs a multiline PEM private key block completely", () => {
+    const secret = [
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "abc123",
+      "def456",
+      "-----END RSA PRIVATE KEY-----",
+    ].join("\n");
+    const out = redactSecrets(`before\n${secret}\nafter`);
+
+    expect(out).toBe("before\n[REDACTED]\nafter");
+    expect(out).not.toContain(secret);
+  });
+
   it("leaves ordinary text untouched", () => {
     const text = "ran bun test, 199 passed, committed as a1e50cb";
+
+    expect(redactSecrets(text)).toBe(text);
+  });
+
+  it("does not mangle prose containing risk or bearer without a token", () => {
+    const text = "the bearer of bad news explained the risk";
 
     expect(redactSecrets(text)).toBe(text);
   });
