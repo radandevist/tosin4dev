@@ -7,10 +7,14 @@ import {
 
 describe("HandoffBriefSchema", () => {
   it("defaults every field so a sparse brief still parses", () => {
-    const brief = HandoffBriefSchema.parse({});
-    expect(brief.workDone).toBe("");
-    expect(brief.filesTouched).toEqual([]);
-    expect(brief.options).toEqual([]);
+    expect(HandoffBriefSchema.parse({})).toEqual({
+      workDone: "",
+      filesTouched: [],
+      commandsRun: [],
+      decision: "",
+      options: [],
+      risk: "",
+    });
   });
 
   it("rejects an unknown key", () => {
@@ -36,6 +40,44 @@ describe("InputExchangeSchema", () => {
         v: 2,
         at: "2026-07-23T10:00:00.000Z",
         question: "q",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an unknown key", () => {
+    expect(
+      InputExchangeSchema.safeParse({
+        v: 1,
+        at: "2026-07-23T10:00:00.000Z",
+        question: "q",
+        extra: 1,
+      }).success,
+    ).toBe(false);
+  });
+
+  it.each(["yesterday", ""])("rejects an invalid at value: %j", (at) => {
+    expect(
+      InputExchangeSchema.safeParse({ v: 1, at, question: "q" }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an invalid answeredAt value", () => {
+    expect(
+      InputExchangeSchema.safeParse({
+        v: 1,
+        at: "2026-07-23T10:00:00.000Z",
+        question: "q",
+        answeredAt: "nope",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an empty question", () => {
+    expect(
+      InputExchangeSchema.safeParse({
+        v: 1,
+        at: "2026-07-23T10:00:00.000Z",
+        question: "",
       }).success,
     ).toBe(false);
   });
