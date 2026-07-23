@@ -54,6 +54,9 @@ interface RunningChild {
 }
 
 const ACTIVITY_CAP = 50;
+// Bounded degradation (losing the oldest rows) is deliberately preferred over
+// an unreadable oversized run document that loses the entire exchange history.
+const EXCHANGE_CAP = 50;
 // The collected buffer feeds parseSessionId (whose marker is the FIRST line of
 // provider output) and summary extraction (which cares about the END). Keep a
 // head window and a tail window rather than a tail alone.
@@ -431,7 +434,7 @@ async function notifyBlocked(
   await notify(`⛔ blocked: ${await ticketLabel(database, ticketId)} — ${reason}. Log: ${logFile}${stderrFile ? ` (stderr: ${stderrFile})` : ""}`);
 }
 
-async function parkTicketNeedsInput(
+export async function parkTicketNeedsInput(
   database: Db,
   runId: string,
   ticketId: string,
@@ -453,12 +456,17 @@ async function parkTicketNeedsInput(
       },
       $push: {
         exchanges: {
-          v: 1 as const,
-          at,
-          question,
-          handoff,
-          answer: null,
-          answeredAt: null,
+          $each: [
+            {
+              v: 1 as const,
+              at,
+              question,
+              handoff,
+              answer: null,
+              answeredAt: null,
+            },
+          ],
+          $slice: -EXCHANGE_CAP,
         },
       },
     },
@@ -790,12 +798,17 @@ async function restoreParkedResume(
         },
         $push: {
           exchanges: {
-            v: 1 as const,
-            at,
-            question: question ?? "",
-            handoff: null,
-            answer: null,
-            answeredAt: null,
+            $each: [
+              {
+                v: 1 as const,
+                at,
+                question: question ?? "",
+                handoff: null,
+                answer: null,
+                answeredAt: null,
+              },
+            ],
+            $slice: -EXCHANGE_CAP,
           },
         },
       },
