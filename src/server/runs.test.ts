@@ -75,6 +75,7 @@ describe("run browser contracts", () => {
       workDir: "/tmp/worktree",
       promptFile: "/tmp/run/prompt.md",
       logFile: "/tmp/run/output.log",
+      stderrFile: "/tmp/run/stderr.log",
       pid: 123,
       exitCode: null,
       summary: null,

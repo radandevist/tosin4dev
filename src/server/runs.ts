@@ -27,6 +27,7 @@ export const RunDTOSchema = z
     workDir: AbsolutePathString,
     promptFile: AbsolutePathString,
     logFile: AbsolutePathString,
+    stderrFile: AbsolutePathString.nullable(),
     pid: z.number().int().positive().nullable(),
     exitCode: z.number().int().nullable(),
     summary: z.string().nullable(),

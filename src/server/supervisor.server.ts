@@ -161,6 +161,7 @@ function runPaths(board: Board, runId: string, phase: Phase) {
         : `${root}/worktrees/${runId}`,
     promptFile: `${runDir}/prompt.md`,
     logFile: `${runDir}/output.log`,
+    stderrFile: `${runDir}/stderr.log`,
   };
 }
 
@@ -830,7 +831,11 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
     child = spawnedChild;
     runningChild = {
       stdout: drainStream(spawnedChild.stdout, run.logFile, true),
-      stderr: drainStream(spawnedChild.stderr, run.logFile, false),
+      stderr: drainStream(
+        spawnedChild.stderr,
+        run.stderrFile ?? run.logFile,
+        false,
+      ),
       exited: settledExit(spawnedChild),
     };
     void Promise.all([
@@ -964,6 +969,7 @@ export async function dispatchRun(
     workDir: paths.workDir,
     promptFile: paths.promptFile,
     logFile: paths.logFile,
+    stderrFile: paths.stderrFile,
     pid: null,
     exitCode: null,
     summary: null,
@@ -1018,6 +1024,7 @@ export async function dispatchRun(
     };
     await writeFile(paths.promptFile, buildPrompt(brief));
     await writeFile(paths.logFile, "");
+    await writeFile(paths.stderrFile, "");
     const command = adapters[ticket.runner].buildCommand(
       brief,
       paths.promptFile,
@@ -1034,7 +1041,7 @@ export async function dispatchRun(
     child = spawnedChild;
     runningChild = {
       stdout: drainStream(spawnedChild.stdout, paths.logFile, true),
-      stderr: drainStream(spawnedChild.stderr, paths.logFile, false),
+      stderr: drainStream(spawnedChild.stderr, paths.stderrFile, false),
       exited: settledExit(spawnedChild),
     };
     void Promise.all([
