@@ -787,18 +787,51 @@ async function restoreParkedResume(
 ): Promise<void> {
   const at = now();
   const runs = database.collection<RunDoc>("runs");
+  const parkedRunState = {
+    status: "awaiting_input" as const,
+    awaitingQuestion: question,
+    pid: null,
+    startedAt: run.startedAt,
+  };
   const updates = [
-    runs.updateOne(
-      { _id: new ObjectId(runId) },
-      {
-        $set: {
-          status: "awaiting_input",
-          awaitingQuestion: question,
-          pid: null,
-          startedAt: run.startedAt,
+    (async () => {
+      // Restore the parked status and its open row in one document write. A
+      // concurrent retry must never observe awaiting_input without an open
+      // exchange and claim the run before the row is reopened.
+      const restored = await runs.updateOne(
+        {
+          _id: new ObjectId(runId),
+          exchanges: { $not: { $elemMatch: { answer: null } } },
         },
-      },
-    ),
+        {
+          $set: parkedRunState,
+          $push: {
+            exchanges: {
+              $each: [
+                {
+                  v: 1 as const,
+                  at,
+                  // Keep compensation rows valid when legacy data lacks a question.
+                  question: question ?? "(question unavailable)",
+                  handoff: null,
+                  answer: null,
+                  answeredAt: null,
+                },
+              ],
+              $slice: -EXCHANGE_CAP,
+            },
+          },
+        },
+      );
+      if (restored.matchedCount === 0) {
+        // If the claim failed before writing, the original row is still open.
+        // Restore status only rather than manufacturing a second open exchange.
+        await runs.updateOne(
+          { _id: new ObjectId(runId) },
+          { $set: parkedRunState },
+        );
+      }
+    })(),
     database.collection<TicketDoc>("tickets").updateOne(
       { _id: new ObjectId(run.ticketId), activeRunId: runId },
       {
@@ -815,33 +848,6 @@ async function restoreParkedResume(
     (result): result is PromiseRejectedResult => result.status === "rejected",
   );
   if (failed) throw failed.reason;
-
-  // If the claim failed before writing, the original row is still open.
-  // Reopening unconditionally would manufacture a second open exchange.
-  await runs.updateOne(
-    {
-      _id: new ObjectId(runId),
-      exchanges: { $not: { $elemMatch: { answer: null } } },
-    },
-    {
-      $push: {
-        exchanges: {
-          $each: [
-            {
-              v: 1 as const,
-              at,
-              // Keep compensation rows valid when legacy data lacks a question.
-              question: question ?? "(question unavailable)",
-              handoff: null,
-              answer: null,
-              answeredAt: null,
-            },
-          ],
-          $slice: -EXCHANGE_CAP,
-        },
-      },
-    },
-  );
 }
 
 export async function resumeRun(runId: string, answer: string): Promise<void> {
@@ -896,23 +902,29 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
   let child: ChildProcess | undefined;
   let runningChild: RunningChild | undefined;
   const answeredAt = now();
+  const exchanges = run.exchanges ?? [];
   let openIndex = -1;
-  for (let index = (run.exchanges ?? []).length - 1; index >= 0; index -= 1) {
-    if (run.exchanges?.[index]?.answer === null) {
-      openIndex = index;
-      break;
-    }
-  }
+  exchanges.forEach((exchange, index) => {
+    if (exchange.answer === null) openIndex = index;
+  });
+  const openRow = openIndex >= 0 ? exchanges[openIndex] : null;
   // Pin the exact row being answered. Array filters throw when `exchanges` is
   // absent on a pre-v5 run and would fan one answer across every open row.
   const claimFilter: Filter<RunDoc> = {
     _id: new ObjectId(runId),
     status: "awaiting_input",
   };
-  if (openIndex >= 0) {
-    (claimFilter as Record<string, unknown>)[
-      `exchanges.${openIndex}.answer`
-    ] = null;
+  if (openIndex >= 0 && openRow) {
+    // Real row-level CAS. `{$type:"null"}` NOT `null`: plain equality-to-null
+    // also matches MISSING, and a numeric path component is ambiguous (index vs
+    // literal field name), so `{"exchanges.N.answer": null}` matches ANY doc
+    // with an exchanges array — it is a no-op. The `at` identity term pins the
+    // exact row we snapshotted, so a concurrent park + $slice front-eviction
+    // (which shifts every index down) cannot land this answer on a different
+    // question.
+    const filter = claimFilter as Record<string, unknown>;
+    filter[`exchanges.${openIndex}.answer`] = { $type: "null" };
+    filter[`exchanges.${openIndex}.at`] = openRow.at;
   }
   // The answer MUST remain inside this claim: a second write could fail after
   // status changes to running, losing the human answer with no safe retry.
@@ -930,10 +942,37 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
               }
             : {}),
         },
+        ...(openIndex === -1
+          ? {
+              $push: {
+                exchanges: {
+                  $each: [
+                    {
+                      v: 1 as const,
+                      at: answeredAt,
+                      question:
+                        run.awaitingQuestion ?? "(question unavailable)",
+                      handoff: null,
+                      answer,
+                      answeredAt,
+                    },
+                  ],
+                  $slice: -EXCHANGE_CAP,
+                },
+              },
+            }
+          : {}),
       },
     )
     .catch(async () => {
-      await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+      try {
+        await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+      } catch (compensationError) {
+        console.error(
+          `Failed to restore parked run ${runId} after claim failure:`,
+          compensationError,
+        );
+      }
       throw new ServerResultError("spawn_failed", "run could not be resumed");
     });
   if (claimed.matchedCount === 0) {
