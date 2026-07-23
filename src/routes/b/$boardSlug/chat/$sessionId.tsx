@@ -1,6 +1,10 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import {
+  consultationAnswerStorageKey,
+  parseConsultationTicketSeq,
+} from "../../../../components/consultationUi";
 import { RISK_LABELS, TYPE_LABELS } from "../../../../components/TicketCard";
 import type { BundleMember } from "../../../../domain/schemas";
 import {
@@ -19,11 +23,18 @@ import { useTickets } from "../../../../queries/tickets";
 import type { ChatSessionDTO } from "../../../../server/chat";
 
 export const Route = createFileRoute("/b/$boardSlug/chat/$sessionId")({
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { ticketSeq?: number } => {
+    const ticketSeq = parseConsultationTicketSeq(search.ticketSeq);
+    return ticketSeq === null ? {} : { ticketSeq };
+  },
   component: ChatPage,
 });
 
 function ChatPage() {
   const { boardSlug, sessionId } = Route.useParams();
+  const { ticketSeq } = Route.useSearch();
   const session = useChatSession({ variables: { sessionId } });
 
   return (
@@ -38,7 +49,9 @@ function ChatPage() {
         </Link>
         <div className="text-center">
           <h1 className="text-lg font-semibold tracking-tight text-zinc-900">
-            Brainstorm
+            {session.data?.kind === "consultation"
+              ? "Consultation"
+              : "Brainstorm"}
           </h1>
           {session.data ? (
             <p className="text-xs text-zinc-500">
@@ -60,6 +73,7 @@ function ChatPage() {
           boardSlug={boardSlug}
           sessionId={sessionId}
           session={session.data}
+          ticketSeq={ticketSeq}
         />
       )}
     </main>
@@ -70,10 +84,12 @@ function ChatBody({
   boardSlug,
   sessionId,
   session,
+  ticketSeq,
 }: {
   boardSlug: string;
   sessionId: string;
   session: ChatSessionDTO;
+  ticketSeq: number | undefined;
 }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -113,8 +129,29 @@ function ChatBody({
     );
   };
 
+  const useAsAnswer = (answer: string) => {
+    if (session.runId === null || ticketSeq === undefined) return;
+    window.sessionStorage.setItem(
+      consultationAnswerStorageKey(session.runId),
+      answer,
+    );
+    void navigate({
+      to: "/b/$boardSlug/t/$ticketSeq",
+      params: { boardSlug, ticketSeq: String(ticketSeq) },
+    });
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {session.kind === "consultation" ? (
+        <div
+          role="note"
+          className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+        >
+          Consultation — advisory and read-only. This AI cannot change the run;
+          copy its suggestion into your answer and press Provide input yourself.
+        </div>
+      ) : null}
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto rounded-xl border border-zinc-200 bg-white p-4">
         {session.messages.length === 0 ? (
           <p className="text-sm text-zinc-400">
@@ -131,6 +168,17 @@ function ChatBody({
               }
             >
               {message.text}
+              {session.kind === "consultation" &&
+              message.role === "assistant" ? (
+                <button
+                  type="button"
+                  disabled={session.runId === null || ticketSeq === undefined}
+                  onClick={() => useAsAnswer(message.text)}
+                  className="mt-2 block rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Use as my answer
+                </button>
+              ) : null}
             </div>
           ))
         )}
@@ -144,7 +192,7 @@ function ChatBody({
             {session.turnError}
           </p>
         ) : null}
-        {session.bundleId ? (
+        {session.kind === "brainstorm" && session.bundleId ? (
           <SpecBundleReview
             bundleId={session.bundleId}
             boardId={session.boardId}
@@ -180,14 +228,16 @@ function ChatBody({
           >
             Send
           </button>
-          <button
-            type="button"
-            disabled={pending || propose.isPending}
-            onClick={proposeTickets}
-            className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium whitespace-nowrap text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:opacity-50"
-          >
-            {propose.isPending ? "Proposing…" : "Propose tickets"}
-          </button>
+          {session.kind === "brainstorm" ? (
+            <button
+              type="button"
+              disabled={pending || propose.isPending}
+              onClick={proposeTickets}
+              className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium whitespace-nowrap text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:opacity-50"
+            >
+              {propose.isPending ? "Proposing…" : "Propose tickets"}
+            </button>
+          ) : null}
         </div>
       </form>
       {send.isError ? (
@@ -195,7 +245,7 @@ function ChatBody({
           {send.error.message}
         </p>
       ) : null}
-      {propose.isError ? (
+      {session.kind === "brainstorm" && propose.isError ? (
         <p role="alert" className="text-sm text-rose-600">
           {propose.error.message}
         </p>
