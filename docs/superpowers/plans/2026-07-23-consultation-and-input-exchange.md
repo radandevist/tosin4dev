@@ -735,6 +735,24 @@ pick throws at the boundary.
 > without the key. A fixture that sets `exchanges: []` explicitly is the
 > post-migration shape and proves nothing.
 
+> **Make the read path row-tolerant, not array-tolerant.** `InputExchangeSchema.v`
+> is `z.literal(1)`, so `z.array(InputExchangeSchema)` rejects the **entire
+> array** if a single row fails — and a rejected array rejects the whole
+> document, which `boundary` turns into `code:"internal"`, which erases the
+> whole runs list. That is the same failure shape as the `stderrFile` bug.
+>
+> So in `toDTO`, parse each row individually with `safeParse` and drop the ones
+> that fail, rather than parsing the array as a unit. Never let one bad row nuke
+> the array, and never let the array nuke the document.
+>
+> Do **not** "fix" this by widening `v` to `z.number()` or wrapping the array in
+> `.catch([])`. Widening silently reinterprets a future v2 row as v1 — exactly
+> what the version field exists to prevent. `.catch([])` silently erases a real
+> Q&A history, so a run consulted three times renders as "no questions were ever
+> asked" — a worse lie than a visible gap. When v2 arrives, replace the literal
+> with `z.discriminatedUnion("v", [V1, V2])`; the literal is the correct
+> one-member degenerate case of exactly that.
+
 - [ ] **Step 2 (RED):** add a pure helper in `src/components/runsUi.ts` plus tests:
 
 ```ts
