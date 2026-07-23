@@ -917,14 +917,22 @@ export function redactSecrets(text: string): string {
 1. The package always contains the ticket title, intent, and acceptance criteria.
 2. It contains the open question and every answered exchange.
 3. It contains the handoff brief fields when present.
-4. With `process.env.T4D_TEST_TOKEN = "planted-secret-1234"` planted in the run's
-   log file, the package contains **neither** that value **nor** the string
-   `planted-secret`.
+4. **No raw log text.** With `process.env.T4D_TEST_TOKEN = "planted-secret-1234"`
+   planted in the run's **log file**, the package contains neither that value nor
+   the string `planted-secret` — because the log file is never read into the
+   package at all (owner decision, see spec). Assert the builder does not read
+   `run.logFile`/`run.stderrFile`.
+   Also, defense-in-depth: with the same token planted in a **handoff field** or
+   a **git commit message** that reaches the package, it is `[REDACTED]` there.
 5. With an oversized synthetic history, the total length is
    `<= RUN_CONTEXT_CHAR_BUDGET + <spec length>`, the spec is still present, and
    the **newest** exchange survives while the oldest is dropped.
 6. Sections are dropped whole: the package never ends mid-section — assert that
    every section header present is followed by content.
+7. **Same view as the human.** The exchange section is built from the row-tolerant
+   `toDTO` projection, not the raw run document: a run with one valid and one
+   invalid exchange row shows the valid row and reflects `exchangesDropped`, matching
+   what `RunsSection` renders. Assert the consultant is not shown a dropped row.
 
 - [ ] **Step 2: verify it fails.**
 
@@ -943,10 +951,16 @@ export async function buildRunContext(runId: string): Promise<{ text: string }> 
   //    `git log --oneline <baseSha>..HEAD` — execFile with an argv array and
   //    NO shell, matching the BoardCheck execution rule. A git failure degrades
   //    that section to a one-line note; it never fails the build.
-  // 5. Redacted log excerpt: tail of logFile then stderrFile, budget permitting.
   //
-  // EVERY section passes through redactSecrets before it is appended, including
-  // 1-3: a runner can echo a secret into its own handoff. If redactSecrets
+  // NO log-excerpt section. Raw runner stdout/stderr is deliberately excluded
+  // (owner decision): redaction cannot be trusted as the sole gate on free-form
+  // log text, and the transcript is persisted + shareable. Do NOT read
+  // run.logFile or run.stderrFile here.
+  //
+  // EVERY section passes through redactSecrets before it is appended — including
+  // 1-3, since a runner can echo a secret into its own handoff, and 4, since a
+  // branch or commit message can carry one. This is DEFENSE-IN-DEPTH, not the
+  // primary control (that is the exclusion of log text above). If redactSecrets
   // throws, omit that section entirely rather than emit it raw (fail-closed).
 }
 ```
