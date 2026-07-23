@@ -52,6 +52,7 @@ describe("run DTO mapping", () => {
     expect(dto.awaitingQuestion).toBe(
       "Which authentication library should I use?",
     );
+    expect(dto.exchangesDropped).toBe(0);
     expect(dto).not.toHaveProperty("branch");
   });
 
@@ -97,6 +98,52 @@ describe("run DTO mapping", () => {
     expect(listed.some(({ _id }) => _id === siblingId.toString())).toBe(true);
   });
 
+  it("defaults a non-array exchanges value without dropping sibling runs", async () => {
+    const ticketId = new ObjectId().toString();
+    const run = RunSchema.parse({
+      ticketId,
+      boardId: new ObjectId().toString(),
+      runner: "claude",
+      phase: "execute",
+      status: "running",
+      workDir: "/repo/.tosin4dev/worktrees/non-array",
+      promptFile: "/repo/.tosin4dev/runs/non-array/prompt.md",
+      logFile: "/repo/.tosin4dev/runs/non-array/output.log",
+    });
+    const malformedId = new ObjectId();
+    const siblingId = new ObjectId();
+    mockState.docs = [
+      {
+        _id: malformedId,
+        ...run,
+        exchanges: "not-an-array",
+        pid: 101,
+        queuedAt: "2026-07-22T10:00:00.000Z",
+        startedAt: "2026-07-22T10:00:01.000Z",
+        finishedAt: null,
+      },
+      {
+        _id: siblingId,
+        ...run,
+        pid: 102,
+        queuedAt: "2026-07-22T10:01:00.000Z",
+        startedAt: "2026-07-22T10:01:01.000Z",
+        finishedAt: null,
+      },
+    ];
+
+    const listed = await listRunsCore({ ticketId });
+
+    expect(listed).toHaveLength(2);
+    expect(
+      listed.find(({ _id }) => _id === malformedId.toString()),
+    ).toMatchObject({
+      exchanges: [],
+      exchangesDropped: 0,
+    });
+    expect(listed.some(({ _id }) => _id === siblingId.toString())).toBe(true);
+  });
+
   it("drops an invalid exchange row without dropping valid history or sibling runs", async () => {
     const ticketId = new ObjectId().toString();
     const run = RunSchema.parse({
@@ -115,13 +162,22 @@ describe("run DTO mapping", () => {
       at: "2026-07-22T10:02:00.000Z",
       question: "Which database?",
     });
+    const secondValidExchange = InputExchangeSchema.parse({
+      ...validExchange,
+      question: "Which cache?",
+    });
     const mixedId = new ObjectId();
     const siblingId = new ObjectId();
     mockState.docs = [
       {
         _id: mixedId,
         ...run,
-        exchanges: [validExchange, { ...validExchange, v: 2 }],
+        exchanges: [
+          validExchange,
+          { ...validExchange, v: 2 },
+          { ...validExchange, unexpected: true },
+          secondValidExchange,
+        ],
         pid: null,
         queuedAt: "2026-07-22T10:00:00.000Z",
         startedAt: "2026-07-22T10:00:01.000Z",
@@ -141,8 +197,10 @@ describe("run DTO mapping", () => {
     const listed = await listRunsCore({ ticketId });
 
     expect(listed).toHaveLength(2);
-    expect(listed.find(({ _id }) => _id === mixedId.toString())?.exchanges)
-      .toEqual([validExchange]);
+    expect(listed.find(({ _id }) => _id === mixedId.toString())).toMatchObject({
+      exchanges: [validExchange, secondValidExchange],
+      exchangesDropped: 2,
+    });
     expect(listed.some(({ _id }) => _id === siblingId.toString())).toBe(true);
   });
 });

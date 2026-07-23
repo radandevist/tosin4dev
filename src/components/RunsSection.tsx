@@ -16,6 +16,7 @@ import {
   formatRunTimestamp,
   isTicketAdvancingRunStatus,
   openExchange,
+  shouldShowAnswerForm,
   shouldPollLog,
   shouldPollRun,
 } from "./runsUi";
@@ -216,6 +217,14 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
 
       {parkedRun ? (
         <div className="space-y-3">
+          {parkedRun.exchangesDropped > 0 ? (
+            <p className="text-xs text-zinc-400">
+              {parkedRun.exchangesDropped} earlier{" "}
+              {parkedRun.exchangesDropped === 1 ? "exchange" : "exchanges"}{" "}
+              could not be displayed
+            </p>
+          ) : null}
+
           {answered.length > 0 ? (
             <ol className="space-y-2">
               {answered.map((exchange, index) => (
@@ -226,13 +235,21 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
                   <p className="text-sm font-medium text-zinc-800">
                     {exchange.question}
                   </p>
-                  <p className="text-sm text-zinc-600">{exchange.answer}</p>
                   <time
-                    dateTime={exchange.answeredAt ?? exchange.at}
+                    dateTime={exchange.at}
                     className="block text-xs text-zinc-400"
                   >
-                    {formatRunTimestamp(exchange.answeredAt ?? exchange.at)}
+                    Asked {formatRunTimestamp(exchange.at)}
                   </time>
+                  <p className="text-sm text-zinc-600">{exchange.answer}</p>
+                  {exchange.answeredAt ? (
+                    <time
+                      dateTime={exchange.answeredAt}
+                      className="block text-xs text-zinc-400"
+                    >
+                      Answered {formatRunTimestamp(exchange.answeredAt)}
+                    </time>
+                  ) : null}
                 </li>
               ))}
             </ol>
@@ -240,47 +257,49 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
 
           {open?.handoff ? <HandoffDetails handoff={open.handoff} /> : null}
 
-          <form
-            className="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
-            onSubmit={(event) => {
-              event.preventDefault();
-              submitInput();
-            }}
-          >
-            <div className="space-y-1">
-              <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
-                Input needed
-              </p>
-              <p className="text-sm text-zinc-800">
-                {parkedRun.awaitingQuestion}
-              </p>
-            </div>
-            <label
-              htmlFor={`run-answer-${parkedRun._id}`}
-              className="block text-xs font-medium text-zinc-600"
+          {shouldShowAnswerForm(parkedRun) ? (
+            <form
+              className="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                submitInput();
+              }}
             >
-              Your answer
-            </label>
-            <textarea
-              id={`run-answer-${parkedRun._id}`}
-              value={answer}
-              onChange={(event) => setAnswer(event.target.value)}
-              rows={3}
-              className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
-            />
-            <button
-              type="submit"
-              disabled={provideInput.isPending || answer.trim().length === 0}
-              className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {provideInput.isPending ? "Submitting…" : "Provide input"}
-            </button>
-            {provideInput.isError ? (
-              <p role="alert" className="text-sm text-rose-600">
-                Could not provide input: {provideInput.error.message}
-              </p>
-            ) : null}
-          </form>
+              <div className="space-y-1">
+                <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                  Input needed
+                </p>
+                <p className="text-sm text-zinc-800">
+                  {parkedRun.awaitingQuestion}
+                </p>
+              </div>
+              <label
+                htmlFor={`run-answer-${parkedRun._id}`}
+                className="block text-xs font-medium text-zinc-600"
+              >
+                Your answer
+              </label>
+              <textarea
+                id={`run-answer-${parkedRun._id}`}
+                value={answer}
+                onChange={(event) => setAnswer(event.target.value)}
+                rows={3}
+                className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={provideInput.isPending || answer.trim().length === 0}
+                className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {provideInput.isPending ? "Submitting…" : "Provide input"}
+              </button>
+              {provideInput.isError ? (
+                <p role="alert" className="text-sm text-rose-600">
+                  Could not provide input: {provideInput.error.message}
+                </p>
+              ) : null}
+            </form>
+          ) : null}
         </div>
       ) : null}
 
@@ -346,6 +365,8 @@ function HandoffDetails({ handoff }: { handoff: HandoffBrief }) {
       values: field.values.filter((value) => value.trim().length > 0),
     }))
     .filter((field) => field.values.length > 0);
+
+  if (fields.length === 0) return null;
 
   return (
     <details className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 text-sm">

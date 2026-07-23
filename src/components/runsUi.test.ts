@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { InputExchange } from "../domain/schemas";
+import { RunDTOSchema } from "../server/runs";
 import {
   answeredExchanges,
   dispatchActionForTicket,
@@ -8,6 +9,7 @@ import {
   isTicketAdvancingRunStatus,
   isTerminalRunStatus,
   openExchange,
+  shouldShowAnswerForm,
   shouldPollRun,
   shouldPollLog,
 } from "./runsUi";
@@ -154,5 +156,55 @@ describe("input exchange helpers", () => {
     const lastOpen = { ...open, question: "Latest question?" };
 
     expect(openExchange([open, lastOpen])).toBe(lastOpen);
+  });
+});
+
+describe("shouldShowAnswerForm", () => {
+  const parkedRun = RunDTOSchema.parse({
+    _id: "0123456789abcdef01234567",
+    ticketId: "123456789abcdef012345678",
+    boardId: "23456789abcdef0123456789",
+    runner: "claude",
+    phase: "execute",
+    status: "awaiting_input",
+    workDir: "/tmp/worktree",
+    promptFile: "/tmp/run/prompt.md",
+    logFile: "/tmp/run/output.log",
+    stderrFile: null,
+    pid: null,
+    exitCode: null,
+    summary: null,
+    awaitingQuestion: "Which base branch?",
+    exchanges: [],
+    exchangesDropped: 0,
+    queuedAt: "2026-07-23T10:00:00.000Z",
+    startedAt: "2026-07-23T10:00:01.000Z",
+    finishedAt: null,
+  });
+
+  it("shows the form for a legacy parked run without exchanges", () => {
+    expect(shouldShowAnswerForm(parkedRun)).toBe(true);
+  });
+
+  it("shows the form for a parked run with populated history", () => {
+    expect(
+      shouldShowAnswerForm({
+        ...parkedRun,
+        exchanges: [
+          {
+            v: 1,
+            at: "2026-07-23T10:02:00.000Z",
+            question: "Which base branch?",
+            handoff: null,
+            answer: "develop",
+            answeredAt: "2026-07-23T10:03:00.000Z",
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("hides the form when there is no parked run", () => {
+    expect(shouldShowAnswerForm(undefined)).toBe(false);
   });
 });

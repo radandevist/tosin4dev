@@ -20,6 +20,11 @@ type RunDoc = Run & {
 };
 
 function toDTO(doc: WithId<RunDoc>): RunDTO {
+  const rawExchanges = Array.isArray(doc.exchanges) ? doc.exchanges : [];
+  const exchanges = rawExchanges.flatMap((exchange) => {
+    const parsed = InputExchangeSchema.safeParse(exchange);
+    return parsed.success ? [parsed.data] : [];
+  });
   const {
     _id,
     ticketId,
@@ -54,10 +59,8 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     exitCode,
     summary,
     awaitingQuestion,
-    exchanges: (doc.exchanges ?? []).flatMap((exchange) => {
-      const parsed = InputExchangeSchema.safeParse(exchange);
-      return parsed.success ? [parsed.data] : [];
-    }),
+    exchanges,
+    exchangesDropped: rawExchanges.length - exchanges.length,
     queuedAt,
     startedAt,
     finishedAt,
