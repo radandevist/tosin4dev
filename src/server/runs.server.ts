@@ -1,7 +1,8 @@
 import { open } from "node:fs/promises";
 import type { WithId } from "mongodb";
-import { InputExchangeSchema, type Run } from "../domain/schemas";
+import type { Run } from "../domain/schemas";
 import { db, ObjectId } from "./db";
+import { projectExchanges } from "./runExchanges";
 import type {
   DispatchRunInput,
   ListRunsInput,
@@ -20,11 +21,7 @@ type RunDoc = Run & {
 };
 
 function toDTO(doc: WithId<RunDoc>): RunDTO {
-  const rawExchanges = Array.isArray(doc.exchanges) ? doc.exchanges : [];
-  const exchanges = rawExchanges.flatMap((exchange) => {
-    const parsed = InputExchangeSchema.safeParse(exchange);
-    return parsed.success ? [parsed.data] : [];
-  });
+  const { exchanges, dropped } = projectExchanges(doc.exchanges);
   const {
     _id,
     ticketId,
@@ -60,7 +57,7 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     summary,
     awaitingQuestion,
     exchanges,
-    exchangesDropped: rawExchanges.length - exchanges.length,
+    exchangesDropped: dropped,
     queuedAt,
     startedAt,
     finishedAt,
