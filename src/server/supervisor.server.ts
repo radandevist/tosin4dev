@@ -1027,6 +1027,7 @@ export async function dispatchRun(
     failureKind: null,
     executionSessionId: null,
     awaitingQuestion: null,
+    exchanges: [],
     queuedAt: claimAt,
     startedAt: null,
     finishedAt: null,

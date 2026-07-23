@@ -1,5 +1,9 @@
 import { readFile } from "node:fs/promises";
-import { RunOutcomeSchema, type RunOutcome } from "../domain/schemas";
+import {
+  HandoffBriefSchema,
+  RunOutcomeSchema,
+  type RunOutcome,
+} from "../domain/schemas";
 
 // Extract the provider session/thread id from a runner's structured stdout.
 // claude --output-format json emits one JSON object carrying `session_id`;
@@ -40,14 +44,27 @@ export function parseSessionId(
 export async function readOutcome(runDir: string): Promise<RunOutcome> {
   try {
     const raw = await readFile(`${runDir}/outcome.json`, "utf8");
-    const parsed = RunOutcomeSchema.safeParse(JSON.parse(raw));
+    const decoded: unknown = JSON.parse(raw);
+    const record =
+      decoded !== null && typeof decoded === "object"
+        ? (decoded as Record<string, unknown>)
+        : null;
+    // Fail-OPEN on the handoff only: it is enrichment, so a malformed brief
+    // must not downgrade an otherwise valid needs_input outcome to a failure.
+    const handoff = HandoffBriefSchema.safeParse(record?.handoff);
+    const parsed = RunOutcomeSchema.safeParse(
+      record ? { ...record, handoff: null } : decoded,
+    );
     if (!parsed.success) {
       return RunOutcomeSchema.parse({
         outcome: "failed",
         reason: "invalid outcome.json",
       });
     }
-    return parsed.data;
+    return {
+      ...parsed.data,
+      handoff: handoff.success ? handoff.data : null,
+    };
   } catch {
     return RunOutcomeSchema.parse({
       outcome: "failed",

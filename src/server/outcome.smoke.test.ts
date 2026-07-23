@@ -27,6 +27,22 @@ describe("readOutcome", () => {
     expect(outcome.question).toBe("Q?");
   });
 
+  it("keeps needs_input when the handoff is malformed", async () => {
+    await writeFile(
+      join(dir, "outcome.json"),
+      JSON.stringify({
+        outcome: "needs_input",
+        question: "Q?",
+        handoff: "not an object",
+      }),
+    );
+
+    const outcome = await readOutcome(dir);
+
+    expect(outcome.outcome).toBe("needs_input");
+    expect(outcome.handoff).toBeNull();
+  });
+
   it("fails closed when the file is missing", async () => {
     expect((await readOutcome(dir)).outcome).toBe("failed");
   });
