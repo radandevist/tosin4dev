@@ -21,6 +21,8 @@ Tailwind 4, Vitest.
 - DTOs are built by **explicit field pick**, never `{...doc}` spread, into a `.strict()` schema.
 - Serialization uses CAS claims: `updateOne({_id, status:"X"}, {$set:{status:"Y"}})` then `matchedCount === 0 → conflict`.
 - Fail-closed: missing/invalid/errored → failure, never false success. **Exception, deliberate:** the handoff brief is fail-*open* (see Task 3).
+- **Legacy documents have no key at all for fields added later.** `RunSchema.parse` runs only in tests — production reads go straight from `find`/`findOne` to `toDTO`, so domain-schema defaults never touch stored data. Default every new DTO field at the **explicit pick** (`doc.field ?? <default>`), and test with a document whose key is genuinely absent, never one that sets it to `null`/`[]`.
+- **A test whose fixture is smaller than the limit it exercises tests nothing.** Budget/truncation logic needs inputs larger than the budget.
 - Run `bun` via `export PATH="$HOME/.bun/bin:$PATH"`.
 - **Parallel test runs are noisy** on standalone Mongo (concurrent smoke suites contend). Any failure must be re-checked with `bunx vitest run --no-file-parallelism` before you believe it.
 
@@ -276,6 +278,13 @@ no gain. Chat still benefits from Task 1 automatically.
 `logTailCore` must not regress — errors usually arrive on stderr. In
 `src/server/runs.server.ts` replace the return at line 106:
 
+> **This code was wrong in the first draft of this plan and shipped two defects.**
+> Splitting the budget on whether `stderrFile` is *set* halves the stdout budget
+> for every run — and almost every run writes nothing to stderr, so the common
+> case silently returned half the log. It also overran the stated ceiling by the
+> joiner's 34 bytes. Corrected version below: read stderr **first**, and charge
+> what it actually costs against the caller's budget.
+
 ```ts
 export const STDERR_DELIMITER = "──── stderr ────";
 
@@ -288,15 +297,33 @@ export async function logTailCore(
   if (!run) {
     throw new ServerResultError("not_found", `run not found: ${input.runId}`);
   }
-  // Split the caller's byte budget so `bytes` stays an honest ceiling.
-  const half = Math.floor(input.bytes / 2);
-  const stdout = await readLogTail(run.logFile, run.stderrFile ? half : input.bytes);
-  if (!run.stderrFile) return { text: stdout };
-  const stderr = await readLogTail(run.stderrFile, half);
-  if (!stderr) return { text: stdout };
-  return { text: `${stdout}\n${STDERR_DELIMITER}\n${stderr}` };
+  if (!run.stderrFile) {
+    return { text: await readLogTail(run.logFile, input.bytes) };
+  }
+  // Read stderr FIRST. Most runs write nothing there, and the stdout budget
+  // must not be halved to reserve room for a section that turns out empty.
+  const joiner = `\n${STDERR_DELIMITER}\n`;
+  const stderr = await readLogTail(run.stderrFile, Math.floor(input.bytes / 2));
+  if (!stderr) {
+    return { text: await readLogTail(run.logFile, input.bytes) };
+  }
+  // Charge the joiner and the stderr section against the caller's ceiling so
+  // stdout + joiner + stderr <= bytes. Measure in BYTES, not chars: readLogTail
+  // budgets a Buffer, and the box-drawing delimiter is multi-byte.
+  const spent =
+    Buffer.byteLength(stderr, "utf8") + Buffer.byteLength(joiner, "utf8");
+  const stdout = await readLogTail(
+    run.logFile,
+    Math.max(0, input.bytes - spent),
+  );
+  return { text: `${stdout}${joiner}${stderr}` };
 }
 ```
+
+**Budget tests are mandatory here.** Every existing test uses `bytes: 20_000`
+against files of a few dozen bytes, so the arithmetic is unobservable and a
+mutant that deletes the split entirely passes the whole suite. Any test of this
+function must use files **larger than the budget**.
 
 - [ ] **Step 6:** add `stderrFile: AbsolutePathString.nullable()` to
 `RunDTOSchema` in `src/server/runs.ts` and to the explicit pick in `toDTO`
@@ -694,6 +721,19 @@ when the outcome is `needs_input`. Assert the `spec_draft` prompt is unchanged.
 - [ ] **Step 1:** add `exchanges: z.array(InputExchangeSchema)` to `RunDTOSchema`
 and to the **explicit pick** in `toDTO`. The DTO is `.strict()` — omitting the
 pick throws at the boundary.
+
+> **Default it at the pick: `exchanges: doc.exchanges ?? []`.** This is not
+> optional polish. `RunSchema.parse` is called only from tests; every production
+> read (`listRunsCore`, `logTailCore`, `resumeRun`) uses raw `find`/`findOne`,
+> so `RunSchema`'s `.default([])` never runs against stored data. A run written
+> before this slice has **no `exchanges` key**, destructures to `undefined`, and
+> a non-optional DTO field rejects it — which `boundary` turns into
+> `code:"internal"`, erasing the **whole** runs list for that ticket. This exact
+> bug shipped in Task 2 with `stderrFile` and was caught only in review.
+>
+> Test it with a document whose key is **genuinely absent** — build the object
+> without the key. A fixture that sets `exchanges: []` explicitly is the
+> post-migration shape and proves nothing.
 
 - [ ] **Step 2 (RED):** add a pure helper in `src/components/runsUi.ts` plus tests:
 

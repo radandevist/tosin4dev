@@ -441,10 +441,34 @@ registry collection.
 
 ## Migration
 
-All new fields are additive with defaults, so stored documents hydrate
-unchanged: `Run.exchanges` → `[]`, `Run.stderrFile` → `null`,
+All new fields are additive with defaults. **But a Zod default does not save a
+legacy document on the read path, and an earlier draft of this section wrongly
+claimed it did.**
+
+`RunSchema.parse` is called **only from tests**. Every production read —
+`listRunsCore`, `logTailCore`, `resumeRun` — goes straight from
+`collection.find()/findOne()` to use, and `listRunsCore` hands the raw document
+to `toDTO`. So `RunSchema`'s `.default(null)` / `.default([])` never execute
+against stored data. A document written before a field existed has **no key at
+all**; destructuring yields `undefined`; and a `.nullable()` (not `.optional()`)
+DTO field rejects `undefined` with `invalid_type: Required`. Because `boundary`
+converts that to `code:"internal"` and `useRuns` throws, one legacy run erases
+the **entire** runs list for that ticket, not just its own row.
+
+This was found in review only after it shipped in the `stderrFile` field, and
+it applies identically to `exchanges`.
+
+**Rule for every new persisted field surfaced through a DTO:** default it at the
+**explicit pick** in `toDTO` — `stderrFile: doc.stderrFile ?? null`,
+`exchanges: doc.exchanges ?? []` — not (only) in the domain schema. And test it
+with a document whose key is **genuinely absent**, not one that sets the key to
+`null`; a fixture that hardcodes the post-migration shape proves nothing about
+the documents production will actually meet.
+
+Given that rule: `Run.exchanges` → `[]`, `Run.stderrFile` → `null`,
 `RunOutcome.handoff` → `null`, `ChatSession.kind` → `"brainstorm"`,
 `ChatSession.runId` → `null`. Legacy parked runs have an empty `exchanges`
 array and still answer through `awaitingQuestion` — the UI renders the open
 question from `awaitingQuestion` whether or not a matching exchange exists, so
-a run parked before this slice remains answerable. No data migration.
+a run parked before this slice remains answerable. No data migration required,
+provided the pick-level defaults are present.
