@@ -425,8 +425,9 @@ async function notifyBlocked(
   ticketId: string,
   reason: string,
   logFile: string,
+  stderrFile: string | null,
 ): Promise<void> {
-  await notify(`⛔ blocked: ${await ticketLabel(database, ticketId)} — ${reason}. Log: ${logFile}`);
+  await notify(`⛔ blocked: ${await ticketLabel(database, ticketId)} — ${reason}. Log: ${logFile}${stderrFile ? ` (stderr: ${stderrFile})` : ""}`);
 }
 
 async function parkTicketNeedsInput(
@@ -500,6 +501,7 @@ async function finishRun(
   exitCode: number,
   stdout: string,
   logFile: string,
+  stderrFile: string | null,
   board: Board,
   runDir: string,
 ): Promise<void> {
@@ -558,7 +560,13 @@ async function finishRun(
       },
     );
     await transitionTicketFailed(database, ticketId, runId, at, `run failed (exit ${exitCode})`);
-    await notifyBlocked(database, ticketId, `run failed (exit ${exitCode})`, logFile);
+    await notifyBlocked(
+      database,
+      ticketId,
+      `run failed (exit ${exitCode})`,
+      logFile,
+      stderrFile,
+    );
     return;
   }
 
@@ -605,7 +613,13 @@ async function finishRun(
       failedAt,
       `runner reported failure: ${outcome.reason ?? "unspecified"}`,
     );
-    await notifyBlocked(database, ticketId, "runner reported failure", logFile);
+    await notifyBlocked(
+      database,
+      ticketId,
+      "runner reported failure",
+      logFile,
+      stderrFile,
+    );
     return;
   }
 
@@ -666,7 +680,13 @@ async function finishRun(
       doneAt,
     );
     await transitionTicketFailed(database, ticketId, runId, doneAt, `verification ${result.failureKind}`);
-    await notifyBlocked(database, ticketId, `verification failed (${result.failureKind})`, logFile);
+    await notifyBlocked(
+      database,
+      ticketId,
+      `verification failed (${result.failureKind})`,
+      logFile,
+      stderrFile,
+    );
   } catch (error) {
     await appendFile(
       logFile,
@@ -682,7 +702,13 @@ async function finishRun(
       failAt,
     );
     await transitionTicketFailed(database, ticketId, runId, failAt, "verification error");
-    await notifyBlocked(database, ticketId, "verification error", logFile);
+    await notifyBlocked(
+      database,
+      ticketId,
+      "verification error",
+      logFile,
+      stderrFile,
+    );
   }
 }
 
@@ -692,6 +718,7 @@ async function monitorChild(
   ticketId: string,
   phase: Phase,
   logFile: string,
+  stderrFile: string | null,
   board: Board,
   runDir: string,
 ): Promise<void> {
@@ -701,13 +728,33 @@ async function monitorChild(
       child.stderr,
       child.exited,
     ]);
-    await finishRun(runId, ticketId, phase, exitCode, stdout, logFile, board, runDir);
+    await finishRun(
+      runId,
+      ticketId,
+      phase,
+      exitCode,
+      stdout,
+      logFile,
+      stderrFile,
+      board,
+      runDir,
+    );
   } catch (error) {
     await appendFile(
       logFile,
       `\nSupervisor stream failure: ${error instanceof Error ? error.message : "unknown error"}\n`,
     ).catch(() => undefined);
-    await finishRun(runId, ticketId, phase, -1, "", logFile, board, runDir);
+    await finishRun(
+      runId,
+      ticketId,
+      phase,
+      -1,
+      "",
+      logFile,
+      stderrFile,
+      board,
+      runDir,
+    );
   }
 }
 
@@ -884,6 +931,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
       run.ticketId,
       run.phase,
       run.logFile,
+      run.stderrFile,
       board,
       runDir,
     ).catch((error) =>
@@ -1061,6 +1109,7 @@ export async function dispatchRun(
       ticketId,
       phase,
       paths.logFile,
+      paths.stderrFile,
       board,
       paths.runDir,
     ).catch((error) =>

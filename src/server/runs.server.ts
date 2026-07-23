@@ -49,7 +49,7 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     workDir,
     promptFile,
     logFile,
-    stderrFile,
+    stderrFile: stderrFile ?? null,
     pid,
     exitCode,
     summary,
@@ -107,14 +107,24 @@ export async function logTailCore(
   if (!run) {
     throw new ServerResultError("not_found", `run not found: ${input.runId}`);
   }
-  // Split the caller's byte budget so `bytes` stays an honest ceiling.
-  const half = Math.floor(input.bytes / 2);
+  if (!run.stderrFile) {
+    return { text: await readLogTail(run.logFile, input.bytes) };
+  }
+  // Read stderr FIRST. Most runs write nothing there, and the stdout budget
+  // must not be halved to reserve room for a section that turns out empty.
+  const joiner = `\n${STDERR_DELIMITER}\n`;
+  const stderr = await readLogTail(run.stderrFile, Math.floor(input.bytes / 2));
+  if (!stderr) {
+    return { text: await readLogTail(run.logFile, input.bytes) };
+  }
+  // Charge the joiner and the stderr section against the caller's ceiling so
+  // stdout + joiner + stderr <= bytes. Measure in BYTES, not chars: readLogTail
+  // budgets a Buffer, and box-drawing/UTF-8 chars are multi-byte.
+  const spent =
+    Buffer.byteLength(stderr, "utf8") + Buffer.byteLength(joiner, "utf8");
   const stdout = await readLogTail(
     run.logFile,
-    run.stderrFile ? half : input.bytes,
+    Math.max(0, input.bytes - spent),
   );
-  if (!run.stderrFile) return { text: stdout };
-  const stderr = await readLogTail(run.stderrFile, half);
-  if (!stderr) return { text: stdout };
-  return { text: `${stdout}\n${STDERR_DELIMITER}\n${stderr}` };
+  return { text: `${stdout}${joiner}${stderr}` };
 }
