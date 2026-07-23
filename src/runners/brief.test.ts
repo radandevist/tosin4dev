@@ -74,6 +74,14 @@ describe("buildPrompt", () => {
     });
     expect(text).toContain("/r/outcome.json");
     expect(text).toContain('"outcome"');
+    expect(text).toContain('"handoff"');
+    expect(text).toContain("filesTouched");
+    expect(text).toContain("commandsRun");
+    expect(text).toContain("options");
+    expect(text).toContain("risk");
+    expect(text).toContain(
+      'When the outcome is "needs_input" you must also fill "handoff"',
+    );
   });
 
   it("carries the human answer on a resume turn", () => {
@@ -127,6 +135,7 @@ describe("buildPrompt", () => {
     );
     expect(prompt).toContain("SUMMARY");
     expect(prompt).not.toContain("/unused");
+    expect(prompt).not.toContain("handoff");
   });
 });
 
