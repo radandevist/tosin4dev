@@ -2,9 +2,22 @@ import { execFileSync } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Collection, Db, WithId } from "mongodb";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { Board, Run, Ticket } from "../domain/schemas";
+import { Collection, type Db, type WithId } from "mongodb";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import {
+  InputExchangeSchema,
+  type Board,
+  type Run,
+  type Ticket,
+} from "../domain/schemas";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
 type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
@@ -37,6 +50,31 @@ let binDirectory: string;
 let boardId: string;
 
 const timestamp = () => new Date().toISOString();
+
+function rejectRunUpdate(
+  runId: string,
+  ordinal: number,
+): ReturnType<typeof vi.spyOn> {
+  const originalUpdateOne = Collection.prototype.updateOne;
+  let runUpdates = 0;
+  return vi
+    .spyOn(Collection.prototype, "updateOne")
+    .mockImplementation(function (
+      this: Collection,
+      filter,
+      update,
+      options,
+    ) {
+      const id = (filter as { _id?: { toString(): string } })._id;
+      if (this.collectionName === "runs" && id?.toString() === runId) {
+        runUpdates += 1;
+        if (runUpdates === ordinal) {
+          return Promise.reject(new Error(`injected run update ${ordinal}`));
+        }
+      }
+      return originalUpdateOne.call(this, filter, update, options);
+    });
+}
 
 async function writeRunner(): Promise<void> {
   const executable = join(binDirectory, "claude");
@@ -403,6 +441,27 @@ describe("runner outcomes", () => {
     await waitForRun(runId, "awaiting_input");
     await runs.updateOne(
       { _id: new ObjectId(runId) },
+      { $unset: { exchanges: "" } },
+    );
+
+    process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+    await expect(
+      provideInputCore({ ticketId, answer: "ok" }),
+    ).resolves.toBeTruthy();
+    await waitForRun(runId, "succeeded");
+  }, 20_000);
+
+  it("resumes a parked run with an empty exchanges array", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Post-migration question?",
+    });
+    const ticketId = await insertApproved(15);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
       { $set: { exchanges: [] } },
     );
 
@@ -411,6 +470,46 @@ describe("runner outcomes", () => {
       provideInputCore({ ticketId, answer: "ok" }),
     ).resolves.toBeTruthy();
     await waitForRun(runId, "succeeded");
+  }, 20_000);
+
+  it("answers only the last open exchange", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Q2?",
+    });
+    const ticketId = await insertApproved(16);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const parkedRun = await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      {
+        $set: {
+          exchanges: [
+            {
+              ...parkedRun.exchanges[0]!,
+              question: "Q1?",
+            },
+            parkedRun.exchanges[0]!,
+          ],
+        },
+      },
+    );
+
+    process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+    await provideInputCore({ ticketId, answer: "ANSWER-FOR-Q2" });
+    const run = await waitForRun(runId, "succeeded");
+
+    expect(run.exchanges[0]).toMatchObject({
+      question: "Q1?",
+      answer: null,
+      answeredAt: null,
+    });
+    expect(run.exchanges[1]).toMatchObject({
+      question: "Q2?",
+      answer: "ANSWER-FOR-Q2",
+    });
+    expect(run.exchanges[1]?.answeredAt).not.toBeNull();
   }, 20_000);
 
   it("keeps at most one exchange open across answer and re-park", async () => {
@@ -447,6 +546,77 @@ describe("runner outcomes", () => {
     expect(secondPark.exchanges[1]).toMatchObject({
       question: "Q2?",
       answer: null,
+    });
+
+    process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+    await provideInputCore({ ticketId, answer: "A2" });
+    const completed = await waitForRun(runId, "succeeded");
+    expect(openExchanges(completed)).toHaveLength(0);
+    expect(completed.exchanges).toMatchObject([
+      { question: "Q1?", answer: "A1" },
+      { question: "Q2?", answer: "A2" },
+    ]);
+  }, 20_000);
+
+  it("does not manufacture an exchange when the claim write fails", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Still open?",
+    });
+    const ticketId = await insertApproved(17);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    const updateSpy = rejectRunUpdate(runId, 1);
+    try {
+      await expect(
+        provideInputCore({ ticketId, answer: "not recorded" }),
+      ).rejects.toThrow("run could not be resumed");
+    } finally {
+      updateSpy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.exchanges).toHaveLength(1);
+    expect(run?.exchanges[0]).toMatchObject({
+      question: "Still open?",
+      answer: null,
+      answeredAt: null,
+    });
+  }, 20_000);
+
+  it("keeps the answer when the write after the claim fails", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Atomic answer?",
+    });
+    const ticketId = await insertApproved(18);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    const updateSpy = rejectRunUpdate(runId, 2);
+    try {
+      await expect(
+        provideInputCore({ ticketId, answer: "preserved" }),
+      ).rejects.toThrow();
+    } finally {
+      updateSpy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.exchanges[0]).toMatchObject({
+      question: "Atomic answer?",
+      answer: "preserved",
+    });
+    expect(run?.exchanges[0]?.answeredAt).not.toBeNull();
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.exchanges[1]).toMatchObject({
+      question: "Atomic answer?",
+      answer: null,
+      answeredAt: null,
     });
   }, 20_000);
 
@@ -507,6 +677,36 @@ describe("runner outcomes", () => {
     expect(retriedRun.workDir).toBe(originalWorkDir);
     expect(retriedRun.branch).toBe(originalBranch);
     expect(retriedRun.executionSessionId).toBe(originalExecutionSessionId);
+  }, 20_000);
+
+  it("uses a valid placeholder when compensation lacks a question", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Original question?",
+    });
+    const ticketId = await insertApproved(19);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $set: { awaitingQuestion: null } },
+    );
+
+    await rm(join(binDirectory, "claude"), { force: true });
+    process.env.PATH = binDirectory;
+    await expect(
+      provideInputCore({ ticketId, answer: "record this" }),
+    ).rejects.toThrow();
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.exchanges.at(-1)).toMatchObject({
+      question: "(question unavailable)",
+      answer: null,
+      answeredAt: null,
+    });
+    expect(() => InputExchangeSchema.parse(run?.exchanges.at(-1))).not.toThrow();
   }, 20_000);
 
   it("caps exchange history when a failed resume reopens the question", async () => {

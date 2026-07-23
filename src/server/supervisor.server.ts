@@ -6,7 +6,7 @@ import {
 import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
-import type { Collection, Db, PushOperator } from "mongodb";
+import type { Collection, Db, Filter, PushOperator } from "mongodb";
 import { unmetDependencies } from "../domain/dependencies";
 import {
   BoardSchema,
@@ -786,8 +786,9 @@ async function restoreParkedResume(
   question: string | null,
 ): Promise<void> {
   const at = now();
+  const runs = database.collection<RunDoc>("runs");
   const updates = [
-    database.collection<RunDoc>("runs").updateOne(
+    runs.updateOne(
       { _id: new ObjectId(runId) },
       {
         $set: {
@@ -795,21 +796,6 @@ async function restoreParkedResume(
           awaitingQuestion: question,
           pid: null,
           startedAt: run.startedAt,
-        },
-        $push: {
-          exchanges: {
-            $each: [
-              {
-                v: 1 as const,
-                at,
-                question: question ?? "",
-                handoff: null,
-                answer: null,
-                answeredAt: null,
-              },
-            ],
-            $slice: -EXCHANGE_CAP,
-          },
         },
       },
     ),
@@ -829,6 +815,33 @@ async function restoreParkedResume(
     (result): result is PromiseRejectedResult => result.status === "rejected",
   );
   if (failed) throw failed.reason;
+
+  // If the claim failed before writing, the original row is still open.
+  // Reopening unconditionally would manufacture a second open exchange.
+  await runs.updateOne(
+    {
+      _id: new ObjectId(runId),
+      exchanges: { $not: { $elemMatch: { answer: null } } },
+    },
+    {
+      $push: {
+        exchanges: {
+          $each: [
+            {
+              v: 1 as const,
+              at,
+              // Keep compensation rows valid when legacy data lacks a question.
+              question: question ?? "(question unavailable)",
+              handoff: null,
+              answer: null,
+              answeredAt: null,
+            },
+          ],
+          $slice: -EXCHANGE_CAP,
+        },
+      },
+    },
+  );
 }
 
 export async function resumeRun(runId: string, answer: string): Promise<void> {
@@ -883,18 +896,41 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
   let child: ChildProcess | undefined;
   let runningChild: RunningChild | undefined;
   const answeredAt = now();
+  let openIndex = -1;
+  for (let index = (run.exchanges ?? []).length - 1; index >= 0; index -= 1) {
+    if (run.exchanges?.[index]?.answer === null) {
+      openIndex = index;
+      break;
+    }
+  }
+  // Pin the exact row being answered. Array filters throw when `exchanges` is
+  // absent on a pre-v5 run and would fan one answer across every open row.
+  const claimFilter: Filter<RunDoc> = {
+    _id: new ObjectId(runId),
+    status: "awaiting_input",
+  };
+  if (openIndex >= 0) {
+    (claimFilter as Record<string, unknown>)[
+      `exchanges.${openIndex}.answer`
+    ] = null;
+  }
+  // The answer MUST remain inside this claim: a second write could fail after
+  // status changes to running, losing the human answer with no safe retry.
   const claimed = await runs
     .updateOne(
-      { _id: new ObjectId(runId), status: "awaiting_input" },
+      claimFilter,
       {
         $set: {
           status: "running",
           startedAt: answeredAt,
-          "exchanges.$[open].answer": answer,
-          "exchanges.$[open].answeredAt": answeredAt,
+          ...(openIndex >= 0
+            ? {
+                [`exchanges.${openIndex}.answer`]: answer,
+                [`exchanges.${openIndex}.answeredAt`]: answeredAt,
+              }
+            : {}),
         },
       },
-      { arrayFilters: [{ "open.answer": null }] },
     )
     .catch(async () => {
       await restoreParkedResume(database, run, runId, run.awaitingQuestion);
