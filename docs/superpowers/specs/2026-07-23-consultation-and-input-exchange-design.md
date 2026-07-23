@@ -205,6 +205,24 @@ handoff is advisory context; a runner that omits it or emits a malformed one
 must not have its `needs_input` converted into a `failed`. Parse it with
 `safeParse` and fall back to `null`.
 
+**Scoped to `needs_input`.** The fail-open applies only when the outcome is
+`needs_input`; any other outcome forces `handoff: null`. This keeps the hole
+exactly as wide as its justification and buys a useful invariant:
+**`handoff !== null` implies the run is parked.** Without the scoping, a
+`completed` or `failed` outcome could carry a handoff, and downstream code that
+reasonably reads `if (outcome.handoff)` as "this run is parked" would be wrong.
+
+**Version the exchange record, and tolerate rows individually.** `v` is
+`z.literal(1)` deliberately — widening it to `z.number()` would silently
+reinterpret a future v2 row as v1, which is the failure the field exists to
+prevent. The consequence is that `z.array(InputExchangeSchema)` rejects the
+whole array on one bad row, so any **read** path must `safeParse` row by row and
+drop failures rather than parsing the array as a unit. When v2 arrives it
+becomes `z.discriminatedUnion("v", […])`, of which the current literal is the
+one-member case. Wrapping the array in `.catch([])` is not acceptable: it would
+render a run that was consulted three times as "no questions were ever asked",
+which is a worse lie than a visible gap.
+
 ### Invariant
 
 **The open exchange is the last element with `answer === null`.** At most one
