@@ -1,12 +1,14 @@
 import { createMutation, createQuery } from "react-query-kit";
 import {
   createChatSession,
+  createConsultationSession,
   getChatSession,
   proposeBundleFromChat,
   sendChatMessage,
   type ChatSessionDTO,
   type ChatSessionRef,
   type CreateChatSessionInput,
+  type CreateConsultationSessionInput,
   type SendChatMessageInput,
 } from "../server/chat";
 import { unwrapResult } from "../server/result";
@@ -29,6 +31,14 @@ export const useCreateChatSession = createMutation<
 >({
   mutationFn: (variables) =>
     createChatSession({ data: variables }).then(unwrapResult),
+});
+
+export const useCreateConsultationSession = createMutation<
+  { id: string },
+  CreateConsultationSessionInput
+>({
+  mutationFn: (variables) =>
+    createConsultationSession({ data: variables }).then(unwrapResult),
 });
 
 export const useSendChatMessage = createMutation<{ ok: true }, SendChatMessageInput>({

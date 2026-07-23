@@ -7,6 +7,7 @@ import {
 } from "../domain/schemas";
 import {
   createChatSessionCore,
+  createConsultationSessionCore,
   getChatSessionCore,
   proposeBundleFromChatCore,
   sendChatMessageCore,
@@ -22,6 +23,8 @@ export const ChatSessionDTOSchema = z
   .object({
     _id: ObjectIdString,
     boardId: ObjectIdString,
+    kind: z.enum(["brainstorm", "consultation"]),
+    runId: ObjectIdString.nullable(),
     provider: z.enum(["claude", "codex"]),
     sessionId: z.string().nullable(),
     status: z.enum(["active", "bundle_locked", "abandoned"]),
@@ -45,6 +48,16 @@ export type CreateChatSessionInput = z.infer<
   typeof CreateChatSessionInputSchema
 >;
 
+export const CreateConsultationSessionInputSchema = z
+  .object({
+    runId: ObjectIdString,
+    provider: z.enum(["claude", "codex"]).optional(),
+  })
+  .strict();
+export type CreateConsultationSessionInput = z.infer<
+  typeof CreateConsultationSessionInputSchema
+>;
+
 export const ChatSessionRefSchema = z
   .object({ sessionId: ObjectIdString })
   .strict();
@@ -63,6 +76,16 @@ export const createChatSession = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
     boundary(CreateChatSessionInputSchema, data, createChatSessionCore),
+  );
+
+export const createConsultationSession = createServerFn({ method: "POST" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
+    boundary(
+      CreateConsultationSessionInputSchema,
+      data,
+      createConsultationSessionCore,
+    ),
   );
 
 export const getChatSession = createServerFn({ method: "GET" })
