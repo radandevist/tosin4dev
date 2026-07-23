@@ -320,6 +320,30 @@ one whose compensation partially failed), the claim must `$push` a complete,
 already-answered row. Otherwise the run resumes, the agent receives the answer,
 and the durable history never records that the human answered anything.
 
+**That branch needs its own CAS, and omitting it was the third defect on this
+path.** The row-identity CAS above only exists on the `openIndex >= 0` side. With
+the `-1` side guarded by nothing but `{_id, status: "awaiting_input"}`, the claim
+matches *any* parked run — so a stale snapshot delivers its answer to whichever
+question the run has since re-parked on. Reproduced end to end: an agent that
+asked *"DROP the production database?"* was resumed with an answer written for a
+question about auth libraries, the answering human was told it landed, and the
+real question was left open forever. It also breaks INV-1, because the answered
+row lands *after* the open row and the next park then adds a second open one.
+
+The `-1` branch must assert both halves of what its snapshot saw:
+
+```ts
+filter.exchanges = { $not: { $elemMatch: { answer: null } } };
+filter.awaitingQuestion = run.awaitingQuestion ?? null;
+```
+
+**The general rule this cost three rounds to learn: when a guarded update grows a
+new branch, the branch inherits the guard's obligation, not the guard.** Each
+round here fixed the predicate on the path under review and left a newly-added
+sibling path unguarded. Before shipping a change to a CAS-protected update, walk
+*every* branch of the filter construction and ask what each one pins — an
+`else` that pins nothing is a lock with one door left open.
+
 The general lesson, recorded because it caused both defects: **a legacy-tolerance
 test must construct the shape that actually exists in the database.** Setting a
 field to its post-migration value and asserting success proves only that the
