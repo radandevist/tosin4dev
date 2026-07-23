@@ -33,8 +33,8 @@ export function buildPrompt(brief: RunnerBrief): string {
     `Links:\n${links}`,
     "Rules: stay inside the worktree; run the repo's own verification commands; commit your changes on the current branch; do not push; do not open PRs.",
     `When you finish, write this JSON to ${brief.outcomePath ?? "<runDir>/outcome.json"} and nothing else to it:`,
-    `{"outcome":"completed|needs_input|failed","question":"<required if needs_input>","reason":"<optional>","summary":"<=10 lines"}`,
-    `Use "needs_input" ONLY for a genuine decision you cannot make under the locked spec; put the exact question in "question". Use "completed" when the work is done and committed; "failed" if you cannot proceed. Do not ask for confirmation of work you can just do.`,
+    `{"outcome":"completed|needs_input|failed","question":"<required if needs_input>","reason":"<optional>","summary":"<=10 lines","handoff":{"workDone":"…","filesTouched":["…"],"commandsRun":["…"],"decision":"…","options":["…"],"risk":"…"}}`,
+    `Use "needs_input" ONLY for a genuine decision you cannot make under the locked spec; put the exact question in "question". When the outcome is "needs_input" you must also fill "handoff" so a human can pick up where you stopped: what you did, which files you touched, which commands you ran, the decision you need, the options you see, and the risk of each. Omit "handoff" for other outcomes. Use "completed" when the work is done and committed; "failed" if you cannot proceed. Do not ask for confirmation of work you can just do.`,
   ];
   return [resumePreface, ...lines].filter(Boolean).join("\n\n");
 }
