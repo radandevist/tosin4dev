@@ -281,6 +281,45 @@ the update filter and the `$set`. This preserves the property that matters — t
 answer is written *inside* the claim, atomically — while working on a
 key-absent document and being incapable of fanning out.
 
+**The CAS predicate must be `{$type: "null"}` plus a row-identity term. Plain
+equality does not work, and the first attempt at this shipped a no-op.** Two
+MongoDB semantics defeat the obvious spelling:
+
+- a **numeric path component is ambiguous** — `exchanges.1.answer` may mean
+  "index 1" or "a field literally named `1`"; and
+- **equality-to-`null` also matches missing.**
+
+So `{"exchanges.1.answer": null}` matches *any* document with an `exchanges`
+array. Measured against a document whose rows are all answered — where a correct
+CAS must not match at all:
+
+```
+{"exchanges.0.answer": null}                    MATCHES   ← wrong
+{"exchanges.9.answer": null}   (out of range)   MATCHES   ← wrong
+{"exchanges.0.bogusfield": null}                MATCHES   ← the tell
+{"exchanges.0.answer": {$type:"null"}}          no match  ← correct
+{"exchanges.0.at": "t0"}  (identity, right row) MATCHES
+{"exchanges.1.at": "t0"}  (identity, wrong row) no match
+```
+
+`$type` alone still leaves a hole: `$slice: -N` evicts from the **front**, so a
+concurrent park shifts every index down by one and a stale index can point at a
+*different but genuinely open* row — attaching a human's answer to a question
+they never saw. Pinning the snapshotted row's `at` closes it, because equality
+against a **non-null** value is immune to the missing-matches-null trap.
+
+Required predicate, both terms:
+
+```ts
+f[`exchanges.${openIndex}.answer`] = { $type: "null" };
+f[`exchanges.${openIndex}.at`] = openRow.at;
+```
+
+**And when there is no open row at all** (`openIndex === -1` — a pre-v5 run, or
+one whose compensation partially failed), the claim must `$push` a complete,
+already-answered row. Otherwise the run resumes, the agent receives the answer,
+and the durable history never records that the human answered anything.
+
 The general lesson, recorded because it caused both defects: **a legacy-tolerance
 test must construct the shape that actually exists in the database.** Setting a
 field to its post-migration value and asserting success proves only that the
