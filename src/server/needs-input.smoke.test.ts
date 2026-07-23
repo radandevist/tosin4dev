@@ -76,6 +76,50 @@ function rejectRunUpdate(
     });
 }
 
+function pauseNextResumeClaim(runId: string): {
+  reached: Promise<void>;
+  release: () => void;
+  spy: ReturnType<typeof vi.spyOn>;
+} {
+  const originalUpdateOne = Collection.prototype.updateOne;
+  let reachedResolve!: () => void;
+  let releaseResolve!: () => void;
+  let paused = false;
+  const reached = new Promise<void>((resolve) => {
+    reachedResolve = resolve;
+  });
+  const release = new Promise<void>((resolve) => {
+    releaseResolve = resolve;
+  });
+  const spy = vi
+    .spyOn(Collection.prototype, "updateOne")
+    .mockImplementation(async function (
+      this: Collection,
+      filter,
+      update,
+      options,
+    ) {
+      const id = (filter as { _id?: { toString(): string } })._id;
+      const status = (filter as { status?: unknown }).status;
+      const nextStatus = (
+        update as { $set?: { status?: unknown } }
+      ).$set?.status;
+      if (
+        !paused &&
+        this.collectionName === "runs" &&
+        id?.toString() === runId &&
+        status === "awaiting_input" &&
+        nextStatus === "running"
+      ) {
+        paused = true;
+        reachedResolve();
+        await release;
+      }
+      return originalUpdateOne.call(this, filter, update, options);
+    });
+  return { reached, release: releaseResolve, spy };
+}
+
 async function writeRunner(): Promise<void> {
   const executable = join(binDirectory, "claude");
   await writeFile(
@@ -448,7 +492,15 @@ describe("runner outcomes", () => {
     await expect(
       provideInputCore({ ticketId, answer: "ok" }),
     ).resolves.toBeTruthy();
-    await waitForRun(runId, "succeeded");
+    const run = await waitForRun(runId, "succeeded");
+    expect(run.exchanges).toHaveLength(1);
+    expect(run.exchanges[0]).toMatchObject({
+      v: 1,
+      question: "Legacy question?",
+      handoff: null,
+      answer: "ok",
+    });
+    expect(run.exchanges[0]?.answeredAt).not.toBeNull();
   }, 20_000);
 
   it("resumes a parked run with an empty exchanges array", async () => {
@@ -510,6 +562,144 @@ describe("runner outcomes", () => {
       answer: "ANSWER-FOR-Q2",
     });
     expect(run.exchanges[1]?.answeredAt).not.toBeNull();
+  }, 20_000);
+
+  it("rejects a stale claim instead of overwriting an earlier answer", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Q1?",
+    });
+    const ticketId = await insertApproved(20);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    const paused = pauseNextResumeClaim(runId);
+    const staleClaim = provideInputCore({
+      ticketId,
+      answer: "STALE-ANSWER",
+    });
+    await paused.reached;
+
+    try {
+      process.env.T4D_OUTCOME = JSON.stringify({
+        outcome: "needs_input",
+        question: "Q2?",
+      });
+      await provideInputCore({ ticketId, answer: "A1" });
+      const reparked = await waitForRun(runId, "awaiting_input");
+      expect(reparked.awaitingQuestion).toBe("Q2?");
+
+      paused.release();
+      await expect(staleClaim).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      paused.release();
+      paused.spy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.exchanges).toMatchObject([
+      { question: "Q1?", answer: "A1" },
+      { question: "Q2?", answer: null, answeredAt: null },
+    ]);
+  }, 20_000);
+
+  it("pins a stale capped-history claim to the snapshotted row", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Capped Q1?",
+    });
+    const ticketId = await insertApproved(21);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const parked = await waitForRun(runId, "awaiting_input");
+    const history: Run["exchanges"] = Array.from(
+      { length: 49 },
+      (_, index) => {
+        const at = new Date(Date.UTC(2030, 0, 1, 0, 0, index)).toISOString();
+        return {
+          v: 1,
+          at,
+          question: `Capped history ${index}`,
+          handoff: null,
+          answer: `Answer ${index}`,
+          answeredAt: at,
+        };
+      },
+    );
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $set: { exchanges: [...history, parked.exchanges[0]!] } },
+    );
+
+    const paused = pauseNextResumeClaim(runId);
+    const staleClaim = provideInputCore({
+      ticketId,
+      answer: "WRONG-QUESTION-ANSWER",
+    });
+    await paused.reached;
+
+    try {
+      process.env.T4D_OUTCOME = JSON.stringify({
+        outcome: "needs_input",
+        question: "Capped Q2?",
+      });
+      await provideInputCore({ ticketId, answer: "A1" });
+      const reparked = await waitForRun(runId, "awaiting_input");
+      expect(reparked.awaitingQuestion).toBe("Capped Q2?");
+      expect(reparked.exchanges).toHaveLength(50);
+
+      process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+      paused.release();
+      await expect(staleClaim).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      paused.release();
+      paused.spy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.exchanges.at(-2)).toMatchObject({
+      question: "Capped Q1?",
+      answer: "A1",
+    });
+    expect(run?.exchanges.at(-1)).toMatchObject({
+      question: "Capped Q2?",
+      answer: null,
+      answeredAt: null,
+    });
+  }, 20_000);
+
+  it("does not treat a missing answer field as an open row", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Typed-null question?",
+    });
+    const ticketId = await insertApproved(22);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    const paused = pauseNextResumeClaim(runId);
+    const staleClaim = provideInputCore({
+      ticketId,
+      answer: "ANSWER-FOR-MISSING-FIELD",
+    });
+    await paused.reached;
+
+    try {
+      await runs.updateOne(
+        { _id: new ObjectId(runId) },
+        { $unset: { "exchanges.0.answer": "" } },
+      );
+      paused.release();
+      await expect(staleClaim).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      paused.release();
+      paused.spy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.exchanges[0]?.answer).toBeUndefined();
   }, 20_000);
 
   it("keeps at most one exchange open across answer and re-park", async () => {
@@ -585,6 +775,105 @@ describe("runner outcomes", () => {
       answer: null,
       answeredAt: null,
     });
+  }, 20_000);
+
+  it("atomically restores parked status with the reopened exchange", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Atomic reopen?",
+    });
+    const ticketId = await insertApproved(23);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    await rm(join(binDirectory, "claude"), { force: true });
+    process.env.PATH = binDirectory;
+    const originalUpdateOne = Collection.prototype.updateOne;
+    const restoreUpdates: Array<Record<string, unknown>> = [];
+    const updateSpy = vi
+      .spyOn(Collection.prototype, "updateOne")
+      .mockImplementation(function (
+        this: Collection,
+        filter,
+        update,
+        options,
+      ) {
+        const id = (filter as { _id?: { toString(): string } })._id;
+        const nextStatus = (
+          update as { $set?: { status?: unknown } }
+        ).$set?.status;
+        if (
+          this.collectionName === "runs" &&
+          id?.toString() === runId &&
+          nextStatus === "awaiting_input"
+        ) {
+          restoreUpdates.push(update as Record<string, unknown>);
+        }
+        return originalUpdateOne.call(this, filter, update, options);
+      });
+    try {
+      await expect(
+        provideInputCore({ ticketId, answer: "recorded" }),
+      ).rejects.toMatchObject({ code: "spawn_failed" });
+    } finally {
+      updateSpy.mockRestore();
+    }
+
+    expect(restoreUpdates).toHaveLength(1);
+    expect(restoreUpdates[0]).toHaveProperty("$push.exchanges");
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(
+      run?.exchanges.filter((exchange) => exchange.answer === null),
+    ).toHaveLength(1);
+  }, 20_000);
+
+  it("maps a claim failure even when compensation also fails", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Mapped failure?",
+    });
+    const ticketId = await insertApproved(24);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    const originalUpdateOne = Collection.prototype.updateOne;
+    let runUpdates = 0;
+    const updateSpy = vi
+      .spyOn(Collection.prototype, "updateOne")
+      .mockImplementation(function (
+        this: Collection,
+        filter,
+        update,
+        options,
+      ) {
+        const id = (filter as { _id?: { toString(): string } })._id;
+        if (this.collectionName === "runs" && id?.toString() === runId) {
+          runUpdates += 1;
+          if (runUpdates <= 2) {
+            return Promise.reject(
+              new Error(`injected run update ${runUpdates}`),
+            );
+          }
+        }
+        return originalUpdateOne.call(this, filter, update, options);
+      });
+    const consoleSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    try {
+      await expect(
+        provideInputCore({ ticketId, answer: "not recorded" }),
+      ).rejects.toMatchObject({ code: "spawn_failed" });
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining(`Failed to restore parked run ${runId}`),
+        expect.any(Error),
+      );
+    } finally {
+      consoleSpy.mockRestore();
+      updateSpy.mockRestore();
+    }
   }, 20_000);
 
   it("keeps the answer when the write after the claim fails", async () => {
