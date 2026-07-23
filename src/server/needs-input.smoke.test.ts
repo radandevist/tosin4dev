@@ -265,6 +265,20 @@ describe("runner outcomes", () => {
     expect(run.exchanges[0]?.at).toBe(ticket?.activity.at(-1)?.at);
   }, 20_000);
 
+  it("uses a valid placeholder when a needs_input outcome has a blank question", async () => {
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "   ",
+    });
+    const ticketId = await insertApproved(30);
+    const { runId } = await dispatchRun(ticketId, "execute");
+
+    const run = await waitForRun(runId, "awaiting_input");
+    expect(run.awaitingQuestion).toBe("(no question provided)");
+    expect(run.exchanges[0]?.question).toBe("(no question provided)");
+    expect(() => InputExchangeSchema.parse(run.exchanges[0])).not.toThrow();
+  }, 20_000);
+
   it("ignores a duplicate park after the run is already parked", async () => {
     process.env.T4D_OUTCOME = JSON.stringify({
       outcome: "needs_input",
@@ -522,6 +536,220 @@ describe("runner outcomes", () => {
       provideInputCore({ ticketId, answer: "ok" }),
     ).resolves.toBeTruthy();
     await waitForRun(runId, "succeeded");
+  }, 20_000);
+
+  it("rejects a stale legacy claim after the run re-parks on a different question", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Legacy Q1?",
+    });
+    const ticketId = await insertApproved(25);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $unset: { exchanges: "" } },
+    );
+
+    const paused = pauseNextResumeClaim(runId);
+    const staleClaim = provideInputCore({
+      ticketId,
+      answer: "STALE-ANSWER",
+    });
+    await paused.reached;
+
+    try {
+      process.env.T4D_OUTCOME = JSON.stringify({
+        outcome: "needs_input",
+        question: "Legacy Q2?",
+      });
+      await provideInputCore({ ticketId, answer: "A1" });
+      const reparked = await waitForRun(runId, "awaiting_input");
+      expect(reparked.awaitingQuestion).toBe("Legacy Q2?");
+
+      paused.release();
+      await expect(staleClaim).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      paused.release();
+      paused.spy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    const openRows =
+      run?.exchanges.filter((exchange) => exchange.answer === null) ?? [];
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.awaitingQuestion).toBe("Legacy Q2?");
+    expect(run?.exchanges).toMatchObject([
+      { question: "Legacy Q1?", answer: "A1" },
+      { question: "Legacy Q2?", answer: null, answeredAt: null },
+    ]);
+    expect(run?.exchanges.some((exchange) => exchange.answer === "STALE-ANSWER"))
+      .toBe(false);
+    expect(openRows).toHaveLength(1);
+  }, 20_000);
+
+  it("rejects a stale legacy claim after failed-resume compensation opens a row", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Compensated Q1?",
+    });
+    const ticketId = await insertApproved(26);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $unset: { exchanges: "" } },
+    );
+
+    const paused = pauseNextResumeClaim(runId);
+    const staleClaim = provideInputCore({
+      ticketId,
+      answer: "STALE-ANSWER",
+    });
+    await paused.reached;
+
+    try {
+      await rm(join(binDirectory, "claude"), { force: true });
+      process.env.PATH = binDirectory;
+      await expect(
+        provideInputCore({ ticketId, answer: "recorded before failure" }),
+      ).rejects.toMatchObject({ code: "spawn_failed" });
+
+      const compensated = await runs.findOne({
+        _id: new ObjectId(runId),
+      });
+      expect(compensated?.status).toBe("awaiting_input");
+      expect(
+        compensated?.exchanges.filter(
+          (exchange) => exchange.answer === null,
+        ),
+      ).toHaveLength(1);
+
+      paused.release();
+      await expect(staleClaim).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      paused.release();
+      paused.spy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    const openRows =
+      run?.exchanges.filter((exchange) => exchange.answer === null) ?? [];
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.exchanges).toMatchObject([
+      { question: "Compensated Q1?", answer: "recorded before failure" },
+      { question: "Compensated Q1?", answer: null, answeredAt: null },
+    ]);
+    expect(run?.exchanges.some((exchange) => exchange.answer === "STALE-ANSWER"))
+      .toBe(false);
+    expect(openRows).toHaveLength(1);
+  }, 20_000);
+
+  it("pins a no-open-row claim to the snapshotted question", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Snapshot question?",
+    });
+    const ticketId = await insertApproved(27);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $unset: { exchanges: "" } },
+    );
+
+    const paused = pauseNextResumeClaim(runId);
+    const staleClaim = provideInputCore({
+      ticketId,
+      answer: "ANSWER-FOR-SNAPSHOT",
+    });
+    await paused.reached;
+
+    try {
+      await runs.updateOne(
+        { _id: new ObjectId(runId) },
+        { $set: { awaitingQuestion: "Replacement question?" } },
+      );
+      paused.release();
+      await expect(staleClaim).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      paused.release();
+      paused.spy.mockRestore();
+    }
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.awaitingQuestion).toBe("Replacement question?");
+    expect(run?.exchanges ?? []).toHaveLength(0);
+  }, 20_000);
+
+  it("caps exchange history when a no-open-row claim appends its answer", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Defensive cap question?",
+    });
+    const ticketId = await insertApproved(28);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    const historyAt = timestamp();
+    const history: Run["exchanges"] = Array.from(
+      { length: 50 },
+      (_, index) => ({
+        v: 1,
+        at: historyAt,
+        question: `No-open history ${index}`,
+        handoff: null,
+        answer: `Answer ${index}`,
+        answeredAt: historyAt,
+      }),
+    );
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $set: { exchanges: history } },
+    );
+
+    process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+    await provideInputCore({ ticketId, answer: "newest answer" });
+    const run = await waitForRun(runId, "succeeded");
+
+    expect(run.exchanges).toHaveLength(50);
+    expect(run.exchanges[0]?.question).toBe("No-open history 1");
+    expect(run.exchanges.at(-1)).toMatchObject({
+      question: "Defensive cap question?",
+      answer: "newest answer",
+    });
+  }, 20_000);
+
+  it("uses a valid placeholder when a legacy claim has a blank question", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Original legacy question?",
+    });
+    const ticketId = await insertApproved(29);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      {
+        $set: { awaitingQuestion: "   " },
+        $unset: { exchanges: "" },
+      },
+    );
+
+    process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+    await provideInputCore({ ticketId, answer: "answer" });
+    const run = await waitForRun(runId, "succeeded");
+
+    expect(run.exchanges.at(-1)).toMatchObject({
+      question: "(question unavailable)",
+      answer: "answer",
+    });
+    expect(() => InputExchangeSchema.parse(run.exchanges.at(-1))).not.toThrow();
   }, 20_000);
 
   it("answers only the last open exchange", async () => {
@@ -876,6 +1104,38 @@ describe("runner outcomes", () => {
     }
   }, 20_000);
 
+  it("maps a spawn failure even when compensation also fails", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Mapped spawn failure?",
+    });
+    const ticketId = await insertApproved(31);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    await rm(join(binDirectory, "claude"), { force: true });
+    process.env.PATH = binDirectory;
+    const updateSpy = rejectRunUpdate(runId, 2);
+    const consoleSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    try {
+      await expect(
+        provideInputCore({ ticketId, answer: "recorded before spawn failure" }),
+      ).rejects.toMatchObject({ code: "spawn_failed" });
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `Failed to restore parked run ${runId} after spawn failure`,
+        ),
+        expect.any(Error),
+      );
+    } finally {
+      consoleSpy.mockRestore();
+      updateSpy.mockRestore();
+    }
+  }, 20_000);
+
   it("keeps the answer when the write after the claim fails", async () => {
     const { provideInputCore } = await import("./tickets.server");
     process.env.T4D_OUTCOME = JSON.stringify({
@@ -979,7 +1239,7 @@ describe("runner outcomes", () => {
     await waitForRun(runId, "awaiting_input");
     await runs.updateOne(
       { _id: new ObjectId(runId) },
-      { $set: { awaitingQuestion: null } },
+      { $set: { awaitingQuestion: "   " } },
     );
 
     await rm(join(binDirectory, "claude"), { force: true });

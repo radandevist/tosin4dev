@@ -57,6 +57,10 @@ const ACTIVITY_CAP = 50;
 // Bounded degradation (losing the oldest rows) is deliberately preferred over
 // an unreadable oversized run document that loses the entire exchange history.
 const EXCHANGE_CAP = 50;
+const questionOrFallback = (
+  question: string | null | undefined,
+  fallback: string,
+) => (question?.trim() ? question : fallback);
 // The collected buffer feeds parseSessionId (whose marker is the FIRST line of
 // provider output) and summary extraction (which cares about the END). Keep a
 // head window and a tail window rather than a tail alone.
@@ -602,7 +606,10 @@ async function finishRun(
   const outcome = await readOutcome(runDir);
   const outSummary = outcome.summary ?? summary;
   if (outcome.outcome === "needs_input") {
-    const question = outcome.question ?? "(no question provided)";
+    const question = questionOrFallback(
+      outcome.question,
+      "(no question provided)",
+    );
     await parkTicketNeedsInput(
       database,
       runId,
@@ -812,7 +819,10 @@ async function restoreParkedResume(
                   v: 1 as const,
                   at,
                   // Keep compensation rows valid when legacy data lacks a question.
-                  question: question ?? "(question unavailable)",
+                  question: questionOrFallback(
+                    question,
+                    "(question unavailable)",
+                  ),
                   handoff: null,
                   answer: null,
                   answeredAt: null,
@@ -925,6 +935,12 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
     const filter = claimFilter as Record<string, unknown>;
     filter[`exchanges.${openIndex}.answer`] = { $type: "null" };
     filter[`exchanges.${openIndex}.at`] = openRow.at;
+  } else {
+    // A legacy snapshot has no open row. Pin both that absence and its parked
+    // question so a stale claim cannot answer a different, newly parked row.
+    const filter = claimFilter as Record<string, unknown>;
+    filter.exchanges = { $not: { $elemMatch: { answer: null } } };
+    filter.awaitingQuestion = run.awaitingQuestion ?? null;
   }
   // The answer MUST remain inside this claim: a second write could fail after
   // status changes to running, losing the human answer with no safe retry.
@@ -950,8 +966,10 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
                     {
                       v: 1 as const,
                       at: answeredAt,
-                      question:
-                        run.awaitingQuestion ?? "(question unavailable)",
+                      question: questionOrFallback(
+                        run.awaitingQuestion,
+                        "(question unavailable)",
+                      ),
                       handoff: null,
                       answer,
                       answeredAt,
@@ -1062,7 +1080,14 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
       child.kill("SIGKILL");
       await runningChild?.exited.catch(() => undefined);
     }
-    await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+    try {
+      await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+    } catch (compensationError) {
+      console.error(
+        `Failed to restore parked run ${runId} after spawn failure:`,
+        compensationError,
+      );
+    }
     throw new ServerResultError("spawn_failed", "run could not be resumed");
   }
 }
