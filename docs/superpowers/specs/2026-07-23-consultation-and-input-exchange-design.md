@@ -59,14 +59,32 @@ if (collected.length > SUMMARY_OUTPUT_CAP) {
 ```
 
 `parseSessionId(runDoc.runner, stdout)` (`:528`) runs on exactly that buffer.
-Codex emits `{"type":"thread.started","thread_id":"…"}` as its **first** line;
-Claude's session id likewise appears in the leading init object. So a run whose
-stdout exceeds 512 KB **silently loses its `executionSessionId`** — and
-`resumeRun` hard-refuses a run with no captured session
-(`supervisor.server.ts:719-724`). A long run that parks on a question becomes
-permanently unresumable.
+Codex emits `{"type":"thread.started","thread_id":"…"}` as its **first** line, so
+a codex run whose stdout exceeds 512 KB **silently loses its
+`executionSessionId`** — and `resumeRun` hard-refuses a run with no captured
+session (`supervisor.server.ts:719-724`). A long codex run that parks on a
+question becomes permanently unresumable.
 
 It fails safe (a refusal, not a wrong resume) but it strands real work.
+
+**Scope, stated precisely: this fix rescues codex only.** An earlier draft of
+this section claimed Claude's session id also rides a leading init object. It
+does not, under the flags this repo actually uses. `claude -p --output-format
+json` emits a **single JSON object** (`outcome.server.ts:5` says so, and
+`claude.ts:23` sets the flag), and `parseSessionId` requires a complete
+`JSON.parse` of a line beginning with `{`. When a claude run exceeds the buffer,
+the head holds a prefix of that one object and the tail holds a suffix —
+**neither parses**, so no window size fixes it. Verified by probe during review:
+a 900 KB claude result yields `null` both before and after the head-window
+change.
+
+So a claude run over 512 KB stays unresumable. That is a **pre-existing defect,
+not a regression**, and it is out of scope here — the honest fix is either to
+capture the session id incrementally as it streams or to move claude to
+`stream-json`, which is slice ④'s territory (and which slice ④ must therefore
+not assume is already solved). Recorded as a known limitation with a comment at
+the constants, and folded into the Layer 0 tests as an explicit non-claim rather
+than left as a silent gap.
 
 **Fix:** keep a head window and a tail window instead of tail-only.
 
@@ -88,9 +106,22 @@ The marker is newline-delimited on **both** sides deliberately. Without the
 leading newline, the marker would glue onto a partial head line; without the
 trailing one, the tail's partial first line would glue onto the marker. Both
 would manufacture a corrupt line. As specified, the only damage is one orphan
-partial line, which every parser in the codebase already skips (`parseSessionId`,
-`parseChatResult`, and `parseTurn` all iterate lines and `continue` on a failed
-`JSON.parse`).
+partial line, which every *line-based JSON* parser in the codebase already skips
+(`parseSessionId`, `parseChatResult`, and `parseTurn` all iterate lines and
+`continue` on a failed `JSON.parse`).
+
+**`parseSummary` is the exception and must be handled.** It is the one consumer
+that matches by regex rather than strict line-JSON (`supervisor.server.ts:320-337`):
+it scans for `^(?:##\s*)?SUMMARY\s*$` and keeps the **last** match. Under the old
+tail-only buffer a `SUMMARY` header early in a run was never in scope; bringing a
+head window into scope means a long run that printed a bare `SUMMARY` in its
+first 64 KB but emitted no final summary section would now report that early
+scratch output as the run's result — into `RunDoc.summary`, the ticket UI, and
+the review-ready notification, where it previously wrote `null`. Since summary
+extraction cares about the END of the output, and the truncation marker is
+exactly the head/tail delimiter, `parseSummary` must search only the portion
+**after the last marker** when one is present. This is a regression the head
+window introduces, so it ships in the same layer.
 
 ### 0b. stdout and stderr interleave in one file
 
