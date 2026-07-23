@@ -25,7 +25,7 @@ describe("buildChatCommand", () => {
     ]);
   });
 
-  it("disallows mutation tools for a claude consultation", () => {
+  it("disallows mutation and file-read tools for a claude consultation", () => {
     expect(
       buildChatCommand("help", null, "claude", "/run/consult", "consultation"),
     ).toEqual([
@@ -39,6 +39,11 @@ describe("buildChatCommand", () => {
       "Write",
       "NotebookEdit",
       "Bash",
+      "Read",
+      "Grep",
+      "Glob",
+      "WebFetch",
+      "WebSearch",
     ]);
   });
 
