@@ -53,7 +53,12 @@ interface RunningChild {
 }
 
 const ACTIVITY_CAP = 50;
-const SUMMARY_OUTPUT_CAP = 512_000;
+// The collected buffer feeds parseSessionId (whose marker is the FIRST line of
+// provider output) and summary extraction (which cares about the END). Keep a
+// head window and a tail window rather than a tail alone.
+const SUMMARY_HEAD_CAP = 64_000;
+const SUMMARY_TAIL_CAP = 448_000;
+const TRUNCATION_MARKER = "\n…[output truncated]…\n";
 const execFileAsync = promisify(execFile);
 const adapters: Record<Ticket["runner"], RunnerAdapter> = {
   claude: claudeAdapter,
@@ -246,18 +251,35 @@ export async function drainStream(
   collect: boolean,
 ): Promise<string> {
   const decoder = new TextDecoder();
-  let collected = "";
+  let head = "";
+  let tail = "";
+  let dropped = false;
+  const absorb = (text: string): void => {
+    if (head.length < SUMMARY_HEAD_CAP) {
+      const room = SUMMARY_HEAD_CAP - head.length;
+      head += text.slice(0, room);
+      text = text.slice(room);
+      if (!text) return;
+    }
+    tail += text;
+    if (tail.length > SUMMARY_TAIL_CAP) {
+      tail = tail.slice(-SUMMARY_TAIL_CAP);
+      dropped = true;
+    }
+  };
   for await (const chunk of stream) {
     await appendFile(logFile, chunk);
-    if (collect) {
-      collected += decoder.decode(chunk, { stream: true });
-      if (collected.length > SUMMARY_OUTPUT_CAP) {
-        collected = collected.slice(-SUMMARY_OUTPUT_CAP);
-      }
-    }
+    if (collect) absorb(decoder.decode(chunk, { stream: true }));
   }
-  if (collect) collected += decoder.decode();
-  return collected;
+  if (collect) absorb(decoder.decode());
+  if (!collect) return "";
+  if (!tail) return head;
+  // The marker is newline-delimited on BOTH sides on purpose: without the
+  // leading newline it would glue onto a partial head line, without the
+  // trailing one the tail's partial first line would glue onto the marker.
+  // Either would manufacture a corrupt line. As written the only damage is one
+  // orphan partial line, which every line-based parser here already skips.
+  return dropped ? head + TRUNCATION_MARKER + tail : head + tail;
 }
 
 export function settledExit(child: ChildProcess): Promise<number> {
