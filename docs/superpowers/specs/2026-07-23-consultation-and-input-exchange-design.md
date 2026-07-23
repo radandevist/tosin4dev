@@ -259,12 +259,32 @@ await runs.updateOne(
 );
 ```
 
-Note for the implementer: a legacy run parked before this slice has
-`exchanges: []`. MongoDB errors only when an `arrayFilters` identifier is
-*unused* in the update document — matching **zero** elements is not an error, it
-simply leaves the array untouched. So this same update is correct for legacy
-parked runs, which continue to resume via `awaitingQuestion` with no history
-recorded. Cover it with a test rather than a special case.
+**Correction — `arrayFilters` is not usable here, and this design says so after
+shipping the mistake.** Two properties disqualify it, both verified against real
+Mongo rather than reasoned about:
+
+1. **It requires the path to exist.** A run parked before this slice has no
+   `exchanges` key, and `arrayFilters` then throws
+   `The path 'exchanges' must exist in the document in order to apply array
+   updates`. `exchanges: []` is fine; absent is fatal. The consequence was that
+   every pre-existing parked run failed to resume on the first attempt, with the
+   human's answer discarded and misreported as a spawn failure.
+2. **It has no positional restriction.** `{"open.answer": null}` matches *every*
+   open row. If a run ever holds two, one answer is written into both —
+   fabricating a question/answer pair the human never wrote, into the very
+   history the consultation chat later feeds back to an agent. It also erases the
+   open-row count that would reveal the corruption.
+
+**Use an index-targeted row-level CAS.** `resumeRun` already holds the run
+document, so it can compute the last open index and pin that exact row in both
+the update filter and the `$set`. This preserves the property that matters — the
+answer is written *inside* the claim, atomically — while working on a
+key-absent document and being incapable of fanning out.
+
+The general lesson, recorded because it caused both defects: **a legacy-tolerance
+test must construct the shape that actually exists in the database.** Setting a
+field to its post-migration value and asserting success proves only that the
+post-migration shape works.
 
 **On spawn-failure compensation** (`restoreParkedResume`,
 `supervisor.server.ts:675-710`) — do **not** revert the recorded answer. The
