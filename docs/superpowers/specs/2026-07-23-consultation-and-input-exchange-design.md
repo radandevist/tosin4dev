@@ -530,6 +530,24 @@ change a file. This is a real, checked flag, not an assumed one. Codex keeps
 is the second, independent layer. Reading the consultant into the worktree
 remains available later if a concrete need appears.
 
+**Read-then-echo is closed for claude, residual for codex.** A security review
+noted that blocking only mutation tools left the claude consultant able to
+`Read`/`Grep`/`Glob` a raw run artifact (`<runDir>/output.log`, `stderrFile`) by
+absolute path and quote a secret from it into its advisory reply — which is
+persisted and shareable, reintroducing exactly the leak the log-exclusion
+decision was meant to prevent. So the claude consultation disallow list is
+widened to `Edit Write NotebookEdit Bash Read Grep Glob WebFetch WebSearch`
+(the consultant reasons from its seeded, redacted context and needs no
+filesystem access), and the scratch cwd is moved out of the run dir to
+`<repoPath>/.tosin4dev/consult/<sessionId>` so a raw log is not a relative hop
+away. **Codex has no per-tool disable**, and `-s read-only` still permits reads,
+so a codex consultant retains a read-then-echo residual claude no longer has —
+documented in code, not silently assumed closed. Flagged for the owner: if this
+residual matters, the options are to restrict consultations to the claude
+provider, or to accept it as within the threat model (the consultant runs on the
+developer's own machine over their own repo). Deferred to the owner rather than
+decided here.
+
 ### No write path
 
 The consultation chat has **no** server function that touches runs or tickets.
