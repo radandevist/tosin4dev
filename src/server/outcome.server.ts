@@ -49,9 +49,14 @@ export async function readOutcome(runDir: string): Promise<RunOutcome> {
       decoded !== null && typeof decoded === "object"
         ? (decoded as Record<string, unknown>)
         : null;
-    // Fail-OPEN on the handoff only: it is enrichment, so a malformed brief
-    // must not downgrade an otherwise valid needs_input outcome to a failure.
-    const handoff = HandoffBriefSchema.safeParse(record?.handoff);
+    // Fail-OPEN on the handoff only for needs_input: a malformed brief must
+    // not downgrade an otherwise valid parked outcome to a failure. Handoffs
+    // are discarded for every other outcome, so handoff !== null implies
+    // outcome === "needs_input".
+    const handoff =
+      record?.outcome === "needs_input"
+        ? HandoffBriefSchema.safeParse(record.handoff)
+        : null;
     const parsed = RunOutcomeSchema.safeParse(
       record ? { ...record, handoff: null } : decoded,
     );
@@ -63,7 +68,7 @@ export async function readOutcome(runDir: string): Promise<RunOutcome> {
     }
     return {
       ...parsed.data,
-      handoff: handoff.success ? handoff.data : null,
+      handoff: handoff?.success ? handoff.data : null,
     };
   } catch {
     return RunOutcomeSchema.parse({
