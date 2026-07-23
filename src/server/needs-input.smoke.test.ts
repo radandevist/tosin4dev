@@ -24,7 +24,9 @@ process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 process.env.DISCORD_WEBHOOK_URL = "";
 
 const { db, closeDb, ObjectId } = await import("./db");
-const { dispatchRun } = await import("./supervisor.server");
+const { dispatchRun, parkTicketNeedsInput } = await import(
+  "./supervisor.server"
+);
 
 let database: Db;
 let boards: Collection<BoardDoc>;
@@ -177,6 +179,36 @@ describe("runner outcomes", () => {
       answer: null,
       answeredAt: null,
     });
+    expect(run.exchanges[0]?.at).toBe(ticket?.updatedAt);
+    expect(run.exchanges[0]?.at).toBe(ticket?.activity.at(-1)?.at);
+  }, 20_000);
+
+  it("ignores a duplicate park after the run is already parked", async () => {
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Q?",
+    });
+    const ticketId = await insertApproved(11);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const parkedRun = await waitForRun(runId, "awaiting_input");
+    const parkedTicket = await tickets.findOne({
+      _id: new ObjectId(ticketId),
+    });
+
+    await parkTicketNeedsInput(
+      database,
+      runId,
+      ticketId,
+      "Q?",
+      parkedRun.summary,
+      null,
+      timestamp(),
+    );
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(run?.exchanges).toHaveLength(1);
+    expect(ticket?.activity).toEqual(parkedTicket?.activity);
   }, 20_000);
 
   it("records an open exchange with its handoff when the run parks", async () => {
@@ -204,6 +236,83 @@ describe("runner outcomes", () => {
     });
     expect(run.exchanges[0]?.handoff?.workDone).toBe("read the router");
     expect(run.awaitingQuestion).toBe("Which base branch?");
+  }, 20_000);
+
+  it("parks needs_input when the handoff is malformed", async () => {
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Malformed handoff question?",
+      handoff: "not an object",
+    });
+    const ticketId = await insertApproved(12);
+    const { runId } = await dispatchRun(ticketId, "execute");
+
+    const run = await waitForRun(runId, "awaiting_input");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(run.status).toBe("awaiting_input");
+    expect(ticket?.status).toBe("needs_input");
+    expect(run.exchanges).toHaveLength(1);
+    expect(run.exchanges[0]?.handoff).toBeNull();
+  }, 20_000);
+
+  it("caps exchange history at 50 while retaining the newest park", async () => {
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Initial question?",
+    });
+    const ticketId = await insertApproved(13);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    await waitForRun(runId, "awaiting_input");
+
+    const historyAt = timestamp();
+    const history: Run["exchanges"] = Array.from(
+      { length: 50 },
+      (_, index) => ({
+        v: 1,
+        at: historyAt,
+        question: `History ${index}`,
+        handoff: null,
+        answer: `Answer ${index}`,
+        answeredAt: historyAt,
+      }),
+    );
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      {
+        $set: {
+          status: "running",
+          awaitingQuestion: null,
+          exchanges: history,
+        },
+      },
+    );
+    await tickets.updateOne(
+      { _id: new ObjectId(ticketId) },
+      { $set: { status: "running" } },
+    );
+
+    const parkAt = "2040-01-02T03:04:05.000Z";
+    await parkTicketNeedsInput(
+      database,
+      runId,
+      ticketId,
+      "Newest question?",
+      null,
+      null,
+      parkAt,
+    );
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(run?.exchanges).toHaveLength(50);
+    expect(run?.exchanges[0]?.question).toBe("History 1");
+    expect(run?.exchanges.at(-1)).toMatchObject({
+      at: parkAt,
+      question: "Newest question?",
+      answer: null,
+    });
+    expect(ticket?.updatedAt).toBe(parkAt);
+    expect(ticket?.activity.at(-1)?.at).toBe(parkAt);
   }, 20_000);
 
   it("resumes a needs_input ticket and completes on the answer", async () => {
@@ -398,6 +507,52 @@ describe("runner outcomes", () => {
     expect(retriedRun.workDir).toBe(originalWorkDir);
     expect(retriedRun.branch).toBe(originalBranch);
     expect(retriedRun.executionSessionId).toBe(originalExecutionSessionId);
+  }, 20_000);
+
+  it("caps exchange history when a failed resume reopens the question", async () => {
+    const { provideInputCore } = await import("./tickets.server");
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Retry question?",
+    });
+    const ticketId = await insertApproved(14);
+    const { runId } = await dispatchRun(ticketId, "execute");
+    const parkedRun = await waitForRun(runId, "awaiting_input");
+    const historyAt = timestamp();
+    const history: Run["exchanges"] = Array.from(
+      { length: 49 },
+      (_, index) => ({
+        v: 1,
+        at: historyAt,
+        question: `History ${index}`,
+        handoff: null,
+        answer: `Answer ${index}`,
+        answeredAt: historyAt,
+      }),
+    );
+    await runs.updateOne(
+      { _id: new ObjectId(runId) },
+      { $set: { exchanges: [...history, parkedRun.exchanges[0]!] } },
+    );
+
+    await rm(join(binDirectory, "claude"), { force: true });
+    process.env.PATH = binDirectory;
+    await expect(
+      provideInputCore({ ticketId, answer: "retry answer" }),
+    ).rejects.toThrow();
+
+    const run = await runs.findOne({ _id: new ObjectId(runId) });
+    expect(run?.exchanges).toHaveLength(50);
+    expect(run?.exchanges[0]?.question).toBe("History 1");
+    expect(run?.exchanges.at(-2)).toMatchObject({
+      question: "Retry question?",
+      answer: "retry answer",
+    });
+    expect(run?.exchanges.at(-1)).toMatchObject({
+      question: "Retry question?",
+      answer: null,
+      answeredAt: null,
+    });
   }, 20_000);
 
   it("sends a completed outcome through verification", async () => {

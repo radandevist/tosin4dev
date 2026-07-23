@@ -149,8 +149,9 @@ export type HandoffBrief = z.infer<typeof HandoffBriefSchema>;
 // One question→answer round trip on a run. `v` is the record version: this
 // history is read by consultation context building and by later slices, so it
 // must be able to evolve without silently reinterpreting stored rows.
-// INVARIANT: the open exchange is the last element with `answer === null`, and
-// at most one exists at a time.
+// SUPERVISOR WRITE INVARIANT: if an open exchange exists, it is the last element
+// with `answer === null`, and at most one exists at a time. Legacy history may
+// be empty; this schema supplies its default but does not require a row.
 export const InputExchangeSchema = z
   .object({
     v: z.literal(1),
