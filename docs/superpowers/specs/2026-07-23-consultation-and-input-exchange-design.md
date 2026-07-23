@@ -519,12 +519,16 @@ damage the run" true by construction rather than by configuration.
 
 Codex additionally keeps `-s read-only`, so it is belt-and-braces there.
 
-**Flip-point, and a task step:** confirm whether the installed Claude CLI
-exposes a tool-restriction flag (`--allowedTools` / `--disallowedTools` or
-equivalent) by checking `claude --help` on this machine. If it does, add it —
-as a *verified* flag, not an assumed one. If it does not, the scratch cwd stands
-alone and that fact is recorded in the spec. Reading the consultant into the
-worktree remains available later if a concrete need appears.
+**Flip-point, now resolved.** `claude --help` on this machine was checked
+(2026-07-23) and the installed CLI **does** expose tool-restriction flags:
+`--allowedTools` / `--disallowedTools` (variadic) and `--permission-mode`. So the
+claude consultation command gets a verified flag in addition to the scratch cwd —
+`--disallowedTools Edit Write NotebookEdit Bash` strips the mutation/execution
+surface, so even setting aside the empty cwd the consultant has no tool that can
+change a file. This is a real, checked flag, not an assumed one. Codex keeps
+`-s read-only`. The scratch cwd remains the by-construction guarantee; the flag
+is the second, independent layer. Reading the consultant into the worktree
+remains available later if a concrete need appears.
 
 ### No write path
 
