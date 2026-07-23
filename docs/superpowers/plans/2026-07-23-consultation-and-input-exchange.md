@@ -647,11 +647,39 @@ it("resumes a legacy parked run that has no exchanges", async () => {
     });
 ```
 
-**Legacy safety:** MongoDB errors only when an `arrayFilters` identifier is
-*unused in the update document*. Matching **zero** array elements is not an
-error — it simply leaves the array untouched. So a legacy run with
-`exchanges: []` resumes fine through this same update, recording no history.
-That is why the third test above exists; do not add a special case for it.
+> **⚠️ THE `arrayFilters` APPROACH ABOVE IS WRONG. It shipped two blocking
+> defects and was replaced. Kept here only so the reasoning is not repeated.**
+>
+> This plan originally claimed that "matching zero array elements is not an
+> error", and inferred from that that a legacy run resumes fine. The first half
+> is true; the inference is false. Verified directly against real Mongo:
+>
+> ```
+> MISSING KEY -> THREW: code 2 | The path 'exchanges' must exist in the
+>                                document in order to apply array updates.
+> EMPTY ARRAY -> OK matched=1
+> ```
+>
+> `exchanges: []` is fine. A genuinely **absent** key — the shape of every run
+> parked before this branch — is a server-side `BadValue`. The claim throws, the
+> compensation fires, and the human gets `spawn_failed` with their answer
+> discarded. **B1.**
+>
+> Worse, `arrayFilters` has **no positional restriction**: `{"open.answer": null}`
+> matches *every* open row, so one answer fans out across all of them,
+> fabricating Q&A pairs the human never wrote. **B2.**
+>
+> **Use an index-targeted row-level CAS instead** — `resumeRun` already holds the
+> run document, so compute `findLastIndex(e => e.answer === null)` and pin that
+> exact row in both the filter and the `$set`. This keeps the answer write inside
+> the single claim, works when the key is absent, and cannot fan out.
+
+**Legacy safety — test the shape that actually exists.** The pre-v5 run document
+has **no `exchanges` key at all**. A test that does `$set: { exchanges: [] }` is
+constructing the *post*-migration shape and proves nothing — that exact mistake
+is why B1 shipped. Force the real shape with `$unset: { exchanges: "" }`, and
+keep `exchanges: []` as a *second* case. Both must resume **on the first
+attempt**.
 
 - [ ] **Step 4: implement the compensation.** In `restoreParkedResume`, do
 **not** revert the recorded answer — the human really did answer, and erasing it
