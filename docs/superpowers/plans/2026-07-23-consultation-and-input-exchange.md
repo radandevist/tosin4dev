@@ -206,8 +206,15 @@ git commit -m "fix(runs): keep a head window in drainStream so session ids survi
 ## Task 2: Split stderr out of the run log
 
 **Files:**
-- Modify: `src/domain/schemas.ts` (`RunSchema`), `src/server/supervisor.server.ts` (run-doc creation ~line 928 and 158; both `drainStream` stderr call sites at 795 and 999), `src/server/runs.server.ts` (`logTailCore` 97-107), `src/server/runs.ts` (`RunDTOSchema`)
+- Modify: `src/domain/schemas.ts` (`RunSchema`), `src/server/supervisor.server.ts` (run paths object ~163; run-doc creation ~966; log pre-write ~1020; both `drainStream` stderr call sites, ~833 and ~1037), `src/server/runs.server.ts` (`logTailCore` 97-107), `src/server/runs.ts` (`RunDTOSchema`)
 - Test: `src/server/log-split.smoke.test.ts` (create)
+
+> **Line numbers drift.** These were re-anchored after Task 1 landed (+32 lines
+> in `supervisor.server.ts`). Later tasks will shift them again. Always locate
+> code by **symbol** — `drainStream`, `parseSummary`, `parkTicketNeedsInput`,
+> `resumeRun`, `logTailCore` — and treat any line number here as a hint, not an
+> address. If a cited line does not contain what this plan says it does, grep
+> for the symbol and proceed; do not edit by line number alone.
 
 - [ ] **Step 1 (RED): write the failing smoke test.**
 
