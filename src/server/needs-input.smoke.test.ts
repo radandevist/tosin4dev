@@ -169,6 +169,41 @@ describe("runner outcomes", () => {
     expect(run.awaitingQuestion).toBe("Q?");
     expect(ticket?.activeRunId).toBe(runId);
     expect(run.executionSessionId).toBe("s-smoke");
+    expect(run.exchanges).toHaveLength(1);
+    expect(run.exchanges[0]).toMatchObject({
+      v: 1,
+      question: "Q?",
+      handoff: null,
+      answer: null,
+      answeredAt: null,
+    });
+  }, 20_000);
+
+  it("records an open exchange with its handoff when the run parks", async () => {
+    process.env.T4D_OUTCOME = JSON.stringify({
+      outcome: "needs_input",
+      question: "Which base branch?",
+      handoff: {
+        workDone: "read the router",
+        decision: "base branch",
+      },
+    });
+    const ticketId = await insertApproved(6);
+    const { runId } = await dispatchRun(ticketId, "execute");
+
+    const run = await waitForRun(runId, "awaiting_input");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+
+    expect(ticket?.status).toBe("needs_input");
+    expect(run.exchanges).toHaveLength(1);
+    expect(run.exchanges[0]).toMatchObject({
+      v: 1,
+      question: "Which base branch?",
+      answer: null,
+      answeredAt: null,
+    });
+    expect(run.exchanges[0]?.handoff?.workDone).toBe("read the router");
+    expect(run.awaitingQuestion).toBe("Which base branch?");
   }, 20_000);
 
   it("resumes a needs_input ticket and completes on the answer", async () => {
