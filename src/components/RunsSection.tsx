@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useParams } from "@tanstack/react-router";
 import type { HandoffBrief } from "../domain/schemas";
+import { useCreateConsultationSession } from "../queries/chat";
 import { useDispatch, useLogTail, useRuns } from "../queries/runs";
 import {
   useDependencyStatus,
@@ -10,6 +12,7 @@ import {
 } from "../queries/tickets";
 import type { RunDTO } from "../server/runs";
 import type { TicketDTO } from "../server/tickets";
+import { consultationAnswerStorageKey } from "./consultationUi";
 import {
   answeredExchanges,
   dispatchActionForTicket,
@@ -26,8 +29,13 @@ const POLL_INTERVAL_MS = 2_000;
 
 export function RunsSection({ ticket }: { ticket: TicketDTO }) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const { boardSlug } = useParams({
+    from: "/b/$boardSlug/t/$ticketSeq",
+  });
   const dispatchRun = useDispatch();
   const provideInput = useProvideInput();
+  const createConsultation = useCreateConsultationSession();
   const [openRunId, setOpenRunId] = useState<string | null>(null);
   const [answer, setAnswer] = useState("");
   const action = dispatchActionForTicket(
@@ -75,6 +83,16 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
       ? POLL_INTERVAL_MS
       : false,
   });
+
+  useEffect(() => {
+    if (!parkedRun) return;
+    const key = consultationAnswerStorageKey(parkedRun._id);
+    const copiedAnswer = window.sessionStorage.getItem(key);
+    if (copiedAnswer === null) return;
+
+    setAnswer(copiedAnswer);
+    window.sessionStorage.removeItem(key);
+  }, [parkedRun]);
 
   useEffect(() => {
     const activeRunId = ticket.activeRunId;
@@ -176,6 +194,21 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
     );
   };
 
+  const consult = () => {
+    if (!parkedRun || createConsultation.isPending) return;
+    createConsultation.mutate(
+      { runId: parkedRun._id },
+      {
+        onSuccess: ({ id }) =>
+          navigate({
+            to: "/b/$boardSlug/chat/$sessionId",
+            params: { boardSlug, sessionId: id },
+            search: { ticketSeq: ticket.seq },
+          }),
+      },
+    );
+  };
+
   return (
     <section aria-labelledby="ticket-runs-heading" className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -258,47 +291,67 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
           {open?.handoff ? <HandoffDetails handoff={open.handoff} /> : null}
 
           {shouldShowAnswerForm(parkedRun) ? (
-            <form
-              className="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
-              onSubmit={(event) => {
-                event.preventDefault();
-                submitInput();
-              }}
-            >
-              <div className="space-y-1">
-                <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
-                  Input needed
-                </p>
-                <p className="text-sm text-zinc-800">
-                  {parkedRun.awaitingQuestion}
-                </p>
+            <div className="space-y-2">
+              <div className="flex items-start gap-2">
+                <form
+                  className="min-w-0 flex-1 space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    submitInput();
+                  }}
+                >
+                  <div className="space-y-1">
+                    <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                      Input needed
+                    </p>
+                    <p className="text-sm text-zinc-800">
+                      {parkedRun.awaitingQuestion}
+                    </p>
+                  </div>
+                  <label
+                    htmlFor={`run-answer-${parkedRun._id}`}
+                    className="block text-xs font-medium text-zinc-600"
+                  >
+                    Your answer
+                  </label>
+                  <textarea
+                    id={`run-answer-${parkedRun._id}`}
+                    value={answer}
+                    onChange={(event) => setAnswer(event.target.value)}
+                    rows={3}
+                    className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    disabled={
+                      provideInput.isPending || answer.trim().length === 0
+                    }
+                    className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {provideInput.isPending ? "Submitting…" : "Provide input"}
+                  </button>
+                  {provideInput.isError ? (
+                    <p role="alert" className="text-sm text-rose-600">
+                      Could not provide input: {provideInput.error.message}
+                    </p>
+                  ) : null}
+                </form>
+                <button
+                  type="button"
+                  disabled={createConsultation.isPending}
+                  onClick={consult}
+                  className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium whitespace-nowrap text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {createConsultation.isPending ? "Opening…" : "Consult"}
+                </button>
               </div>
-              <label
-                htmlFor={`run-answer-${parkedRun._id}`}
-                className="block text-xs font-medium text-zinc-600"
-              >
-                Your answer
-              </label>
-              <textarea
-                id={`run-answer-${parkedRun._id}`}
-                value={answer}
-                onChange={(event) => setAnswer(event.target.value)}
-                rows={3}
-                className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
-              />
-              <button
-                type="submit"
-                disabled={provideInput.isPending || answer.trim().length === 0}
-                className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {provideInput.isPending ? "Submitting…" : "Provide input"}
-              </button>
-              {provideInput.isError ? (
+              {createConsultation.isError ? (
                 <p role="alert" className="text-sm text-rose-600">
-                  Could not provide input: {provideInput.error.message}
+                  Could not start consultation:{" "}
+                  {createConsultation.error.message}
                 </p>
               ) : null}
-            </form>
+            </div>
           ) : null}
         </div>
       ) : null}
