@@ -256,7 +256,13 @@ export async function drainStream(
   let dropped = false;
   const absorb = (text: string): void => {
     if (head.length < SUMMARY_HEAD_CAP) {
-      const room = SUMMARY_HEAD_CAP - head.length;
+      let room = SUMMARY_HEAD_CAP - head.length;
+      // Never split a surrogate pair across the head/tail boundary: in the
+      // dropped case the marker would land between the halves.
+      if (room > 0 && room < text.length) {
+        const code = text.charCodeAt(room - 1);
+        if (code >= 0xd800 && code <= 0xdbff) room -= 1;
+      }
       head += text.slice(0, room);
       text = text.slice(room);
       if (!text) return;
@@ -319,7 +325,17 @@ export function waitForSpawn(child: ChildProcess): Promise<void> {
 
 export function parseSummary(output: string): string | null {
   const normalized = output.replace(/\r\n?/g, "\n");
-  const lines = normalized.split("\n");
+  // drainStream may prepend a window from the START of the run so session ids
+  // survive. A SUMMARY header in that head window is early scratch output, not
+  // the run's final summary — taking it would report scratch as the result.
+  // The truncation marker is exactly the head/tail delimiter, so search only
+  // what follows it.
+  const markerAt = normalized.lastIndexOf(TRUNCATION_MARKER);
+  const searchable =
+    markerAt < 0
+      ? normalized
+      : normalized.slice(markerAt + TRUNCATION_MARKER.length);
+  const lines = searchable.split("\n");
   let header = -1;
   for (let index = 0; index < lines.length; index++) {
     if (/^(?:##\s*)?SUMMARY\s*$/i.test(lines[index])) header = index;
