@@ -7,6 +7,7 @@ import {
   ChatSessionSchema,
   type Board,
   type ChatSession,
+  type Run,
 } from "../domain/schemas";
 import { ChatSessionDTOSchema, type ChatSessionDTO } from "./chat";
 import { buildChatCommand } from "./chatCommand";
@@ -17,6 +18,7 @@ import {
 } from "./chatResult";
 import { db, ObjectId } from "./db";
 import { ServerResultError } from "./result";
+import { buildRunContext } from "./runContext.server";
 import { replaceDraftingBundle } from "./specBundles.server";
 import {
   drainStream,
@@ -186,10 +188,31 @@ export async function startChatTurn(
   if (doc.turnStatus === "pending") {
     throw new ServerResultError("conflict", "a turn is already in progress");
   }
+  if ((doc.kind ?? "brainstorm") === "consultation" && kind === "draft") {
+    throw new ServerResultError(
+      "conflict",
+      "consultation sessions cannot propose bundles",
+    );
+  }
   const board = await loadBoard(doc.boardId);
 
   const at = now();
   const logFile = `${board.repoPath}/.tosin4dev/chat/${sessionId}/turn.log`;
+  const sessionKind = doc.kind ?? "brainstorm";
+  if (sessionKind === "consultation" && doc.runId === null) {
+    throw new ServerResultError(
+      "invalid_state",
+      "consultation session has no run",
+    );
+  }
+  const workingDirectory =
+    sessionKind === "consultation"
+      ? `${board.repoPath}/.tosin4dev/runs/${doc.runId}/consult`
+      : board.repoPath;
+  const providerText =
+    sessionKind === "consultation" && doc.sessionId === null
+      ? [doc.messages[0]?.text, text].filter(Boolean).join("\n\n")
+      : text;
 
   const claim = await coll.updateOne(
     { _id: new ObjectId(sessionId), turnStatus: { $ne: "pending" } },
@@ -212,19 +235,21 @@ export async function startChatTurn(
     throw new ServerResultError("conflict", "a turn is already in progress");
   }
   await mkdir(dirname(logFile), { recursive: true });
+  await mkdir(workingDirectory, { recursive: true });
   await writeFile(logFile, "");
 
   let child: ChildProcess | undefined;
   let running: RunningTurn | undefined;
   try {
     const cmd = buildChatCommand(
-      text,
+      providerText,
       doc.sessionId,
       doc.provider,
-      board.repoPath,
+      workingDirectory,
+      sessionKind,
     );
     const spawned = spawn(cmd[0], cmd.slice(1), {
-      cwd: board.repoPath,
+      cwd: workingDirectory,
       env: { ...process.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -292,6 +317,8 @@ export async function reconcileChatSession(
 export function chatToDTO(doc: WithId<ChatSessionDoc>): ChatSessionDTO {
   const validated = ChatSessionSchema.parse({
     boardId: doc.boardId,
+    kind: doc.kind ?? "brainstorm",
+    runId: doc.runId ?? null,
     provider: doc.provider,
     sessionId: doc.sessionId,
     status: doc.status,
@@ -303,6 +330,8 @@ export function chatToDTO(doc: WithId<ChatSessionDoc>): ChatSessionDTO {
   return ChatSessionDTOSchema.parse({
     _id: doc._id.toString(),
     boardId: validated.boardId,
+    kind: validated.kind,
+    runId: validated.runId,
     provider: validated.provider,
     sessionId: validated.sessionId,
     status: validated.status,
@@ -342,6 +371,8 @@ export async function createChatSessionCore(input: {
   const at = now();
   const doc: ChatSessionDoc = {
     boardId: input.boardId,
+    kind: "brainstorm",
+    runId: null,
     provider: input.provider ?? "claude",
     sessionId: null,
     status: "active",
@@ -358,6 +389,46 @@ export async function createChatSessionCore(input: {
   };
   const r = await coll.insertOne(doc);
   return { id: r.insertedId.toString() };
+}
+
+export async function createConsultationSessionCore(input: {
+  runId: string;
+  provider?: "claude" | "codex";
+}): Promise<{ id: string }> {
+  const database = await db();
+  const run = await database
+    .collection<Run>("runs")
+    .findOne({ _id: new ObjectId(input.runId) });
+  if (!run) {
+    throw new ServerResultError("not_found", `run not found: ${input.runId}`);
+  }
+  if (run.status !== "awaiting_input") {
+    throw new ServerResultError("conflict", "run is not awaiting input");
+  }
+  await loadBoard(run.boardId);
+  const context = await buildRunContext(input.runId);
+  const coll = await chatSessions();
+  const at = now();
+  const doc: ChatSessionDoc = {
+    boardId: run.boardId,
+    kind: "consultation",
+    runId: input.runId,
+    provider: input.provider ?? "claude",
+    sessionId: null,
+    status: "active",
+    turnStatus: "idle",
+    turnError: null,
+    messages: [{ role: "user", text: context.text, at }],
+    bundleId: null,
+    createdAt: at,
+    updatedAt: at,
+    pid: null,
+    logFile: null,
+    pendingKind: null,
+    pendingUserMessageAt: null,
+  };
+  const result = await coll.insertOne(doc);
+  return { id: result.insertedId.toString() };
 }
 
 export async function sendChatMessageCore(input: {
@@ -397,6 +468,12 @@ export async function proposeBundleFromChatCore(input: {
     throw new ServerResultError(
       "conflict",
       "this session has already locked its tickets",
+    );
+  }
+  if ((doc.kind ?? "brainstorm") === "consultation") {
+    throw new ServerResultError(
+      "conflict",
+      "consultation sessions cannot propose bundles",
     );
   }
   await startChatTurn(input.sessionId, BUNDLE_INSTRUCTION, "draft");
