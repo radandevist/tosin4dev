@@ -414,7 +414,20 @@ no compaction state. A consultant reading the log knows what the run *did and
 said*, not what it was *thinking*.
 
 So the consultant is deliberately **not** given the log as its primary input.
-It is given a purpose-built package, log excerpts last.
+It is given a purpose-built package of **structured fields only**.
+
+**Raw log text is excluded from the package entirely (owner decision,
+2026-07-23).** An adversarial security review of `redactSecrets` demonstrated
+that the redaction control cannot be trusted as the *sole* gate on free-form log
+text: the env-derived pass matches verbatim bytes only, so a live credential that
+is base64-encoded, percent-encoded, re-cased, line-wrapped, or printed as a bare
+password on its own line (as DB drivers routinely do) survives — and the shape
+list can never be complete. Because the consultation transcript is persisted and
+shareable, a single redaction miss is a live-credential disclosure into a durable
+artifact. Rather than lean on a control that will miss, the design removes the
+free-form text: the consultant sees curated, structured fields, and
+`redactSecrets` is retained as **defense-in-depth** on those fields, not as the
+load-bearing control it was originally cast as.
 
 ### `RunContextBuilder` (`src/server/runContext.server.ts`)
 
@@ -429,37 +442,48 @@ the budget is exhausted — sections are never half-included:
 1. **Locked spec** — ticket seq/title/intent/scope/nonGoals/acceptance.
    Always included; never dropped. If the spec alone exceeded the budget the
    package would be meaningless, so this section is exempt from the cap.
-2. **Exchange history** — every `InputExchange`, newest first, so the freshest
-   round trips survive truncation.
+2. **Exchange history** — the `InputExchange` rows, newest first, so the
+   freshest round trips survive truncation. **Read from the same row-tolerant
+   `toDTO` projection the UI uses, not the raw run document** — otherwise the
+   consultant and the human reason from different histories (see the versioning
+   note). Carry the `exchangesDropped` count into the package so a shortened
+   history is visible to the consultant too.
 3. **Handoff brief** of the open exchange.
 4. **Objective worktree facts** — `run.branch`, `run.baseSha`, plus
    `git status --porcelain` and `git log --oneline <baseSha>..HEAD` executed in
    `run.workDir`.
-5. **Redacted log excerpt** — tail of `logFile`, then `stderrFile`, only if
-   budget remains.
+
+**No raw log excerpt section.** Removed per the owner decision above. The package
+ends at structured facts; the runner's stdout/stderr never enters it.
 
 Git commands run via `execFile` with an argv array and **no shell**, matching
 the existing `BoardCheck` execution rule (`schemas.ts:101-110`). A git failure
-degrades that section to a one-line note; it never fails the build.
+degrades that section to a one-line note; it never fails the build. Note that
+`git status`/`git log` output is itself structured and low-risk, but it can still
+echo a branch or commit message containing a secret, which is why `redactSecrets`
+still runs over it (defense-in-depth, below).
 
 ### Redaction
 
-Both execution and chat inherit the full server env, so logs can contain
-secrets. Piping a raw log into a chat transcript — which is persisted, and which
-the human may later share — is a real leak path. This is the single control that
-makes Layer 2 safe, so it is specified concretely.
-
-`redactSecrets(text)` in `src/server/redact.ts`, applied to **every** section
-(4 and 5 by necessity; 1–3 defensively, since a runner can echo a secret into
-its own handoff):
+`redactSecrets(text)` (`src/server/redact.ts`) runs over **every** section as
+**defense-in-depth** — the primary control is that no free-form log text enters
+the package at all (above). It is not trusted to catch everything, and the review
+that established this is on record:
 
 - **Env-derived:** for each `process.env` key matching
   `/(TOKEN|SECRET|KEY|PASSWORD|PASSWD|CREDENTIAL|AUTH)/i` whose value is ≥ 8
   characters, replace every literal occurrence of that value with `[REDACTED]`.
-  This catches the actual live secrets regardless of format.
+  This catches a live secret only when it appears **verbatim** — it does not see
+  an encoded, re-cased, wrapped, or otherwise transformed occurrence. That
+  limitation is acceptable *because* the high-risk free-form text was removed;
+  structured fields (spec, Q&A, handoff, git facts) contain far less transformed
+  credential material than a raw `curl -v` dump.
 - **Shape-derived:** `sk-[A-Za-z0-9_-]{16,}`, `gh[pousr]_[A-Za-z0-9]{20,}`,
   `AKIA[0-9A-Z]{16}`, `Bearer\s+[A-Za-z0-9._~+/-]{20,}`, and JWT-shaped
-  `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`.
+  `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`. Known-incomplete
+  by construction (Slack `xox*`, Google `AIza`, bare AWS secret keys, lowercase
+  `bearer`, connection-string passwords, and any non-enumerated vendor are not
+  covered). Treated as a bonus, never as the guarantee.
 
 **Fail-closed:** if `redactSecrets` throws, the offending section is omitted
 entirely rather than emitted raw.
