@@ -277,6 +277,18 @@ describe("split run logs", () => {
     expect(tail.text).toContain("e");
   });
 
+  it("never exceeds the requested byte ceiling across small budgets", async () => {
+    const runId = await insertRunWithLogs(
+      "s".repeat(50_000),
+      "e".repeat(50_000),
+    );
+
+    for (const bytes of [1, 2, 33, 34, 35, 66, 67, 100, 20_000]) {
+      const { text } = await logTailCore({ runId, bytes });
+      expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(bytes);
+    }
+  });
+
   it("handles a one-byte budget when stderr is non-empty", async () => {
     const runId = await insertRunWithLogs(
       "s".repeat(50_000),

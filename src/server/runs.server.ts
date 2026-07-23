@@ -113,15 +113,21 @@ export async function logTailCore(
   // Read stderr FIRST. Most runs write nothing there, and the stdout budget
   // must not be halved to reserve room for a section that turns out empty.
   const joiner = `\n${STDERR_DELIMITER}\n`;
-  const stderr = await readLogTail(run.stderrFile, Math.floor(input.bytes / 2));
+  const joinerBytes = Buffer.byteLength(joiner, "utf8");
+  // Clamp so the joiner itself can never push the result past the ceiling:
+  // spent = stderrBytes + joinerBytes <= (bytes - joinerBytes) + joinerBytes.
+  const stderrBudget = Math.max(
+    0,
+    Math.min(Math.floor(input.bytes / 2), input.bytes - joinerBytes),
+  );
+  const stderr = await readLogTail(run.stderrFile, stderrBudget);
   if (!stderr) {
     return { text: await readLogTail(run.logFile, input.bytes) };
   }
   // Charge the joiner and the stderr section against the caller's ceiling so
   // stdout + joiner + stderr <= bytes. Measure in BYTES, not chars: readLogTail
   // budgets a Buffer, and box-drawing/UTF-8 chars are multi-byte.
-  const spent =
-    Buffer.byteLength(stderr, "utf8") + Buffer.byteLength(joiner, "utf8");
+  const spent = Buffer.byteLength(stderr, "utf8") + joinerBytes;
   const stdout = await readLogTail(
     run.logFile,
     Math.max(0, input.bytes - spent),
