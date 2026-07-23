@@ -43,6 +43,54 @@ describe("readOutcome", () => {
     expect(outcome.handoff).toBeNull();
   });
 
+  it("round-trips a valid needs_input handoff with defaults", async () => {
+    await writeFile(
+      join(dir, "outcome.json"),
+      JSON.stringify({
+        outcome: "needs_input",
+        question: "Q?",
+        handoff: {
+          workDone: "wired the parser",
+          filesTouched: ["a.ts"],
+          decision: "which base branch",
+        },
+      }),
+    );
+
+    const outcome = await readOutcome(dir);
+
+    expect(outcome.handoff?.workDone).toBe("wired the parser");
+    expect(outcome.handoff?.filesTouched).toEqual(["a.ts"]);
+    expect(outcome.handoff?.decision).toBe("which base branch");
+    expect(outcome.handoff?.commandsRun).toEqual([]);
+    expect(outcome.handoff?.options).toEqual([]);
+    expect(outcome.handoff?.risk).toBe("");
+  });
+
+  it.each(["completed", "failed"] as const)(
+    "discards a valid handoff from a %s outcome",
+    async (result) => {
+      await writeFile(
+        join(dir, "outcome.json"),
+        JSON.stringify({ outcome: result, handoff: { workDone: "x" } }),
+      );
+
+      expect((await readOutcome(dir)).handoff).toBeNull();
+    },
+  );
+
+  it("keeps failed when its handoff is malformed", async () => {
+    await writeFile(
+      join(dir, "outcome.json"),
+      JSON.stringify({ outcome: "failed", handoff: "garbage" }),
+    );
+
+    expect(await readOutcome(dir)).toMatchObject({
+      outcome: "failed",
+      handoff: null,
+    });
+  });
+
   it("fails closed when the file is missing", async () => {
     expect((await readOutcome(dir)).outcome).toBe("failed");
   });
