@@ -15,6 +15,7 @@ import {
   RunPhase,
   TicketSchema,
   type Board,
+  type HandoffBrief,
   type Run,
   type Ticket,
 } from "../domain/schemas";
@@ -436,6 +437,7 @@ async function parkTicketNeedsInput(
   ticketId: string,
   question: string,
   summary: string | null,
+  handoff: HandoffBrief | null,
   at: string,
 ): Promise<void> {
   await database.collection<RunDoc>("runs").updateOne(
@@ -448,6 +450,16 @@ async function parkTicketNeedsInput(
         status: "awaiting_input",
         awaitingQuestion: question,
         summary,
+      },
+      $push: {
+        exchanges: {
+          v: 1 as const,
+          at,
+          question,
+          handoff,
+          answer: null,
+          answeredAt: null,
+        },
       },
     },
   );
@@ -589,7 +601,8 @@ async function finishRun(
       ticketId,
       question,
       outSummary,
-      now(),
+      outcome.handoff,
+      at,
     );
     await notify(
       `⏸️ needs input: ${await ticketLabel(database, ticketId)} — ${outcome.question ?? ""}`,
