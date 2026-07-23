@@ -1,3 +1,4 @@
+import type { InputExchange } from "../domain/schemas";
 import type { RunDTO } from "../server/runs";
 import type { TicketDTO } from "../server/tickets";
 
@@ -64,4 +65,17 @@ export function shouldPollLog(
 
 export function formatRunTimestamp(iso: string): string {
   return `${iso.slice(0, 16).replace("T", " ")} UTC`;
+}
+
+export function answeredExchanges(
+  exchanges: InputExchange[],
+): InputExchange[] {
+  return exchanges.filter((exchange) => exchange.answer !== null);
+}
+
+export function openExchange(
+  exchanges: InputExchange[],
+): InputExchange | null {
+  const open = exchanges.filter((exchange) => exchange.answer === null);
+  return open.length > 0 ? open[open.length - 1] : null;
 }

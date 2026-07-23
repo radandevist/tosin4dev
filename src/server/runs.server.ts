@@ -1,6 +1,6 @@
 import { open } from "node:fs/promises";
 import type { WithId } from "mongodb";
-import type { Run } from "../domain/schemas";
+import { InputExchangeSchema, type Run } from "../domain/schemas";
 import { db, ObjectId } from "./db";
 import type {
   DispatchRunInput,
@@ -54,6 +54,10 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     exitCode,
     summary,
     awaitingQuestion,
+    exchanges: (doc.exchanges ?? []).flatMap((exchange) => {
+      const parsed = InputExchangeSchema.safeParse(exchange);
+      return parsed.success ? [parsed.data] : [];
+    }),
     queuedAt,
     startedAt,
     finishedAt,

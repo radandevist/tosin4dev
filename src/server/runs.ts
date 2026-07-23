@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import {
   AbsolutePathString,
+  InputExchangeSchema,
   ObjectIdString,
   RunnerName,
   RunPhase,
@@ -32,6 +33,7 @@ export const RunDTOSchema = z
     exitCode: z.number().int().nullable(),
     summary: z.string().nullable(),
     awaitingQuestion: z.string().nullable(),
+    exchanges: z.array(InputExchangeSchema),
     queuedAt: timestamp,
     startedAt: timestamp.nullable(),
     finishedAt: timestamp.nullable(),
