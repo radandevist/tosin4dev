@@ -131,6 +131,38 @@ export const RunStatus = z.enum([
   "cancelled",
 ]);
 
+// A structured account of where a run stopped and what it needs decided.
+// Enrichment, NOT a gate: a parked run with no handoff is still a valid
+// needs_input, so nothing here may ever turn a needs_input into a failure.
+export const HandoffBriefSchema = z
+  .object({
+    workDone: z.string().default(""),
+    filesTouched: z.array(z.string()).default([]),
+    commandsRun: z.array(z.string()).default([]),
+    decision: z.string().default(""),
+    options: z.array(z.string()).default([]),
+    risk: z.string().default(""),
+  })
+  .strict();
+export type HandoffBrief = z.infer<typeof HandoffBriefSchema>;
+
+// One question→answer round trip on a run. `v` is the record version: this
+// history is read by consultation context building and by later slices, so it
+// must be able to evolve without silently reinterpreting stored rows.
+// INVARIANT: the open exchange is the last element with `answer === null`, and
+// at most one exists at a time.
+export const InputExchangeSchema = z
+  .object({
+    v: z.literal(1),
+    at: z.string().datetime(),
+    question: z.string(),
+    handoff: HandoffBriefSchema.nullable().default(null),
+    answer: z.string().nullable().default(null),
+    answeredAt: z.string().datetime().nullable().default(null),
+  })
+  .strict();
+export type InputExchange = z.infer<typeof InputExchangeSchema>;
+
 export const RunSchema = z.object({
   ticketId: ObjectIdString,
   boardId: ObjectIdString,
@@ -168,6 +200,9 @@ export const RunSchema = z.object({
   executionSessionId: z.string().nullable().default(null),
   // The question a `needs_input` run is parked on; null otherwise.
   awaitingQuestion: z.string().nullable().default(null),
+  // Durable Q&A history. `awaitingQuestion` stays the denormalised OPEN
+  // question (cleared on resume); this survives every round trip.
+  exchanges: z.array(InputExchangeSchema).default([]),
 });
 export type Run = z.infer<typeof RunSchema>;
 
@@ -179,6 +214,7 @@ export const RunOutcomeSchema = z.object({
   question: z.string().nullable().default(null),
   reason: z.string().nullable().default(null),
   summary: z.string().nullable().default(null),
+  handoff: HandoffBriefSchema.nullable().default(null),
 });
 export type RunOutcome = z.infer<typeof RunOutcomeSchema>;
 
