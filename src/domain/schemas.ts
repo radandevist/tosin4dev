@@ -155,7 +155,7 @@ export const InputExchangeSchema = z
   .object({
     v: z.literal(1),
     at: z.string().datetime(),
-    question: z.string(),
+    question: z.string().min(1),
     handoff: HandoffBriefSchema.nullable().default(null),
     answer: z.string().nullable().default(null),
     answeredAt: z.string().datetime().nullable().default(null),

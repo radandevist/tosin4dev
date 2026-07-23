@@ -280,11 +280,16 @@ describe("split run logs", () => {
 
   it("never exceeds the requested byte ceiling across small budgets", async () => {
     const runId = await insertRunWithLogs(
-      "s".repeat(50_000),
-      "e".repeat(50_000),
+      "│─✓🚀 ".repeat(10_000),
+      "│─✗⚠ ".repeat(10_000),
     );
 
-    for (const bytes of [1, 2, 33, 34, 35, 66, 67, 100, 20_000]) {
+    for (const bytes of [
+      ...Array.from({ length: 70 }, (_, index) => index + 1),
+      100,
+      1_000,
+      20_000,
+    ]) {
       const { text } = await logTailCore({ runId, bytes });
       expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(bytes);
     }

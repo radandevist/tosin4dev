@@ -88,7 +88,13 @@ export async function readLogTail(
     const length = Math.min(size, bytes);
     const buffer = Buffer.alloc(length);
     if (length > 0) await handle.read(buffer, 0, length, size - length);
-    return buffer.toString("utf8");
+    // Skip leading UTF-8 continuation bytes (0b10xxxxxx) so the window starts
+    // on a character boundary. Otherwise toString() substitutes U+FFFD — 3
+    // bytes — for the 1-2 partial bytes, and the decoded string can exceed the
+    // caller's byte budget.
+    let start = 0;
+    while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++;
+    return buffer.subarray(start).toString("utf8");
   } catch {
     return "";
   } finally {
