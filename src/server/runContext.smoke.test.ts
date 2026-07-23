@@ -23,6 +23,11 @@ process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 const guardedAccess = vi.hoisted(() => ({
   paths: new Set<string>(),
   attempted: [] as string[],
+  execFileCalls: [] as Array<{
+    file: string;
+    args: readonly string[];
+    options: Record<string, unknown>;
+  }>,
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -45,6 +50,27 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       return actual.readFile(...args);
     },
   };
+});
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const mockedExecFile = vi.fn(actual.execFile);
+  const customPromisify = Symbol.for("nodejs.util.promisify.custom");
+  const actualPromisified = Object.getOwnPropertyDescriptor(
+    actual.execFile,
+    customPromisify,
+  )?.value;
+  Object.defineProperty(mockedExecFile, customPromisify, {
+    value: (
+      file: string,
+      args: readonly string[],
+      options: Record<string, unknown>,
+    ) => {
+      guardedAccess.execFileCalls.push({ file, args, options });
+      return actualPromisified(file, args, options);
+    },
+  });
+  return { ...actual, execFile: mockedExecFile };
 });
 
 const execFileAsync = promisify(execFile);
@@ -154,6 +180,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   guardedAccess.paths.clear();
   guardedAccess.attempted.length = 0;
+  guardedAccess.execFileCalls.length = 0;
   await Promise.all([
     database.collection("runs").deleteMany({}),
     database.collection("tickets").deleteMany({}),
@@ -365,6 +392,45 @@ describe("buildRunContext", () => {
     expect(text.endsWith("\n\n")).toBe(true);
   });
 
+  it("stops at the first overflowing section to keep history contiguous", async () => {
+    const { runId } = await insertFixture({
+      exchanges: [
+        {
+          v: 1,
+          at: at(2),
+          question: "old-small-section",
+          handoff: null,
+          answer: "old answer",
+          answeredAt: at(3),
+        },
+        {
+          v: 1,
+          at: at(4),
+          question: `huge-middle-section${"x".repeat(
+            RUN_CONTEXT_CHAR_BUDGET,
+          )}`,
+          handoff: null,
+          answer: "middle answer",
+          answeredAt: at(5),
+        },
+        {
+          v: 1,
+          at: at(6),
+          question: "newest-small-section",
+          handoff: null,
+          answer: "newest answer",
+          answeredAt: at(7),
+        },
+      ],
+    });
+
+    const { text } = await buildRunContext(runId);
+
+    expect(text).toContain("newest-small-section");
+    expect(text).not.toContain("huge-middle-section");
+    expect(text).not.toContain("old-small-section");
+  });
+
   it("uses the shared row-tolerant exchange projection seen by the human", async () => {
     const valid = {
       v: 1,
@@ -408,5 +474,58 @@ describe("buildRunContext", () => {
     expect(text).toContain(
       "## Objective worktree facts\nGit worktree facts unavailable.\n\n",
     );
+  });
+
+  it("does not pass an invalid base SHA to git", async () => {
+    const repo = await makeRepo();
+    const { runId } = await insertFixture({
+      workDir: repo.workDir,
+      baseSha: "--upload-pack=evil",
+    });
+    guardedAccess.execFileCalls.length = 0;
+
+    const { text } = await buildRunContext(runId);
+
+    expect(guardedAccess.execFileCalls).toEqual([]);
+    expect(text).toContain("Git worktree facts unavailable.");
+  });
+
+  it("uses execFile with argv arrays and no shell for git reads", async () => {
+    const repo = await makeRepo();
+    const { runId } = await insertFixture({
+      workDir: repo.workDir,
+      baseSha: repo.baseSha,
+    });
+    guardedAccess.execFileCalls.length = 0;
+
+    const { text } = await buildRunContext(runId);
+
+    expect(text).toContain("Git status:\n(clean)");
+    expect(guardedAccess.execFileCalls).toEqual([
+      {
+        file: "git",
+        args: ["status", "--porcelain"],
+        options: expect.objectContaining({
+          cwd: repo.workDir,
+          timeout: 10_000,
+        }),
+      },
+      {
+        file: "git",
+        args: ["log", "--oneline", `${repo.baseSha}..HEAD`],
+        options: expect.objectContaining({
+          cwd: repo.workDir,
+          timeout: 10_000,
+        }),
+      },
+    ]);
+  });
+
+  it("maps a malformed run id to a not-found server error", async () => {
+    await expect(buildRunContext("not-an-object-id")).rejects.toMatchObject({
+      name: "ServerResultError",
+      code: "not_found",
+      message: "run not found: not-an-object-id",
+    });
   });
 });

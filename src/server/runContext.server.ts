@@ -110,15 +110,19 @@ function handoffSection(handoff: HandoffBrief): Section {
 
 async function worktreeSection(run: ContextRun): Promise<Section> {
   try {
-    if (!run.baseSha) throw new Error("missing base SHA");
+    if (!run.baseSha || !/^[0-9a-f]{7,40}$/.test(run.baseSha)) {
+      throw new Error("invalid base SHA");
+    }
     const [{ stdout: status }, { stdout: log }] = await Promise.all([
       execFileAsync("git", ["status", "--porcelain"], {
         cwd: run.workDir,
         encoding: "utf8",
+        timeout: 10_000,
       }),
       execFileAsync("git", ["log", "--oneline", `${run.baseSha}..HEAD`], {
         cwd: run.workDir,
         encoding: "utf8",
+        timeout: 10_000,
       }),
     ]);
     return {
@@ -142,9 +146,15 @@ export async function buildRunContext(
   runId: string,
 ): Promise<{ text: string }> {
   const database = await db();
+  let objectId: ObjectId;
+  try {
+    objectId = new ObjectId(runId);
+  } catch {
+    throw new ServerResultError("not_found", `run not found: ${runId}`);
+  }
   const run = await database
     .collection<ContextRun>("runs")
-    .findOne({ _id: new ObjectId(runId) });
+    .findOne({ _id: objectId });
   if (!run) {
     throw new ServerResultError("not_found", `run not found: ${runId}`);
   }
@@ -163,7 +173,14 @@ export async function buildRunContext(
     updatedAt: _updatedAt,
     ...raw
   } = ticketDoc;
-  const ticket = TicketSchema.parse(raw);
+  const parsedTicket = TicketSchema.safeParse(raw);
+  if (!parsedTicket.success) {
+    throw new ServerResultError(
+      "invalid_state",
+      `stored ticket is invalid: ${run.ticketId}`,
+    );
+  }
+  const ticket = parsedTicket.data;
 
   let text = redactSection(specSection(ticket)) ?? "";
   let budgetedLength = 0;
@@ -183,7 +200,7 @@ export async function buildRunContext(
       redacted === null ||
       budgetedLength + redacted.length > RUN_CONTEXT_CHAR_BUDGET
     ) {
-      continue;
+      break;
     }
     text += redacted;
     budgetedLength += redacted.length;
