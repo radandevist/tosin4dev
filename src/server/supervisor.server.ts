@@ -788,6 +788,16 @@ async function restoreParkedResume(
           pid: null,
           startedAt: run.startedAt,
         },
+        $push: {
+          exchanges: {
+            v: 1 as const,
+            at,
+            question: question ?? "",
+            handoff: null,
+            answer: null,
+            answeredAt: null,
+          },
+        },
       },
     ),
     database.collection<TicketDoc>("tickets").updateOne(
@@ -859,10 +869,19 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
 
   let child: ChildProcess | undefined;
   let runningChild: RunningChild | undefined;
+  const answeredAt = now();
   const claimed = await runs
     .updateOne(
       { _id: new ObjectId(runId), status: "awaiting_input" },
-      { $set: { status: "running", startedAt: now() } },
+      {
+        $set: {
+          status: "running",
+          startedAt: answeredAt,
+          "exchanges.$[open].answer": answer,
+          "exchanges.$[open].answeredAt": answeredAt,
+        },
+      },
+      { arrayFilters: [{ "open.answer": null }] },
     )
     .catch(async () => {
       await restoreParkedResume(database, run, runId, run.awaitingQuestion);
