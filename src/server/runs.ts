@@ -34,6 +34,7 @@ export const RunDTOSchema = z
     summary: z.string().nullable(),
     awaitingQuestion: z.string().nullable(),
     exchanges: z.array(InputExchangeSchema),
+    exchangesDropped: z.number().int().nonnegative(),
     queuedAt: timestamp,
     startedAt: timestamp.nullable(),
     finishedAt: timestamp.nullable(),

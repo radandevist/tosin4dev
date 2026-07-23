@@ -67,6 +67,12 @@ export function formatRunTimestamp(iso: string): string {
   return `${iso.slice(0, 16).replace("T", " ")} UTC`;
 }
 
+// Deliberately independent of `exchanges`: runs parked before exchange history
+// existed have none and must remain answerable.
+export function shouldShowAnswerForm(parkedRun: RunDTO | undefined): boolean {
+  return parkedRun !== undefined;
+}
+
 export function answeredExchanges(
   exchanges: InputExchange[],
 ): InputExchange[] {
