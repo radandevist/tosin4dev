@@ -207,7 +207,7 @@ export async function startChatTurn(
   }
   const workingDirectory =
     sessionKind === "consultation"
-      ? `${board.repoPath}/.tosin4dev/runs/${doc.runId}/consult`
+      ? `${board.repoPath}/.tosin4dev/consult/${sessionId}`
       : board.repoPath;
   const providerText =
     sessionKind === "consultation" && doc.sessionId === null

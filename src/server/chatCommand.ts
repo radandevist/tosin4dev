@@ -9,6 +9,9 @@ export function buildChatCommand(
   kind: "brainstorm" | "consultation",
 ): string[] {
   if (provider === "codex") {
+    // codex read-only still permits file reads; unlike claude we cannot disable
+    // Read here, so a codex consultant can read (and thus echo) on-disk run
+    // artifacts — residual accepted, flagged for owner.
     const root = ["codex", "-C", repoPath, "-s", "read-only", "exec"];
     const resume = sessionId ? ["resume", sessionId] : [];
     return [...root, ...resume, "--json", text];
@@ -17,7 +20,18 @@ export function buildChatCommand(
   // Verified locally on 2026-07-23: `claude --help` exposes the variadic
   // `--disallowedTools` flag.
   if (kind === "consultation") {
-    cmd.push("--disallowedTools", "Edit", "Write", "NotebookEdit", "Bash");
+    cmd.push(
+      "--disallowedTools",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "Bash",
+      "Read",
+      "Grep",
+      "Glob",
+      "WebFetch",
+      "WebSearch",
+    );
   }
   if (sessionId) cmd.push("--resume", sessionId);
   return cmd;

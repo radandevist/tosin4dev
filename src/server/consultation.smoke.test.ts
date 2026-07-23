@@ -236,12 +236,13 @@ describe("consultation sessions", () => {
     expect(session.messages[0].text).toContain("[REDACTED]");
   });
 
-  it("spawns in an empty run scratch directory, never the board repo", async () => {
+  it("spawns in an empty consultation scratch directory outside the run", async () => {
     const runId = await insertRun();
     const captureFile = join(repoPath, `consult-cwd-${runId}.txt`);
     process.env.T4D_CONSULT_CWD_CAPTURE = captureFile;
     const { id } = await createConsultationSessionCore({ runId });
-    const scratchDir = join(repoPath, ".tosin4dev", "runs", runId, "consult");
+    const scratchDir = join(repoPath, ".tosin4dev", "consult", id);
+    const runDir = join(repoPath, ".tosin4dev", "runs", runId);
 
     await sendChatMessageCore({ sessionId: id, text: "Help me decide" });
     const session = await waitForSettled(id);
@@ -249,6 +250,7 @@ describe("consultation sessions", () => {
     expect(session.turnStatus).toBe("idle");
     expect((await readFile(captureFile, "utf8")).trim()).toBe(scratchDir);
     expect(scratchDir).not.toBe(repoPath);
+    expect(scratchDir.startsWith(`${runDir}/`)).toBe(false);
     expect(await readdir(scratchDir)).toEqual([]);
   });
 
