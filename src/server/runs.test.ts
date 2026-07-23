@@ -80,6 +80,7 @@ describe("run browser contracts", () => {
       exitCode: null,
       summary: null,
       awaitingQuestion: null,
+      exchanges: [],
       queuedAt: timestamp,
       startedAt: timestamp,
       finishedAt: null,

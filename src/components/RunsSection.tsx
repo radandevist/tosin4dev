@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import type { HandoffBrief } from "../domain/schemas";
 import { useDispatch, useLogTail, useRuns } from "../queries/runs";
 import {
   useDependencyStatus,
@@ -10,9 +11,11 @@ import {
 import type { RunDTO } from "../server/runs";
 import type { TicketDTO } from "../server/tickets";
 import {
+  answeredExchanges,
   dispatchActionForTicket,
   formatRunTimestamp,
   isTicketAdvancingRunStatus,
+  openExchange,
   shouldPollLog,
   shouldPollRun,
 } from "./runsUi";
@@ -61,6 +64,8 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
             run._id === ticket.activeRunId && run.status === "awaiting_input",
         )
       : undefined;
+  const answered = parkedRun ? answeredExchanges(parkedRun.exchanges) : [];
+  const open = parkedRun ? openExchange(parkedRun.exchanges) : null;
   const selectedRun = runs.data?.find((run) => run._id === openRunId);
   const log = useLogTail({
     variables: { runId: openRunId ?? EMPTY_RUN_ID },
@@ -210,47 +215,73 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
       ) : null}
 
       {parkedRun ? (
-        <form
-          className="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            submitInput();
-          }}
-        >
-          <div className="space-y-1">
-            <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
-              Input needed
-            </p>
-            <p className="text-sm text-zinc-800">
-              {parkedRun.awaitingQuestion}
-            </p>
-          </div>
-          <label
-            htmlFor={`run-answer-${parkedRun._id}`}
-            className="block text-xs font-medium text-zinc-600"
-          >
-            Your answer
-          </label>
-          <textarea
-            id={`run-answer-${parkedRun._id}`}
-            value={answer}
-            onChange={(event) => setAnswer(event.target.value)}
-            rows={3}
-            className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
-          />
-          <button
-            type="submit"
-            disabled={provideInput.isPending || answer.trim().length === 0}
-            className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {provideInput.isPending ? "Submitting…" : "Provide input"}
-          </button>
-          {provideInput.isError ? (
-            <p role="alert" className="text-sm text-rose-600">
-              Could not provide input: {provideInput.error.message}
-            </p>
+        <div className="space-y-3">
+          {answered.length > 0 ? (
+            <ol className="space-y-2">
+              {answered.map((exchange, index) => (
+                <li
+                  key={`${exchange.at}-${index}`}
+                  className="space-y-1 rounded-lg border border-zinc-200 bg-white p-3"
+                >
+                  <p className="text-sm font-medium text-zinc-800">
+                    {exchange.question}
+                  </p>
+                  <p className="text-sm text-zinc-600">{exchange.answer}</p>
+                  <time
+                    dateTime={exchange.answeredAt ?? exchange.at}
+                    className="block text-xs text-zinc-400"
+                  >
+                    {formatRunTimestamp(exchange.answeredAt ?? exchange.at)}
+                  </time>
+                </li>
+              ))}
+            </ol>
           ) : null}
-        </form>
+
+          {open?.handoff ? <HandoffDetails handoff={open.handoff} /> : null}
+
+          <form
+            className="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
+            onSubmit={(event) => {
+              event.preventDefault();
+              submitInput();
+            }}
+          >
+            <div className="space-y-1">
+              <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                Input needed
+              </p>
+              <p className="text-sm text-zinc-800">
+                {parkedRun.awaitingQuestion}
+              </p>
+            </div>
+            <label
+              htmlFor={`run-answer-${parkedRun._id}`}
+              className="block text-xs font-medium text-zinc-600"
+            >
+              Your answer
+            </label>
+            <textarea
+              id={`run-answer-${parkedRun._id}`}
+              value={answer}
+              onChange={(event) => setAnswer(event.target.value)}
+              rows={3}
+              className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
+            />
+            <button
+              type="submit"
+              disabled={provideInput.isPending || answer.trim().length === 0}
+              className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {provideInput.isPending ? "Submitting…" : "Provide input"}
+            </button>
+            {provideInput.isError ? (
+              <p role="alert" className="text-sm text-rose-600">
+                Could not provide input: {provideInput.error.message}
+              </p>
+            ) : null}
+          </form>
+        </div>
       ) : null}
 
       {runs.isPending ? (
@@ -298,6 +329,50 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
         </div>
       ) : null}
     </section>
+  );
+}
+
+function HandoffDetails({ handoff }: { handoff: HandoffBrief }) {
+  const fields = [
+    { label: "Work done", values: [handoff.workDone] },
+    { label: "Files touched", values: handoff.filesTouched },
+    { label: "Commands run", values: handoff.commandsRun },
+    { label: "Decision", values: [handoff.decision] },
+    { label: "Options", values: handoff.options },
+    { label: "Risk", values: [handoff.risk] },
+  ]
+    .map((field) => ({
+      ...field,
+      values: field.values.filter((value) => value.trim().length > 0),
+    }))
+    .filter((field) => field.values.length > 0);
+
+  return (
+    <details className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 text-sm">
+      <summary className="cursor-pointer font-medium text-zinc-700">
+        What the run did
+      </summary>
+      <dl className="mt-3 space-y-2">
+        {fields.map((field) => (
+          <div key={field.label}>
+            <dt className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+              {field.label}
+            </dt>
+            <dd className="mt-0.5 text-zinc-700">
+              {field.values.length === 1 ? (
+                field.values[0]
+              ) : (
+                <ul className="list-disc space-y-0.5 pl-5">
+                  {field.values.map((value, index) => (
+                    <li key={`${value}-${index}`}>{value}</li>
+                  ))}
+                </ul>
+              )}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </details>
   );
 }
 
