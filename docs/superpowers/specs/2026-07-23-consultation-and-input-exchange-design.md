@@ -212,6 +212,28 @@ exactly as wide as its justification and buys a useful invariant:
 `completed` or `failed` outcome could carry a handoff, and downstream code that
 reasonably reads `if (outcome.handoff)` as "this run is parked" would be wrong.
 
+**A dropped row must be visible.** Row-by-row tolerance means an unparseable row
+is skipped — which is the right availability choice, but skipping it *silently*
+reintroduces the failure this design rejected `.catch([])` for, just at a smaller
+scale. The human at the approval gate reads this thread to decide what to answer
+**next**; if an earlier round trip established a constraint and that row vanishes
+without a seam, they answer without it and can contradict a decision the agent
+already acted on. The trigger is ordinary, not exotic: both `InputExchangeSchema`
+and `HandoffBriefSchema` are `.strict()`, so *any* unknown key drops a row — a
+partial deploy, a rollback after a field addition, or the eventual v2.
+
+So `toDTO` counts the failures into `exchangesDropped`, and the UI renders a
+one-line marker when it is non-zero. A visible gap beats an invisible one.
+
+**Task 9 must read the same filtered view.** `buildRunContext` assembles the
+package a consulting AI reads. Every other production read goes straight from
+`find`/`findOne` to use — if the context builder does the same, the consultant
+sees the **raw** rows while the human sees the **filtered** ones. That divergence
+is worse than either view alone: the two parties to the same decision would be
+reasoning from different histories. The builder must consume the same
+row-tolerant projection (and inherit the dropped-row count) rather than
+re-reading the array itself.
+
 **Version the exchange record, and tolerate rows individually.** `v` is
 `z.literal(1)` deliberately — widening it to `z.number()` would silently
 reinterpret a future v2 row as v1, which is the failure the field exists to
