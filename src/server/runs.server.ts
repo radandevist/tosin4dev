@@ -30,6 +30,7 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     workDir,
     promptFile,
     logFile,
+    stderrFile,
     pid,
     exitCode,
     summary,
@@ -48,6 +49,7 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     workDir,
     promptFile,
     logFile,
+    stderrFile,
     pid,
     exitCode,
     summary,
@@ -94,6 +96,8 @@ export async function readLogTail(
   }
 }
 
+export const STDERR_DELIMITER = "──── stderr ────";
+
 export async function logTailCore(
   input: LogTailInput,
 ): Promise<{ text: string }> {
@@ -103,5 +107,14 @@ export async function logTailCore(
   if (!run) {
     throw new ServerResultError("not_found", `run not found: ${input.runId}`);
   }
-  return { text: await readLogTail(run.logFile, input.bytes) };
+  // Split the caller's byte budget so `bytes` stays an honest ceiling.
+  const half = Math.floor(input.bytes / 2);
+  const stdout = await readLogTail(
+    run.logFile,
+    run.stderrFile ? half : input.bytes,
+  );
+  if (!run.stderrFile) return { text: stdout };
+  const stderr = await readLogTail(run.stderrFile, half);
+  if (!stderr) return { text: stdout };
+  return { text: `${stdout}\n${STDERR_DELIMITER}\n${stderr}` };
 }

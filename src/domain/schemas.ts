@@ -140,6 +140,10 @@ export const RunSchema = z.object({
   workDir: AbsolutePathString,
   promptFile: AbsolutePathString,
   logFile: AbsolutePathString,
+  // stdout only, since v5. stderr goes to stderrFile so JSONL framing in
+  // logFile is not torn by interleaved writes. null for runs created before
+  // the split.
+  stderrFile: AbsolutePathString.nullable().default(null),
   exitCode: z.number().int().nullable().default(null),
   summary: z.string().nullable().default(null),
   // Execution worktree branch + its base commit. spec_draft runs work in the
