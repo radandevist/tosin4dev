@@ -14,6 +14,7 @@ import {
   logTailCore,
   turnTailCore,
 } from "./runs.server";
+import { continueExecution as continueExecutionCore } from "./supervisor.server";
 import { boundary, type ServerResult } from "./result";
 
 const timestamp = z.string().datetime();
@@ -24,7 +25,7 @@ export const RunTurnDTOSchema = z
     id: z.string().min(1),
     index: z.number().int().nonnegative(),
     at: timestamp,
-    kind: z.enum(["dispatch", "resume"]),
+    kind: z.enum(["dispatch", "resume", "continue"]),
     outcome: z
       .enum(["continued", "needs_input", "completed", "failed"])
       .nullable()
@@ -70,6 +71,14 @@ export const DispatchRunInputSchema = z
   .object({ ticketId: ObjectIdString, phase: RunPhase })
   .strict();
 export type DispatchRunInput = z.infer<typeof DispatchRunInputSchema>;
+
+export const ContinueExecutionInputSchema = z
+  .object({
+    runId: ObjectIdString,
+    message: z.string().min(1),
+  })
+  .strict();
+export type ContinueExecutionInput = z.infer<typeof ContinueExecutionInputSchema>;
 
 export const LogTailInputSchema = z
   .object({
@@ -121,4 +130,12 @@ export const turnTail = createServerFn({ method: "GET" })
   .handler(
     ({ data }): Promise<ServerResult<TurnTailResult>> =>
       boundary(TurnTailInputSchema, data, turnTailCore),
+  );
+
+export const continueExecution = createServerFn({ method: "POST" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<void>> =>
+    boundary(ContinueExecutionInputSchema, data, (input) =>
+      continueExecutionCore(input.runId, input.message),
+    ),
   );

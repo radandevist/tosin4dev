@@ -3,7 +3,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import type { HandoffBrief } from "../domain/schemas";
 import { useCreateConsultationSession } from "../queries/chat";
-import { useDispatch, useLogTail, useRuns } from "../queries/runs";
+import {
+  useContinueExecution,
+  useDispatch,
+  useLogTail,
+  useRuns,
+} from "../queries/runs";
 import {
   useDependencyStatus,
   useProvideInput,
@@ -35,9 +40,11 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
   });
   const dispatchRun = useDispatch();
   const provideInput = useProvideInput();
+  const continueExecution = useContinueExecution();
   const createConsultation = useCreateConsultationSession();
   const [openRunId, setOpenRunId] = useState<string | null>(null);
   const [answer, setAnswer] = useState("");
+  const [continueMessage, setContinueMessage] = useState("");
   const action = dispatchActionForTicket(
     ticket.status,
     ticket.runner,
@@ -194,6 +201,38 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
     );
   };
 
+  const submitContinue = () => {
+    const trimmedMessage = continueMessage.trim();
+    if (
+      !parkedRun ||
+      continueExecution.isPending ||
+      trimmedMessage.length === 0
+    )
+      return;
+    continueExecution.mutate(
+      { runId: parkedRun._id, message: trimmedMessage },
+      {
+        onSuccess: () => {
+          setContinueMessage("");
+          void Promise.all([
+            queryClient.invalidateQueries({
+              queryKey: useRuns.getKey({ ticketId: ticket._id }),
+            }),
+            queryClient.invalidateQueries({
+              queryKey: useTicket.getKey({
+                boardId: ticket.boardId,
+                seq: ticket.seq,
+              }),
+            }),
+            queryClient.invalidateQueries({
+              queryKey: useTickets.getKey({ boardId: ticket.boardId }),
+            }),
+          ]);
+        },
+      },
+    );
+  };
+
   const consult = () => {
     if (!parkedRun || createConsultation.isPending) return;
     createConsultation.mutate(
@@ -290,6 +329,27 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
 
           {open?.handoff ? <HandoffDetails handoff={open.handoff} /> : null}
 
+          {parkedRun.turns.length > 0 ? (
+            <div className="space-y-1">
+              <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                Turns
+              </p>
+              <ul className="space-y-1">
+                {parkedRun.turns.map((turn) => (
+                  <li
+                    key={turn.id}
+                    className="flex items-center gap-2 text-sm text-zinc-700"
+                  >
+                    <span className="font-mono text-xs">{turn.kind}</span>
+                    <span className="text-xs text-zinc-400">
+                      {turn.outcome === null ? "running" : turn.outcome}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
           {shouldShowAnswerForm(parkedRun) ? (
             <div className="space-y-2">
               <div className="flex items-start gap-2">
@@ -353,6 +413,57 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
               ) : null}
             </div>
           ) : null}
+
+          <div className="space-y-2 border-t border-zinc-200 pt-3">
+            <div className="space-y-1">
+              <p className="text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                Continue execution
+              </p>
+              <p className="text-sm text-zinc-600">
+                Resumes the live agent in the run's worktree. The consultation
+                above is advisory; this actually continues the run.
+              </p>
+            </div>
+            <form
+              className="space-y-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                submitContinue();
+              }}
+            >
+              <label
+                htmlFor={`run-continue-${parkedRun._id}`}
+                className="block text-xs font-medium text-zinc-600"
+              >
+                Message to the agent
+              </label>
+              <textarea
+                id={`run-continue-${parkedRun._id}`}
+                value={continueMessage}
+                onChange={(event) => setContinueMessage(event.target.value)}
+                rows={3}
+                className="block w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={
+                  continueExecution.isPending ||
+                  continueMessage.trim().length === 0
+                }
+                className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {continueExecution.isPending
+                  ? "Continuing…"
+                  : "Continue execution"}
+              </button>
+              {continueExecution.isError ? (
+                <p role="alert" className="text-sm text-rose-600">
+                  Could not continue execution:{" "}
+                  {continueExecution.error.message}
+                </p>
+              ) : null}
+            </form>
+          </div>
         </div>
       ) : null}
 

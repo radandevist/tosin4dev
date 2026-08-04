@@ -1,9 +1,11 @@
 import { createMutation, createQuery } from "react-query-kit";
 import {
+  continueExecution,
   dispatch,
   listRuns,
   logTail,
   turnTail,
+  type ContinueExecutionInput,
   type DispatchRunInput,
   type ListRunsInput,
   type LogTailVariables,
@@ -33,4 +35,12 @@ export const useLogTail = createQuery<{ text: string }, LogTailVariables>({
 export const useTurnTail = createQuery<TurnTailResult, TurnTailVariables>({
   queryKey: ["turnTail"],
   fetcher: (variables) => turnTail({ data: variables }).then(unwrapResult),
+});
+
+export const useContinueExecution = createMutation<
+  void,
+  ContinueExecutionInput
+>({
+  mutationFn: (variables) =>
+    continueExecution({ data: variables }).then(unwrapResult),
 });
