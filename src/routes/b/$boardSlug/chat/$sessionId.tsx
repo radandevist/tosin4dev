@@ -129,7 +129,7 @@ function ChatBody({
     );
   };
 
-  const useAsAnswer = (answer: string) => {
+  const applyAsAnswer = (answer: string) => {
     if (session.runId === null || ticketSeq === undefined) return;
     window.sessionStorage.setItem(
       consultationAnswerStorageKey(session.runId),
@@ -173,7 +173,7 @@ function ChatBody({
                 <button
                   type="button"
                   disabled={session.runId === null || ticketSeq === undefined}
-                  onClick={() => useAsAnswer(message.text)}
+                  onClick={() => applyAsAnswer(message.text)}
                   className="mt-2 block rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Use as my answer
