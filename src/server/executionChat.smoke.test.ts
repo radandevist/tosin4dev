@@ -54,13 +54,17 @@ const timestamp = () => new Date().toISOString();
 // into the worktree (needed for the completed/verification path), and writes the
 // T4D_OUTCOME snippet to the outcome path when one is supplied. When T4D_OUTCOME
 // is absent it exits 0 writing no outcome.json — the `continued` case.
+// T4D_ROTATE_SESSION makes a continue turn report a DIFFERENT session id than
+// the dispatch turn, which is how the session-rotation guard is exercised.
 async function writeRunner(): Promise<void> {
   const executable = join(binDirectory, "claude");
   await writeFile(
     executable,
     `#!/bin/sh
 if [ -n "$T4D_ARGS_FILE" ]; then printf '%s\\n' "$@" > "$T4D_ARGS_FILE"; fi
-printf '%s\\n' '{"type":"result","session_id":"s-smoke","result":"ok"}'
+SESSION=s-smoke
+if [ -n "$T4D_ROTATE_SESSION" ]; then SESSION=s-continue; fi
+printf '%s\\n' "{\\"type\\":\\"result\\",\\"session_id\\":\\"$SESSION\\",\\"result\\":\\"ok\\"}"
 if [ -n "$T4D_MARKER" ]; then printf 'MARKER_%s\\n' "$T4D_MARKER"; fi
 printf 'noise before summary\\n'
 printf '%s\\n' '## SUMMARY'
@@ -160,10 +164,13 @@ async function parkRun(
   return { runId, ticketId, parked };
 }
 
-// Pause the first finishContinueTurn outcome write for the run. Mirror of the
-// needs-input suite's pauseNextResumeClaim, but targeting the `turns.$.outcome`
-// write that a stale turn would attempt.
-function pauseNextTurnOutcomeWrite(runId: string): {
+// Pause the first state-mutating write a resolving continue turn makes for the
+// run. A turn resolves via one of: the `turns.$.outcome` write, the lease
+// release (terminal outcomes), or the re-park (continued outcomes). Which one
+// comes first is a property of the code under test — pausing on whichever
+// arrives first lets a test move the lease / run / ticket underneath the turn
+// at the earliest point it touches state, before any guard has a chance to run.
+function pauseNextTurnResolution(runId: string): {
   reached: Promise<void>;
   release: () => void;
   spy: ReturnType<typeof vi.spyOn>;
@@ -189,11 +196,13 @@ function pauseNextTurnOutcomeWrite(runId: string): {
       const id = (filter as { _id?: { toString(): string } })._id;
       const set = (update as { $set?: Record<string, unknown> })
         .$set as Record<string, unknown> | undefined;
+      const isOutcomeWrite = typeof set?.["turns.$.outcome"] === "string";
+      const isLeaseMutation = set?.executionLeaseId === null;
       if (
         !paused &&
         this.collectionName === "runs" &&
         id?.toString() === runId &&
-        typeof set?.["turns.$.outcome"] === "string"
+        (isOutcomeWrite || isLeaseMutation)
       ) {
         paused = true;
         reachedResolve();
@@ -295,6 +304,7 @@ describe("continueExecution", () => {
     delete process.env.T4D_OUTCOME;
     delete process.env.T4D_MARKER;
     delete process.env.T4D_ARGS_FILE;
+    delete process.env.T4D_ROTATE_SESSION;
     await writeRunner();
     await tickets.deleteMany({});
     await runs.deleteMany({});
@@ -376,32 +386,49 @@ describe("continueExecution", () => {
     }, 20_000);
 
     it("does not let a turn that lost its lease write its outcome", async () => {
-      const { runId } = await parkRun(3);
-      process.env.T4D_OUTCOME = JSON.stringify({
-        outcome: "needs_input",
-        question: "Lost lease?",
-      });
+      const { runId, ticketId } = await parkRun(3);
+      process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
 
-      const pause = pauseNextTurnOutcomeWrite(runId);
+      const pause = pauseNextTurnResolution(runId);
       const continuePromise = continueExecution(runId, "stale write");
       await pause.reached;
       try {
-        // While the monitor is frozen at its outcome write, the run's lease
-        // moves underneath it — exactly the lost-lease condition.
+        // While the monitor is frozen at its first state write, the run's
+        // lease moves underneath it — exactly the lost-lease condition. With a
+        // `completed` outcome the stale turn would otherwise drive status,
+        // verdict, evidence and the ticket, so the assertions below prove the
+        // fencing held.
         await runs.updateOne(
           { _id: new ObjectId(runId) },
           { $set: { executionLeaseId: "someone-else-owns-the-run" } },
         );
         pause.release();
         await continuePromise;
+        // If the stale turn slipped through, its finishRun would terminalize
+        // (verify + succeed) in well under a second; give it a bounded window
+        // to do so, then assert it never happened.
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          const current = await runs.findOne({ _id: new ObjectId(runId) });
+          if (current?.status === "succeeded" || current?.status === "failed") {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
       } finally {
         pause.release();
         pause.spy.mockRestore();
       }
 
-      const run = await waitForRun(runId, "awaiting_input");
-      const turn = run.turns.find((t) => t.kind === "continue");
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      const turn = run?.turns.find((t) => t.kind === "continue");
       expect(turn?.outcome).toBeNull();
+      expect(run?.verdict).toBeNull();
+      expect(run?.finishedAt).toBeNull();
+      expect(run?.status).not.toBe("succeeded");
+      expect(run?.status).not.toBe("failed");
+      const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+      expect(ticket?.status).not.toBe("review_ready");
     }, 20_000);
   });
 
@@ -488,11 +515,12 @@ describe("continueExecution", () => {
       process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
       await continueExecution(runId, "finish it");
       await waitForRun(runId, "succeeded");
-
-      const run = await runs.findOne({ _id: new ObjectId(runId) });
-      const turn = run?.turns.find((candidate) => candidate.kind === "continue");
+      // The declared outcome is published only after the state it implies is
+      // durable, so synchronize on the turn's resolved outcome too.
+      const run = await waitForContinueTurn(runId, 1);
+      const turn = run.turns.find((candidate) => candidate.kind === "continue");
       expect(turn?.outcome).toBe("completed");
-      expect(run?.verdict).toBe("passed");
+      expect(run.verdict).toBe("passed");
     }, 20_000);
 
     it("records needs_input on the turn and re-parks", async () => {
@@ -558,7 +586,10 @@ describe("continueExecution", () => {
       const { runId, ticketId } = await parkRun(11);
       process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
       await continueExecution(runId, "done");
-      const run = await waitForRun(runId, "succeeded");
+      await waitForRun(runId, "succeeded");
+      // The declared outcome is published only after the state it implies is
+      // durable, so synchronize on the turn's resolved outcome too.
+      const run = await waitForContinueTurn(runId, 1);
       const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
 
       expect(ticket?.status).toBe("review_ready");
@@ -650,6 +681,149 @@ describe("continueExecution", () => {
       expect(leaseless?.status).toBe("failed");
       expect(leaseless?.executionLeaseId).toBeNull();
       expect(leaseless?.executionLeaseExpiresAt).toBeNull();
+    }, 20_000);
+  });
+
+  describe("continue-turn guards", () => {
+    it("persists the operator's continue message into the open exchange row", async () => {
+      const { runId, parked } = await parkRun(15);
+      const openBefore = (parked.exchanges ?? []).filter(
+        (exchange) => exchange.answer === null,
+      );
+      expect(openBefore).toHaveLength(1);
+
+      process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+      await continueExecution(runId, "continue-with-this-message");
+      await waitForRun(runId, "succeeded");
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      const answered = (run?.exchanges ?? []).filter(
+        (exchange) => exchange.answer === "continue-with-this-message",
+      );
+      expect(answered).toHaveLength(1);
+      expect(answered[0]?.answeredAt).not.toBeNull();
+    }, 20_000);
+
+    it("keeps exactly one open exchange row across continued and needs_input turns", async () => {
+      const { runId } = await parkRun(16);
+      const openCount = async (): Promise<number> => {
+        const run = await runs.findOne({ _id: new ObjectId(runId) });
+        return (run?.exchanges ?? []).filter(
+          (exchange) => exchange.answer === null,
+        ).length;
+      };
+      expect(await openCount()).toBe(1);
+
+      delete process.env.T4D_OUTCOME;
+      await continueExecution(runId, "continue one");
+      await waitForRun(runId, "awaiting_input");
+      const first = await waitForContinueTurn(runId, 1);
+      expect(first.turns.filter((turn) => turn.kind === "continue")).toHaveLength(
+        1,
+      );
+      expect(await openCount()).toBe(1);
+
+      process.env.T4D_OUTCOME = JSON.stringify({
+        outcome: "needs_input",
+        question: "Round again?",
+      });
+      await continueExecution(runId, "continue two");
+      await waitForRun(runId, "awaiting_input");
+      const second = await waitForContinueTurn(runId, 2);
+      expect(
+        second.turns.filter((turn) => turn.kind === "continue"),
+      ).toHaveLength(2);
+      expect(await openCount()).toBe(1);
+    }, 20_000);
+
+    it("never leaves awaitingQuestion blank after a continued re-park", async () => {
+      const { runId } = await parkRun(17);
+      delete process.env.T4D_OUTCOME;
+      await continueExecution(runId, "keep going");
+      const run = await waitForContinueTurn(runId, 1);
+      const open = (run.exchanges ?? []).filter(
+        (exchange) => exchange.answer === null,
+      );
+      expect(open).toHaveLength(1);
+      expect(run.awaitingQuestion).toBeTruthy();
+      expect(run.awaitingQuestion).toBe(open[0]?.question);
+    }, 20_000);
+
+    it("re-captures a rotated session id after a continued turn", async () => {
+      const { runId } = await parkRun(18);
+      // The fake runner reports a DIFFERENT session id on the continue turn;
+      // the re-park must re-capture it so the NEXT turn resumes THIS session.
+      process.env.T4D_ROTATE_SESSION = "1";
+      delete process.env.T4D_OUTCOME;
+      await continueExecution(runId, "rotate me");
+      const run = await waitForContinueTurn(runId, 1);
+      expect(run.executionSessionId).toBe("s-continue");
+    }, 20_000);
+
+    it("does not resurrect a run terminalized while its turn was in flight", async () => {
+      const { runId } = await parkRun(19);
+      delete process.env.T4D_OUTCOME;
+
+      const pause = pauseNextTurnResolution(runId);
+      const continuePromise = continueExecution(runId, "keep going");
+      await pause.reached;
+      try {
+        const at = timestamp();
+        await runs.updateOne(
+          { _id: new ObjectId(runId) },
+          { $set: { status: "failed", finishedAt: at } },
+        );
+        pause.release();
+        await continuePromise;
+        // The re-park guard must refuse the `status: "running"` term and leave
+        // the terminalized run alone; give a resurrecting re-park a bounded
+        // window to flip status before asserting it never did.
+        const deadline = Date.now() + 750;
+        while (Date.now() < deadline) {
+          const current = await runs.findOne({ _id: new ObjectId(runId) });
+          if (current?.status !== "failed") break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        pause.release();
+        pause.spy.mockRestore();
+      }
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      expect(run?.status).toBe("failed");
+      expect(run?.finishedAt).not.toBeNull();
+    }, 20_000);
+
+    it("clears activeRunId when the ticket moves underneath a continued turn", async () => {
+      const { runId, ticketId } = await parkRun(20);
+      delete process.env.T4D_OUTCOME;
+
+      const pause = pauseNextTurnResolution(runId);
+      const continuePromise = continueExecution(runId, "keep going");
+      await pause.reached;
+      try {
+        const at = timestamp();
+        await tickets.updateOne(
+          { _id: new ObjectId(ticketId) },
+          { $set: { status: "archived", updatedAt: at } },
+        );
+        pause.release();
+        await continuePromise;
+        // The ticket fallback must null the dangling activeRunId; poll until it
+        // lands (or the timeout elapses, meaning the bug left it dangling).
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+          const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+          if (ticket?.activeRunId === null) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        pause.release();
+        pause.spy.mockRestore();
+      }
+
+      const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+      expect(ticket?.activeRunId).toBeNull();
     }, 20_000);
   });
 });
