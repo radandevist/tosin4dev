@@ -178,17 +178,27 @@ export async function turnTailCore(
     throw new ServerResultError("not_found", `turn not found: ${input.turnId}`);
   }
   const file = input.stream === "stderr" ? turn.stderrFile : turn.stdoutFile;
-  const finished = run.status !== "running";
+  // `eof` is a property of the TURN, not the run. A turn with a declared outcome
+  // is over even while the run keeps going (a later turn), and a `queued` run has
+  // not written a byte yet — reporting eof there makes a client that stops polling
+  // on eof render an empty log for the entire run.
+  const finished =
+    turn.outcome !== null ||
+    (run.status !== "running" && run.status !== "queued");
 
   let handle;
   try {
     handle = await open(file, "r");
     const { size } = await handle.stat();
-    // Cursor beyond EOF: the file was truncated or rotated. Clamp nextCursor to
-    // the file size so the client's next poll starts from the new end instead
-    // of throwing.
-    if (input.cursor >= size) {
-      return { chunk: "", nextCursor: size, eof: finished };
+    // Cursor beyond EOF: the file was truncated or rotated. Restart from the top
+    // of the replacement rather than clamping to its size — clamping skips every
+    // byte written before the next poll. Turn files are append-only in practice,
+    // so this is a safety net; duplicate delivery beats silent loss for a log.
+    // Strictly GREATER, not >=: a cursor that has caught up exactly to the file
+    // size is a normal completed read, not a truncation — >= would rewind it to
+    // 0 and re-deliver the whole file on every poll.
+    if (input.cursor > size) {
+      return { chunk: "", nextCursor: 0, eof: finished };
     }
     const cursor = input.cursor;
     const length = Math.min(size - cursor, input.maxBytes);

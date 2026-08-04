@@ -1037,6 +1037,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
       index: (run.turns?.length ?? 0),
       at: now(),
       kind: "resume",
+      outcome: null,
       stdoutFile: resumeTurnPaths.stdoutFile,
       stderrFile: resumeTurnPaths.stderrFile,
     };
@@ -1194,6 +1195,7 @@ export async function dispatchRun(
     index: 0,
     at: now(),
     kind: "dispatch",
+    outcome: null,
     stdoutFile: dispatchTurnPaths.stdoutFile,
     stderrFile: dispatchTurnPaths.stderrFile,
   };

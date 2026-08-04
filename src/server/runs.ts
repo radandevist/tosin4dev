@@ -25,6 +25,10 @@ export const RunTurnDTOSchema = z
     index: z.number().int().nonnegative(),
     at: timestamp,
     kind: z.enum(["dispatch", "resume"]),
+    outcome: z
+      .enum(["continued", "needs_input", "completed", "failed"])
+      .nullable()
+      .default(null),
     stdoutFile: AbsolutePathString,
     stderrFile: AbsolutePathString,
   })
@@ -81,7 +85,10 @@ export const TurnTailInputSchema = z
     runId: ObjectIdString,
     turnId: z.string().min(1),
     cursor: z.number().int().nonnegative().default(0),
-    maxBytes: z.number().int().positive().max(100_000).default(20_000),
+    // Floor of 16: below ~4 bytes a window can be a single incomplete multi-byte
+    // sequence, and the UTF-8 trim-back would return an empty chunk without
+    // advancing the cursor — a permanent deadlock.
+    maxBytes: z.number().int().min(16).max(100_000).default(20_000),
     stream: z.enum(["stdout", "stderr"]).default("stdout"),
   })
   .strict();

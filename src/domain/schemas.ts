@@ -177,6 +177,12 @@ export const RunTurnSchema = z
     index: z.number().int().nonnegative(),
     at: z.string().datetime(),
     kind: z.enum(["dispatch", "resume"]),
+    // The terminal outcome of this turn, resolved after the process exits.
+    // null while the turn is running or for legacy dispatch/resume turns.
+    outcome: z
+      .enum(["continued", "needs_input", "completed", "failed"])
+      .nullable()
+      .default(null),
     stdoutFile: AbsolutePathString,
     stderrFile: AbsolutePathString,
   })

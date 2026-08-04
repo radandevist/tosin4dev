@@ -34,6 +34,8 @@ process.env.DISCORD_WEBHOOK_URL = "";
 const { db, closeDb, ObjectId } = await import("./db");
 const { turnTailCore } = await import("./runs.server");
 const { dispatchRun } = await import("./supervisor.server");
+const { boundary } = await import("./result");
+const { TurnTailInputSchema } = await import("./runs");
 
 let database: Db;
 let boards: Collection<BoardDoc>;
@@ -129,11 +131,21 @@ function tail(args: {
 
 // Insert a run whose single dispatch turn points at files we control, so the
 // cursor tests exercise turnTailCore directly without spawning processes.
+// `extraTurns` appends later turns (kind "resume") after turn 0, for tests that
+// need an earlier, already-finished turn while a later turn keeps the run
+// running. Returns every turn's id alongside turn 0's.
 async function insertTurnRun(params: {
   stdout: string;
   stderr?: string;
   status?: Run["status"];
-}): Promise<{ runId: string; turnId: string; stdoutFile: string }> {
+  outcome?: RunTurn["outcome"];
+  extraTurns?: Array<{ stdout: string; outcome?: RunTurn["outcome"] }>;
+}): Promise<{
+  runId: string;
+  turnId: string;
+  stdoutFile: string;
+  turnIds: string[];
+}> {
   const runId = new ObjectId().toString();
   const turnId = new ObjectId().toString();
   const runDir = join(repo, ".tosin4dev", "runs", runId);
@@ -152,9 +164,30 @@ async function insertTurnRun(params: {
     index: 0,
     at,
     kind: "dispatch",
+    outcome: params.outcome ?? null,
     stdoutFile,
     stderrFile,
   };
+  const extra: RunTurn[] = [];
+  for (const [index, spec] of (params.extraTurns ?? []).entries()) {
+    const extraTurnId = new ObjectId().toString();
+    const extraDir = join(runDir, "turns", extraTurnId);
+    const extraStdout = join(extraDir, "stdout.log");
+    const extraStderr = join(extraDir, "stderr.log");
+    await mkdir(extraDir, { recursive: true });
+    await Promise.all([writeFile(extraStdout, spec.stdout), writeFile(extraStderr, "")]);
+    extra.push({
+      v: 1,
+      id: extraTurnId,
+      index: index + 1,
+      at,
+      kind: "resume",
+      outcome: spec.outcome ?? null,
+      stdoutFile: extraStdout,
+      stderrFile: extraStderr,
+    });
+  }
+  const turns = [turn, ...extra];
   await runs.insertOne({
     _id: new ObjectId(runId),
     ticketId: new ObjectId().toString(),
@@ -176,12 +209,17 @@ async function insertTurnRun(params: {
     executionSessionId: null,
     awaitingQuestion: null,
     exchanges: [],
-    turns: [turn],
+    turns,
     queuedAt: at,
     startedAt: at,
     finishedAt: null,
   });
-  return { runId, turnId, stdoutFile };
+  return {
+    runId,
+    turnId,
+    stdoutFile,
+    turnIds: turns.map((t) => t.id),
+  };
 }
 
 describe("per-turn logs and cursor polling", () => {
@@ -487,7 +525,7 @@ describe("per-turn logs and cursor polling", () => {
     expect(pieces.join("")).toBe(content);
   });
 
-  it("clamps a cursor beyond EOF instead of throwing", async () => {
+  it("restarts from the top when a cursor is beyond EOF instead of throwing", async () => {
     const { runId, turnId, stdoutFile } = await insertTurnRun({
       stdout: "one\ntwo\n",
       status: "succeeded",
@@ -502,7 +540,7 @@ describe("per-turn logs and cursor polling", () => {
         stream: "stdout",
         maxBytes: 20_000,
       }),
-    ).toEqual({ chunk: "", nextCursor: size, eof: true });
+    ).toEqual({ chunk: "", nextCursor: 0, eof: true });
 
     const running = await insertTurnRun({
       stdout: "one\ntwo\n",
@@ -517,7 +555,87 @@ describe("per-turn logs and cursor polling", () => {
         stream: "stdout",
         maxBytes: 20_000,
       }),
-    ).toEqual({ chunk: "", nextCursor: runningSize, eof: false });
+    ).toEqual({ chunk: "", nextCursor: 0, eof: false });
+  });
+
+  it("does not report eof on a queued run whose turn has not started", async () => {
+    // dispatchRun persists turn 0 with empty files before spawning, while the
+    // run is still `queued`. Reporting eof here would make a client that stops
+    // polling on eof render an empty log for the entire run.
+    const { runId, turnId } = await insertTurnRun({
+      stdout: "",
+      status: "queued",
+    });
+
+    expect(await tail({ runId, turnId, cursor: 0 })).toEqual({
+      chunk: "",
+      nextCursor: 0,
+      eof: false,
+    });
+  });
+
+  it("reports eof on a finished earlier turn while a later turn keeps the run running", async () => {
+    // An earlier turn with a declared outcome is definitively over even though
+    // the run is `running` again because of a later turn; its eof must not wait
+    // for the whole run to terminate.
+    const { runId, turnIds } = await insertTurnRun({
+      stdout: "done\n",
+      status: "running",
+      outcome: "continued",
+      extraTurns: [{ stdout: "later\n" }],
+    });
+
+    expect(await tail({ runId, turnId: turnIds[0], cursor: 0 })).toEqual({
+      chunk: "done\n",
+      nextCursor: 5,
+      eof: true,
+    });
+  });
+
+  it("rejects a maxBytes below the 16-byte floor instead of deadlocking", async () => {
+    // The reviewer's repro: file "éX\n", maxBytes 1, cursor 0 returns an empty
+    // chunk with nextCursor === cursor forever, because the UTF-8 trim-back
+    // reduces the whole window to nothing. The schema now floors maxBytes at 16.
+    const { runId, turnId } = await insertTurnRun({
+      stdout: "éX\n",
+      status: "running",
+    });
+
+    const result = await boundary(
+      TurnTailInputSchema,
+      { runId, turnId, cursor: 0, maxBytes: 1, stream: "stdout" },
+      turnTailCore,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("invalid_input");
+  });
+
+  it("re-delivers a truncated file instead of skipping it forever", async () => {
+    const { runId, turnId, stdoutFile } = await insertTurnRun({
+      stdout: "aaaa\nbbbb\n",
+      status: "running",
+    });
+
+    expect(await tail({ runId, turnId, cursor: 0 })).toEqual({
+      chunk: "aaaa\nbbbb\n",
+      nextCursor: 10,
+      eof: false,
+    });
+
+    // The file is replaced by something shorter: cursor 10 is beyond the new
+    // size 3. Restart from the top so the replacement content is delivered,
+    // instead of clamping to size and skipping it forever.
+    await writeFile(stdoutFile, "cc\n");
+    expect(await tail({ runId, turnId, cursor: 10 })).toEqual({
+      chunk: "",
+      nextCursor: 0,
+      eof: false,
+    });
+    expect(await tail({ runId, turnId, cursor: 0 })).toEqual({
+      chunk: "cc\n",
+      nextCursor: 3,
+      eof: false,
+    });
   });
 
   it("returns not_found for an unknown runId or turnId", async () => {
