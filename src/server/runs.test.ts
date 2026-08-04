@@ -82,6 +82,7 @@ describe("run browser contracts", () => {
       awaitingQuestion: null,
       exchanges: [],
       exchangesDropped: 0,
+      turns: [],
       queuedAt: timestamp,
       startedAt: timestamp,
       finishedAt: null,

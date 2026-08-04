@@ -12,10 +12,24 @@ import {
   dispatchRunCore,
   listRunsCore,
   logTailCore,
+  turnTailCore,
 } from "./runs.server";
 import { boundary, type ServerResult } from "./result";
 
 const timestamp = z.string().datetime();
+
+export const RunTurnDTOSchema = z
+  .object({
+    v: z.literal(1),
+    id: z.string().min(1),
+    index: z.number().int().nonnegative(),
+    at: timestamp,
+    kind: z.enum(["dispatch", "resume"]),
+    stdoutFile: AbsolutePathString,
+    stderrFile: AbsolutePathString,
+  })
+  .strict();
+export type RunTurnDTO = z.infer<typeof RunTurnDTOSchema>;
 
 export const RunDTOSchema = z
   .object({
@@ -35,6 +49,7 @@ export const RunDTOSchema = z
     awaitingQuestion: z.string().nullable(),
     exchanges: z.array(InputExchangeSchema),
     exchangesDropped: z.number().int().nonnegative(),
+    turns: z.array(RunTurnDTOSchema).default([]),
     queuedAt: timestamp,
     startedAt: timestamp.nullable(),
     finishedAt: timestamp.nullable(),
@@ -61,6 +76,19 @@ export const LogTailInputSchema = z
 export type LogTailInput = z.infer<typeof LogTailInputSchema>;
 export type LogTailVariables = z.input<typeof LogTailInputSchema>;
 
+export const TurnTailInputSchema = z
+  .object({
+    runId: ObjectIdString,
+    turnId: z.string().min(1),
+    cursor: z.number().int().nonnegative().default(0),
+    maxBytes: z.number().int().positive().max(100_000).default(20_000),
+    stream: z.enum(["stdout", "stderr"]).default("stdout"),
+  })
+  .strict();
+export type TurnTailInput = z.infer<typeof TurnTailInputSchema>;
+export type TurnTailVariables = z.input<typeof TurnTailInputSchema>;
+export type TurnTailResult = { chunk: string; nextCursor: number; eof: boolean };
+
 const passthrough = (data: unknown): unknown => data;
 
 export const listRuns = createServerFn({ method: "GET" })
@@ -79,4 +107,11 @@ export const logTail = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ text: string }>> =>
     boundary(LogTailInputSchema, data, logTailCore),
+  );
+
+export const turnTail = createServerFn({ method: "GET" })
+  .validator(passthrough)
+  .handler(
+    ({ data }): Promise<ServerResult<TurnTailResult>> =>
+      boundary(TurnTailInputSchema, data, turnTailCore),
   );

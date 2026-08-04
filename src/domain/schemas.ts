@@ -164,6 +164,25 @@ export const InputExchangeSchema = z
   .strict();
 export type InputExchange = z.infer<typeof InputExchangeSchema>;
 
+// One dispatch-or-resume of a run. Each turn owns its own immutable id and its
+// own per-turn stdout/stderr files (additive cache on top of the run-level
+// logs, which keep receiving every byte). `index` is the turn's position in the
+// run's turns array. Defaults keep pre-existing documents hydrating.
+export const RunTurnSchema = z
+  .object({
+    v: z.literal(1),
+    // Immutable, unique within the run. Generated as a serialized ObjectId so
+    // turns are sortable by creation order without a separate timestamp sort.
+    id: z.string().min(1),
+    index: z.number().int().nonnegative(),
+    at: z.string().datetime(),
+    kind: z.enum(["dispatch", "resume"]),
+    stdoutFile: AbsolutePathString,
+    stderrFile: AbsolutePathString,
+  })
+  .strict();
+export type RunTurn = z.infer<typeof RunTurnSchema>;
+
 export const RunSchema = z.object({
   ticketId: ObjectIdString,
   boardId: ObjectIdString,
@@ -204,6 +223,8 @@ export const RunSchema = z.object({
   // Durable Q&A history. `awaitingQuestion` stays the denormalised OPEN
   // question (cleared on resume); this survives every round trip.
   exchanges: z.array(InputExchangeSchema).default([]),
+  // One record per dispatch or resume of this run. Immutable, append-only.
+  turns: z.array(RunTurnSchema).default([]),
 });
 export type Run = z.infer<typeof RunSchema>;
 

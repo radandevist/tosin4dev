@@ -17,6 +17,7 @@ import {
   type Board,
   type HandoffBrief,
   type Run,
+  type RunTurn,
   type Ticket,
 } from "../domain/schemas";
 import { transition } from "../domain/stateMachine";
@@ -57,6 +58,10 @@ const ACTIVITY_CAP = 50;
 // Bounded degradation (losing the oldest rows) is deliberately preferred over
 // an unreadable oversized run document that loses the entire exchange history.
 const EXCHANGE_CAP = 50;
+// Turns accumulate one row per dispatch/resume for the life of a run, so the
+// same bounded degradation applies: keep the newest turns rather than let a
+// long-lived run grow the document without limit.
+const TURN_CAP = 50;
 const questionOrFallback = (
   question: string | null | undefined,
   fallback: string,
@@ -173,6 +178,18 @@ function runPaths(board: Board, runId: string, phase: Phase) {
   };
 }
 
+// Per-turn log paths under <runDir>/turns/<turnId>. Turn ids are serialized
+// ObjectIds (`new ObjectId().toString()`), which are globally unique and sort
+// by creation order — never Math.random or Date.now.
+export function turnPaths(runDir: string, turnId: string) {
+  const turnDir = `${runDir}/turns/${turnId}`;
+  return {
+    turnDir,
+    stdoutFile: `${turnDir}/stdout.log`,
+    stderrFile: `${turnDir}/stderr.log`,
+  };
+}
+
 export function runBranchName(runId: string): string {
   return `tosin4dev/run/${runId}`;
 }
@@ -256,7 +273,7 @@ async function recordSetupFailure(
 
 export async function drainStream(
   stream: Readable,
-  logFile: string,
+  logFiles: string | string[],
   collect: boolean,
 ): Promise<string> {
   const decoder = new TextDecoder();
@@ -282,8 +299,14 @@ export async function drainStream(
       dropped = true;
     }
   };
+  const targets = Array.isArray(logFiles) ? logFiles : [logFiles];
   for await (const chunk of stream) {
-    await appendFile(logFile, chunk);
+    // Fan-out: append each chunk to EVERY target. Targets are awaited
+    // sequentially so bytes land in the same order within each file; a copy
+    // that lags never lets a later chunk overtake an earlier one.
+    for (const target of targets) {
+      await appendFile(target, chunk);
+    }
     if (collect) absorb(decoder.decode(chunk, { stream: true }));
   }
   if (collect) absorb(decoder.decode());
@@ -1003,6 +1026,24 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
     await rm(outcomePath, { force: true });
     await writeFile(run.promptFile, buildPrompt(brief));
 
+    // Record the resume turn before spawning: index continues where the run's
+    // turn history left off. Persist via $push so dispatch turn 0 (inserted
+    // with the run) is never disturbed.
+    const resumeTurnId = new ObjectId().toString();
+    const resumeTurnPaths = turnPaths(runDir, resumeTurnId);
+    const resumeTurn: RunTurn = {
+      v: 1,
+      id: resumeTurnId,
+      index: (run.turns?.length ?? 0),
+      at: now(),
+      kind: "resume",
+      stdoutFile: resumeTurnPaths.stdoutFile,
+      stderrFile: resumeTurnPaths.stderrFile,
+    };
+    await mkdir(resumeTurnPaths.turnDir, { recursive: true });
+    await writeFile(resumeTurn.stdoutFile, "");
+    await writeFile(resumeTurn.stderrFile, "");
+
     const command = adapters[run.runner].buildCommand(brief, run.promptFile);
     const spawnedChild = spawn(command.cmd[0], command.cmd.slice(1), {
       cwd: run.workDir,
@@ -1015,10 +1056,14 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
     });
     child = spawnedChild;
     runningChild = {
-      stdout: drainStream(spawnedChild.stdout, run.logFile, true),
+      stdout: drainStream(
+        spawnedChild.stdout,
+        [run.logFile, resumeTurn.stdoutFile],
+        true,
+      ),
       stderr: drainStream(
         spawnedChild.stderr,
-        run.stderrFile ?? run.logFile,
+        [run.stderrFile ?? run.logFile, resumeTurn.stderrFile],
         false,
       ),
       exited: settledExit(spawnedChild),
@@ -1032,7 +1077,15 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
 
     const runStarted = await runs.updateOne(
       { _id: new ObjectId(runId), status: "running" },
-      { $set: { pid: spawnedChild.pid, awaitingQuestion: null } },
+      {
+        $set: { pid: spawnedChild.pid, awaitingQuestion: null },
+        $push: {
+          turns: {
+            $each: [resumeTurn],
+            $slice: -TURN_CAP,
+          },
+        },
+      },
     );
     if (runStarted.matchedCount === 0) {
       throw new ServerResultError("conflict", "run left running");
@@ -1130,6 +1183,20 @@ export async function dispatchRun(
   const board = BoardSchema.parse(rawBoard);
   const runId = new ObjectId().toString();
   const paths = runPaths(board, runId, phase);
+  // Turn 0: the dispatch turn. Id is an ObjectId so it is unique within the
+  // run and sorts by creation order. Persisted with the run so the record and
+  // its (empty) per-turn files exist before the first byte is drained.
+  const dispatchTurnId = new ObjectId().toString();
+  const dispatchTurnPaths = turnPaths(paths.runDir, dispatchTurnId);
+  const dispatchTurn: RunTurn = {
+    v: 1,
+    id: dispatchTurnId,
+    index: 0,
+    at: now(),
+    kind: "dispatch",
+    stdoutFile: dispatchTurnPaths.stdoutFile,
+    stderrFile: dispatchTurnPaths.stderrFile,
+  };
   const claimAt = now();
   const claim = await ticketCollection.updateOne(
     {
@@ -1173,6 +1240,7 @@ export async function dispatchRun(
     executionSessionId: null,
     awaitingQuestion: null,
     exchanges: [],
+    turns: [dispatchTurn],
     queuedAt: claimAt,
     startedAt: null,
     finishedAt: null,
@@ -1194,6 +1262,9 @@ export async function dispatchRun(
   let runningChild: RunningChild | undefined;
   try {
     await mkdir(paths.runDir, { recursive: true });
+    await mkdir(dispatchTurnPaths.turnDir, { recursive: true });
+    await writeFile(dispatchTurn.stdoutFile, "");
+    await writeFile(dispatchTurn.stderrFile, "");
     if (phase !== "spec_draft") {
       await mkdir(`${board.repoPath}/.tosin4dev/worktrees`, { recursive: true });
       const created = await createRunBranch(
@@ -1234,8 +1305,16 @@ export async function dispatchRun(
     });
     child = spawnedChild;
     runningChild = {
-      stdout: drainStream(spawnedChild.stdout, paths.logFile, true),
-      stderr: drainStream(spawnedChild.stderr, paths.stderrFile, false),
+      stdout: drainStream(
+        spawnedChild.stdout,
+        [paths.logFile, dispatchTurn.stdoutFile],
+        true,
+      ),
+      stderr: drainStream(
+        spawnedChild.stderr,
+        [paths.stderrFile, dispatchTurn.stderrFile],
+        false,
+      ),
       exited: settledExit(spawnedChild),
     };
     void Promise.all([
