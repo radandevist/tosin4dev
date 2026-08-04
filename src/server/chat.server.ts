@@ -211,7 +211,16 @@ export async function startChatTurn(
       : board.repoPath;
   const providerText =
     sessionKind === "consultation" && doc.sessionId === null
-      ? [doc.messages[0]?.text, text].filter(Boolean).join("\n\n")
+      ? [
+          doc.messages[0]?.text,
+          ...doc.messages.slice(1).map(
+            (message) =>
+              `${message.role === "assistant" ? "Assistant" : "User"}:\n${message.text}`,
+          ),
+          text,
+        ]
+          .filter(Boolean)
+          .join("\n\n")
       : text;
 
   const claim = await coll.updateOne(
@@ -326,6 +335,8 @@ export function chatToDTO(doc: WithId<ChatSessionDoc>): ChatSessionDTO {
     turnError: doc.turnError,
     messages: doc.messages,
     bundleId: doc.bundleId,
+    forkedFromSessionId: doc.forkedFromSessionId ?? null,
+    forkedAtMessageCount: doc.forkedAtMessageCount ?? null,
   });
   return ChatSessionDTOSchema.parse({
     _id: doc._id.toString(),
@@ -339,6 +350,8 @@ export function chatToDTO(doc: WithId<ChatSessionDoc>): ChatSessionDTO {
     turnError: validated.turnError,
     messages: validated.messages,
     bundleId: validated.bundleId,
+    forkedFromSessionId: validated.forkedFromSessionId,
+    forkedAtMessageCount: validated.forkedAtMessageCount,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   });
@@ -380,6 +393,8 @@ export async function createChatSessionCore(input: {
     turnError: null,
     messages: [],
     bundleId: null,
+    forkedFromSessionId: null,
+    forkedAtMessageCount: null,
     createdAt: at,
     updatedAt: at,
     pid: null,
@@ -420,6 +435,62 @@ export async function createConsultationSessionCore(input: {
     turnError: null,
     messages: [{ role: "user", text: context.text, at }],
     bundleId: null,
+    forkedFromSessionId: null,
+    forkedAtMessageCount: null,
+    createdAt: at,
+    updatedAt: at,
+    pid: null,
+    logFile: null,
+    pendingKind: null,
+    pendingUserMessageAt: null,
+  };
+  const result = await coll.insertOne(doc);
+  return { id: result.insertedId.toString() };
+}
+
+export async function forkConsultationSessionCore(input: {
+  sessionId: string;
+  throughMessageCount?: number;
+}): Promise<{ id: string }> {
+  const coll = await chatSessions();
+  const source = await coll.findOne({ _id: new ObjectId(input.sessionId) });
+  if (!source) {
+    throw new ServerResultError(
+      "not_found",
+      `chat session not found: ${input.sessionId}`,
+    );
+  }
+  if ((source.kind ?? "brainstorm") !== "consultation") {
+    throw new ServerResultError(
+      "conflict",
+      "only consultation sessions can be forked",
+    );
+  }
+  if (source.turnStatus === "pending") {
+    throw new ServerResultError(
+      "conflict",
+      "cannot fork a consultation while a turn is in progress",
+    );
+  }
+  const count =
+    input.throughMessageCount === undefined
+      ? source.messages.length
+      : input.throughMessageCount;
+  const clamped = Math.min(Math.max(count, 1), source.messages.length);
+  const at = now();
+  const doc: ChatSessionDoc = {
+    boardId: source.boardId,
+    kind: "consultation",
+    runId: source.runId,
+    provider: source.provider,
+    sessionId: null,
+    status: "active",
+    turnStatus: "idle",
+    turnError: null,
+    messages: source.messages.slice(0, clamped),
+    bundleId: null,
+    forkedFromSessionId: source._id.toString(),
+    forkedAtMessageCount: clamped,
     createdAt: at,
     updatedAt: at,
     pid: null,
