@@ -1,4 +1,8 @@
-import { defineConfig } from 'vite'
+// defineConfig comes from vitest/config, not vite, so the `test` block below is
+// typed. Keeping the test config HERE rather than in a separate vitest.config.ts
+// is deliberate: vitest prefers vitest.config.ts and does not merge vite.config.ts
+// into it, so a split file would silently drop the resolver and plugins below.
+import { defineConfig } from 'vitest/config'
 import { devtools } from '@tanstack/devtools-vite'
 
 import { tanstackStart } from '@tanstack/react-start/plugin/vite'
@@ -17,6 +21,15 @@ const config = defineConfig({
     strictPort: true,
   },
   plugins: [devtools(), tailwindcss(), tanstackStart(), viteReact()],
+  test: {
+    // The server smoke tests each connect a MongoClient and spawn git
+    // subprocesses. Run files serially and allow 60s: under the default
+    // parallel forks + 10s hookTimeout the suite failed nondeterministically
+    // (13/4/10 files across three consecutive runs) purely from contention.
+    fileParallelism: false,
+    hookTimeout: 60_000,
+    testTimeout: 60_000,
+  },
 })
 
 export default config
