@@ -3,10 +3,13 @@ import {
   dispatch,
   listRuns,
   logTail,
+  turnTail,
   type DispatchRunInput,
   type ListRunsInput,
   type LogTailVariables,
   type RunDTO,
+  type TurnTailResult,
+  type TurnTailVariables,
 } from "../server/runs";
 import { unwrapResult } from "../server/result";
 
@@ -25,4 +28,9 @@ export const useDispatch = createMutation<
 export const useLogTail = createQuery<{ text: string }, LogTailVariables>({
   queryKey: ["logTail"],
   fetcher: (variables) => logTail({ data: variables }).then(unwrapResult),
+});
+
+export const useTurnTail = createQuery<TurnTailResult, TurnTailVariables>({
+  queryKey: ["turnTail"],
+  fetcher: (variables) => turnTail({ data: variables }).then(unwrapResult),
 });

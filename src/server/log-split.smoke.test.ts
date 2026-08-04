@@ -67,6 +67,7 @@ function runDocument(
     executionSessionId: null,
     awaitingQuestion: null,
     exchanges: [],
+    turns: [],
     queuedAt: at,
     startedAt: at,
     finishedAt: at,
