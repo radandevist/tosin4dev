@@ -8,6 +8,7 @@ import {
 import {
   createChatSessionCore,
   createConsultationSessionCore,
+  forkConsultationSessionCore,
   getChatSessionCore,
   proposeBundleFromChatCore,
   sendChatMessageCore,
@@ -32,6 +33,8 @@ export const ChatSessionDTOSchema = z
     turnError: z.string().nullable(),
     messages: z.array(ChatMessageSchema),
     bundleId: ObjectIdString.nullable(),
+    forkedFromSessionId: ObjectIdString.nullable(),
+    forkedAtMessageCount: z.number().int().nonnegative().nullable(),
     createdAt: timestamp,
     updatedAt: timestamp,
   })
@@ -70,6 +73,16 @@ export type SendChatMessageInput = z.infer<
   typeof SendChatMessageInputSchema
 >;
 
+export const ForkConsultationSessionInputSchema = z
+  .object({
+    sessionId: ObjectIdString,
+    throughMessageCount: z.number().int().positive().optional(),
+  })
+  .strict();
+export type ForkConsultationSessionInput = z.infer<
+  typeof ForkConsultationSessionInputSchema
+>;
+
 const passthrough = (data: unknown): unknown => data;
 
 export const createChatSession = createServerFn({ method: "POST" })
@@ -85,6 +98,16 @@ export const createConsultationSession = createServerFn({ method: "POST" })
       CreateConsultationSessionInputSchema,
       data,
       createConsultationSessionCore,
+    ),
+  );
+
+export const forkConsultationSession = createServerFn({ method: "POST" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
+    boundary(
+      ForkConsultationSessionInputSchema,
+      data,
+      forkConsultationSessionCore,
     ),
   );
 

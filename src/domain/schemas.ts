@@ -351,6 +351,8 @@ export const ChatSessionSchema = z.object({
   turnError: z.string().nullable().default(null),
   messages: z.array(ChatMessageSchema).default([]),
   bundleId: ObjectIdString.nullable().default(null),
+  forkedFromSessionId: ObjectIdString.nullable().default(null),
+  forkedAtMessageCount: z.number().int().nonnegative().nullable().default(null),
 });
 export type ChatSession = z.infer<typeof ChatSessionSchema>;
 

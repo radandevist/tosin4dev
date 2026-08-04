@@ -2,6 +2,7 @@ import { createMutation, createQuery } from "react-query-kit";
 import {
   createChatSession,
   createConsultationSession,
+  forkConsultationSession,
   getChatSession,
   proposeBundleFromChat,
   sendChatMessage,
@@ -9,6 +10,7 @@ import {
   type ChatSessionRef,
   type CreateChatSessionInput,
   type CreateConsultationSessionInput,
+  type ForkConsultationSessionInput,
   type SendChatMessageInput,
 } from "../server/chat";
 import { unwrapResult } from "../server/result";
@@ -39,6 +41,14 @@ export const useCreateConsultationSession = createMutation<
 >({
   mutationFn: (variables) =>
     createConsultationSession({ data: variables }).then(unwrapResult),
+});
+
+export const useForkConsultationSession = createMutation<
+  { id: string },
+  ForkConsultationSessionInput
+>({
+  mutationFn: (variables) =>
+    forkConsultationSession({ data: variables }).then(unwrapResult),
 });
 
 export const useSendChatMessage = createMutation<{ ok: true }, SendChatMessageInput>({
