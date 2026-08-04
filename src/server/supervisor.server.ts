@@ -1186,10 +1186,6 @@ async function finishContinueTurn(
   }
 
   const at = now();
-  await runs.updateOne(
-    { _id: new ObjectId(runId), executionLeaseId: leaseId, "turns.id": turnId },
-    { $set: { "turns.$.outcome": resolved } },
-  );
 
   if (!continued) {
     // Every terminal outcome hands off to finishRun, which owns all
@@ -1197,7 +1193,7 @@ async function finishContinueTurn(
     // lease live: a stale lease would reject the next continueExecution with
     // "run is already executing", breaking the back-and-forth loop. Release it
     // here, before finishRun, so the re-parked run is immediately continuable.
-    await runs.updateOne(
+    const released = await runs.updateOne(
       { _id: new ObjectId(runId), executionLeaseId: leaseId },
       {
         $set: {
@@ -1206,6 +1202,12 @@ async function finishContinueTurn(
         },
       },
     );
+    // The release doubles as this turn's fencing token. If it matched nothing
+    // the lease already moved to a newer turn, so this turn owns nothing —
+    // finishRun would otherwise terminalize the run and ticket underneath the
+    // live one.
+    if (released.matchedCount === 0) return;
+
     await finishRun(
       runId,
       run.ticketId,
@@ -1217,27 +1219,94 @@ async function finishContinueTurn(
       board,
       runDir,
     );
+    // Publish the declared outcome only after the state it implies is durable.
+    // Writing it first opens a window where readers see `completed` on a run
+    // that is still `running` — which is what makes this suite flaky.
+    await runs.updateOne(
+      { _id: new ObjectId(runId), "turns.id": turnId },
+      { $set: { "turns.$.outcome": resolved } },
+    );
     return;
   }
 
   // continued: a re-park, nothing more. No verification, no verdict, no
   // finishedAt, and the ticket is not moved toward review.
-  await runs.updateOne(
-    { _id: new ObjectId(runId), executionLeaseId: leaseId },
+  //
+  // The agent continued without asking anything, so there is no real question to
+  // park on. Open a fresh exchange row for the next human turn instead of leaving
+  // `awaitingQuestion` null — the schema's invariant is that a parked run has
+  // exactly one open row and `awaitingQuestion` denormalises it.
+  const continuedQuestion =
+    "(agent continued without a question — send another message to keep going)";
+  // --resume forks a new session id on every turn, and `continued` is the path
+  // designed to repeat. Without re-capturing it here the next turn resumes the
+  // session as it stood BEFORE this one, silently discarding this turn.
+  const rotatedSessionId = parseSessionId(run.runner, stdout);
+  const reparked = await runs.updateOne(
+    {
+      _id: new ObjectId(runId),
+      executionLeaseId: leaseId,
+      // Never resurrect a run that recoverOrphans (or any other path) already
+      // terminalized while this turn was in flight.
+      status: "running",
+    },
     {
       $set: {
         status: "awaiting_input",
+        awaitingQuestion: continuedQuestion,
+        // The child is gone; a stale pid reads as alive after PID recycling.
+        pid: null,
         executionLeaseId: null,
         executionLeaseExpiresAt: null,
+        ...(rotatedSessionId ? { executionSessionId: rotatedSessionId } : {}),
+      },
+      $push: {
+        exchanges: {
+          $each: [
+            {
+              v: 1 as const,
+              at,
+              question: continuedQuestion,
+              handoff: null,
+              answer: null,
+              answeredAt: null,
+            },
+          ],
+          $slice: -EXCHANGE_CAP,
+        },
       },
     },
   );
-  await database.collection<TicketDoc>("tickets").updateOne(
-    { _id: new ObjectId(run.ticketId), activeRunId: runId, status: "running" },
-    {
-      $set: { status: "needs_input", updatedAt: at },
-      $push: pushActivity("run", "continued execution pending", at),
-    },
+  if (reparked.matchedCount === 0) return;
+
+  const to = transition("running", "run_needs_input");
+  const ticketReparked = await database
+    .collection<TicketDoc>("tickets")
+    .updateOne(
+      { _id: new ObjectId(run.ticketId), activeRunId: runId, status: "running" },
+      {
+        $set: { status: to, updatedAt: at },
+        $push: pushActivity("run", "continued execution pending", at),
+      },
+    );
+  if (ticketReparked.matchedCount === 0) {
+    // The ticket moved underneath us (archived, failed, reassigned). Never leave
+    // a dangling activeRunId: dispatchRun refuses every future run on that ticket.
+    await database
+      .collection<TicketDoc>("tickets")
+      .updateOne(
+        { _id: new ObjectId(run.ticketId), activeRunId: runId },
+        { $set: { activeRunId: null, updatedAt: at } },
+      );
+  }
+  // Publish the declared outcome only once the re-park is durable.
+  await runs.updateOne(
+    { _id: new ObjectId(runId), "turns.id": turnId },
+    { $set: { "turns.$.outcome": resolved } },
+  );
+  // Every other park in this file notifies. A silently parked run waits forever.
+  await notify(
+    `⏸️ continued, awaiting input: ${await ticketLabel(database, run.ticketId)}`,
   );
 }
 
@@ -1323,24 +1392,64 @@ export async function continueExecution(
   const leaseExpiresAt = new Date(
     Date.now() + EXECUTION_LEASE_MS,
   ).toISOString();
-  const claimed = await runs.updateOne(
-    {
-      _id: new ObjectId(runId),
-      status: "awaiting_input",
-      $or: [
-        { executionLeaseId: null },
-        { executionLeaseExpiresAt: { $lt: claimAt } },
-      ],
+  // The message must ride the claiming update, exactly as resumeRun carries its
+  // answer: a second write could fail after status flips to running, losing the
+  // human's text with no safe retry. Pin the exact row — see resumeRun for why
+  // `{$type:"null"}` and the `at` identity term are both required.
+  const priorExchanges = run.exchanges ?? [];
+  let openIndex = -1;
+  priorExchanges.forEach((exchange, index) => {
+    if (exchange.answer === null) openIndex = index;
+  });
+  const openRow = openIndex >= 0 ? priorExchanges[openIndex] : null;
+  const claimFilter: Record<string, unknown> = {
+    _id: new ObjectId(runId),
+    status: "awaiting_input",
+    $or: [
+      { executionLeaseId: null },
+      { executionLeaseExpiresAt: { $lt: claimAt } },
+    ],
+  };
+  if (openIndex >= 0 && openRow) {
+    claimFilter[`exchanges.${openIndex}.answer`] = { $type: "null" };
+    claimFilter[`exchanges.${openIndex}.at`] = openRow.at;
+  }
+  const claimed = await runs.updateOne(claimFilter as Filter<RunDoc>, {
+    $set: {
+      executionLeaseId: leaseId,
+      executionLeaseExpiresAt: leaseExpiresAt,
+      status: "running",
+      startedAt: claimAt,
+      ...(openIndex >= 0
+        ? {
+            [`exchanges.${openIndex}.answer`]: message,
+            [`exchanges.${openIndex}.answeredAt`]: claimAt,
+          }
+        : {}),
     },
-    {
-      $set: {
-        executionLeaseId: leaseId,
-        executionLeaseExpiresAt: leaseExpiresAt,
-        status: "running",
-        startedAt: claimAt,
-      },
-    },
-  );
+    ...(openIndex === -1
+      ? {
+          $push: {
+            exchanges: {
+              $each: [
+                {
+                  v: 1 as const,
+                  at: claimAt,
+                  question: questionOrFallback(
+                    run.awaitingQuestion,
+                    "(continued execution)",
+                  ),
+                  handoff: null,
+                  answer: message,
+                  answeredAt: claimAt,
+                },
+              ],
+              $slice: -EXCHANGE_CAP,
+            },
+          },
+        }
+      : {}),
+  });
   if (claimed.matchedCount === 0) {
     throw new ServerResultError("conflict", "run is already executing");
   }
