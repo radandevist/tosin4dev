@@ -62,6 +62,10 @@ const EXCHANGE_CAP = 50;
 // same bounded degradation applies: keep the newest turns rather than let a
 // long-lived run grow the document without limit.
 const TURN_CAP = 50;
+// A `continue` turn holds an exclusive lease on the run for the duration of the
+// spawned process. If the lease expires (supervisor down / process lost) the
+// run is claimable again by a fresh turn.
+const EXECUTION_LEASE_MS = 15 * 60 * 1000;
 const questionOrFallback = (
   question: string | null | undefined,
   fallback: string,
@@ -1146,6 +1150,346 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
   }
 }
 
+// Resolve a finished continue turn. A declared outcome (completed / needs_input /
+// failed) hands off to the EXISTING finishRun path so verification behaves
+// identically to a normal resume. A process that exited 0 without producing a
+// usable outcome is a `continued` turn: release the lease, keep no verdict, and
+// re-park the run awaiting a further human turn.
+async function finishContinueTurn(
+  runId: string,
+  run: RunDoc,
+  board: Board,
+  runDir: string,
+  leaseId: string,
+  turnId: string,
+  stdout: string,
+  exitCode: number,
+): Promise<void> {
+  const database = await db();
+  const runs = database.collection<RunDoc>("runs");
+  const outcome = await readOutcome(runDir);
+  // readOutcome fails closed: a missing/invalid outcome.json reads as `failed`
+  // with one of these sentinel reasons. Only a runner that actually declared a
+  // `failed` outcome counts as a usable failure; the rest is "no usable outcome".
+  const usable = !(
+    outcome.outcome === "failed" &&
+    (outcome.reason === "no outcome.json written" ||
+      outcome.reason === "invalid outcome.json")
+  );
+  let resolved: Exclude<RunTurn["outcome"], null> = "failed";
+  let continued = false;
+  if (usable) {
+    resolved = outcome.outcome;
+  } else if (exitCode === 0) {
+    resolved = "continued";
+    continued = true;
+  }
+
+  const at = now();
+  await runs.updateOne(
+    { _id: new ObjectId(runId), executionLeaseId: leaseId, "turns.id": turnId },
+    { $set: { "turns.$.outcome": resolved } },
+  );
+
+  if (!continued) {
+    // Every terminal outcome hands off to finishRun, which owns all
+    // status/verdict/ticket transitions. But it must not leave the execution
+    // lease live: a stale lease would reject the next continueExecution with
+    // "run is already executing", breaking the back-and-forth loop. Release it
+    // here, before finishRun, so the re-parked run is immediately continuable.
+    await runs.updateOne(
+      { _id: new ObjectId(runId), executionLeaseId: leaseId },
+      {
+        $set: {
+          executionLeaseId: null,
+          executionLeaseExpiresAt: null,
+        },
+      },
+    );
+    await finishRun(
+      runId,
+      run.ticketId,
+      run.phase,
+      exitCode,
+      stdout,
+      run.logFile,
+      run.stderrFile,
+      board,
+      runDir,
+    );
+    return;
+  }
+
+  // continued: a re-park, nothing more. No verification, no verdict, no
+  // finishedAt, and the ticket is not moved toward review.
+  await runs.updateOne(
+    { _id: new ObjectId(runId), executionLeaseId: leaseId },
+    {
+      $set: {
+        status: "awaiting_input",
+        executionLeaseId: null,
+        executionLeaseExpiresAt: null,
+      },
+    },
+  );
+  await database.collection<TicketDoc>("tickets").updateOne(
+    { _id: new ObjectId(run.ticketId), activeRunId: runId, status: "running" },
+    {
+      $set: { status: "needs_input", updatedAt: at },
+      $push: pushActivity("run", "continued execution pending", at),
+    },
+  );
+}
+
+async function monitorContinue(
+  child: RunningChild,
+  runId: string,
+  run: RunDoc,
+  board: Board,
+  runDir: string,
+  leaseId: string,
+  turnId: string,
+): Promise<void> {
+  try {
+    const [stdout, , exitCode] = await Promise.all([
+      child.stdout,
+      child.stderr,
+      child.exited,
+    ]);
+    await finishContinueTurn(
+      runId,
+      run,
+      board,
+      runDir,
+      leaseId,
+      turnId,
+      stdout,
+      exitCode,
+    );
+  } catch (error) {
+    await appendFile(
+      run.logFile,
+      `\nSupervisor continue stream failure: ${error instanceof Error ? error.message : "unknown error"}\n`,
+    ).catch(() => undefined);
+    await finishContinueTurn(runId, run, board, runDir, leaseId, turnId, "", -1);
+  }
+}
+
+export async function continueExecution(
+  runId: string,
+  message: string,
+): Promise<void> {
+  const database = await db();
+  const runs = database.collection<RunDoc>("runs");
+  const run = await runs.findOne({ _id: new ObjectId(runId) });
+  if (!run || run.status !== "awaiting_input") {
+    throw new ServerResultError("conflict", "run is not awaiting input");
+  }
+  if (!run.executionSessionId) {
+    throw new ServerResultError(
+      "conflict",
+      "run has no captured session to continue",
+    );
+  }
+
+  const rawBoard = await database.collection<BoardDoc>("boards").findOne({
+    _id: new ObjectId(run.boardId),
+  });
+  if (!rawBoard) {
+    throw new ServerResultError("not_found", `board not found: ${run.boardId}`);
+  }
+  const board = BoardSchema.parse(rawBoard);
+  const rawTicket = await database.collection<TicketDoc>("tickets").findOne({
+    _id: new ObjectId(run.ticketId),
+  });
+  if (!rawTicket) {
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${run.ticketId}`,
+    );
+  }
+  const ticket = TicketSchema.parse(rawTicket);
+  if (ticket.status !== "needs_input" || ticket.activeRunId !== runId) {
+    throw new ServerResultError(
+      "conflict",
+      "ticket is not parked on this run",
+    );
+  }
+
+  // Claim the run's execution lease in ONE atomic update: only wins when the
+  // run is parked and no live lease exists. A loser must not retry or force.
+  const leaseId = new ObjectId().toString();
+  const claimAt = now();
+  const leaseExpiresAt = new Date(
+    Date.now() + EXECUTION_LEASE_MS,
+  ).toISOString();
+  const claimed = await runs.updateOne(
+    {
+      _id: new ObjectId(runId),
+      status: "awaiting_input",
+      $or: [
+        { executionLeaseId: null },
+        { executionLeaseExpiresAt: { $lt: claimAt } },
+      ],
+    },
+    {
+      $set: {
+        executionLeaseId: leaseId,
+        executionLeaseExpiresAt: leaseExpiresAt,
+        status: "running",
+        startedAt: claimAt,
+      },
+    },
+  );
+  if (claimed.matchedCount === 0) {
+    throw new ServerResultError("conflict", "run is already executing");
+  }
+
+  // Pinned capability: the run's OWN runner/workdir/session — nothing from the
+  // caller. The message rides the resume slot the same way resumeRun carries its
+  // answer.
+  const runDir = `${board.repoPath}/.tosin4dev/runs/${runId}`;
+  const outcomePath = `${runDir}/outcome.json`;
+  const brief: RunnerBrief = {
+    ticket,
+    board,
+    workDir: run.workDir,
+    phase: run.phase,
+    outcomePath,
+    resume: { sessionId: run.executionSessionId, answer: message },
+  };
+
+  let child: ChildProcess | undefined;
+  let runningChild: RunningChild | undefined;
+  try {
+    // Every write below carries the claimed lease id: a turn that lost its lease
+    // can never write.
+    await rm(outcomePath, { force: true });
+    await writeFile(run.promptFile, buildPrompt(brief));
+
+    const continueTurnId = new ObjectId().toString();
+    const continueTurnPaths = turnPaths(runDir, continueTurnId);
+    const continueTurn: RunTurn = {
+      v: 1,
+      id: continueTurnId,
+      index: run.turns?.length ?? 0,
+      at: now(),
+      kind: "continue",
+      outcome: null,
+      stdoutFile: continueTurnPaths.stdoutFile,
+      stderrFile: continueTurnPaths.stderrFile,
+    };
+    await mkdir(continueTurnPaths.turnDir, { recursive: true });
+    await writeFile(continueTurn.stdoutFile, "");
+    await writeFile(continueTurn.stderrFile, "");
+
+    const command = adapters[run.runner].buildCommand(brief, run.promptFile);
+    const spawnedChild = spawn(command.cmd[0], command.cmd.slice(1), {
+      cwd: run.workDir,
+      env: {
+        ...process.env,
+        ...command.env,
+        T4D_OUTCOME_PATH: outcomePath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child = spawnedChild;
+    runningChild = {
+      stdout: drainStream(
+        spawnedChild.stdout,
+        [run.logFile, continueTurn.stdoutFile],
+        true,
+      ),
+      stderr: drainStream(
+        spawnedChild.stderr,
+        [run.stderrFile ?? run.logFile, continueTurn.stderrFile],
+        false,
+      ),
+      exited: settledExit(spawnedChild),
+    };
+    void Promise.all([
+      runningChild.stdout,
+      runningChild.stderr,
+      runningChild.exited,
+    ]).catch(() => undefined);
+    await waitForSpawn(spawnedChild);
+
+    const runStarted = await runs.updateOne(
+      {
+        _id: new ObjectId(runId),
+        status: "running",
+        executionLeaseId: leaseId,
+      },
+      {
+        $set: { pid: spawnedChild.pid, awaitingQuestion: null },
+        $push: {
+          turns: {
+            $each: [continueTurn],
+            $slice: -TURN_CAP,
+          },
+        },
+      },
+    );
+    if (runStarted.matchedCount === 0) {
+      throw new ServerResultError("conflict", "run left running");
+    }
+
+    const at = now();
+    const to = transition("needs_input", "provide_input");
+    const ticketStarted = await database
+      .collection<TicketDoc>("tickets")
+      .updateOne(
+        {
+          _id: new ObjectId(run.ticketId),
+          status: "needs_input",
+          activeRunId: runId,
+        },
+        {
+          $set: { status: to, updatedAt: at },
+          $push: pushActivity("run", "continued execution", at),
+        },
+      );
+    if (ticketStarted.matchedCount === 0) {
+      throw new ServerResultError(
+        "conflict",
+        "ticket is no longer awaiting input",
+      );
+    }
+
+    void monitorContinue(
+      runningChild,
+      runId,
+      run,
+      board,
+      runDir,
+      leaseId,
+      continueTurnId,
+    ).catch((error) =>
+      console.error(`Continue monitor failed for run ${runId}:`, error),
+    );
+  } catch {
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await runningChild?.exited.catch(() => undefined);
+    }
+    try {
+      // Release the lease and re-park via the existing resume compensation.
+      await runs.updateOne(
+        { _id: new ObjectId(runId), executionLeaseId: leaseId },
+        { $set: { executionLeaseId: null, executionLeaseExpiresAt: null } },
+      );
+      await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+    } catch (compensationError) {
+      console.error(
+        `Failed to restore parked run ${runId} after spawn failure:`,
+        compensationError,
+      );
+    }
+    throw new ServerResultError("spawn_failed", "run could not be continued");
+  }
+}
+
+
 export async function dispatchRun(
   rawTicketId: string,
   rawPhase: Phase,
@@ -1240,6 +1584,8 @@ export async function dispatchRun(
     verdict: null,
     failureKind: null,
     executionSessionId: null,
+    executionLeaseId: null,
+    executionLeaseExpiresAt: null,
     awaitingQuestion: null,
     exchanges: [],
     turns: [dispatchTurn],
@@ -1386,19 +1732,28 @@ export async function recoverOrphans(): Promise<void> {
   for (const run of staleRuns) {
     if (isProcessAlive(run.pid)) continue;
     const at = now();
+    const orphaned: Record<string, unknown> = {
+      status: "failed",
+      exitCode: null,
+      failureKind:
+        run.status === "verifying" ? "verification_failed" : "runner_exit",
+      verdict: run.status === "verifying" ? "failed" : null,
+      summary: "Run orphaned after supervisor restart",
+      finishedAt: at,
+    };
+    // A continue turn's lease is a claim on a live process. When that process is
+    // dead AND the lease has run out, clear the lease so the parked run can be
+    // claimed again. Runs that hold no lease are untouched.
+    if (
+      run.executionLeaseExpiresAt !== null &&
+      run.executionLeaseExpiresAt < at
+    ) {
+      orphaned.executionLeaseId = null;
+      orphaned.executionLeaseExpiresAt = null;
+    }
     const failed = await runCollection.updateOne(
       { _id: run._id, status: { $in: ["queued", "running", "verifying"] } },
-      {
-        $set: {
-          status: "failed",
-          exitCode: null,
-          failureKind:
-            run.status === "verifying" ? "verification_failed" : "runner_exit",
-          verdict: run.status === "verifying" ? "failed" : null,
-          summary: "Run orphaned after supervisor restart",
-          finishedAt: at,
-        },
-      },
+      { $set: orphaned },
     );
     if (failed.matchedCount === 0) continue;
 

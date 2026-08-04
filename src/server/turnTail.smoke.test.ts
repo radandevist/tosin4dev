@@ -207,6 +207,8 @@ async function insertTurnRun(params: {
     verdict: null,
     failureKind: null,
     executionSessionId: null,
+    executionLeaseId: null,
+    executionLeaseExpiresAt: null,
     awaitingQuestion: null,
     exchanges: [],
     turns,

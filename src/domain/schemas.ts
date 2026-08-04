@@ -176,7 +176,7 @@ export const RunTurnSchema = z
     id: z.string().min(1),
     index: z.number().int().nonnegative(),
     at: z.string().datetime(),
-    kind: z.enum(["dispatch", "resume"]),
+    kind: z.enum(["dispatch", "resume", "continue"]),
     // The terminal outcome of this turn, resolved after the process exits.
     // null while the turn is running or for legacy dispatch/resume turns.
     outcome: z
@@ -224,6 +224,11 @@ export const RunSchema = z.object({
   // Provider conversation id captured from the runner's structured output, so
   // a later turn can resume the SAME session. null for legacy/uncaptured runs.
   executionSessionId: z.string().nullable().default(null),
+  // Exclusive claim guarding a single human `continue` turn. Claimed atomically
+  // before spawn; cleared on re-park. Every write of the continuing turn carries
+  // executionLeaseId so a turn that lost its lease can never write.
+  executionLeaseId: z.string().nullable().default(null),
+  executionLeaseExpiresAt: z.string().datetime().nullable().default(null),
   // The question a `needs_input` run is parked on; null otherwise.
   awaitingQuestion: z.string().nullable().default(null),
   // Durable Q&A history. `awaitingQuestion` stays the denormalised OPEN
