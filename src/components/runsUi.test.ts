@@ -207,4 +207,22 @@ describe("shouldShowAnswerForm", () => {
   it("hides the form when there is no parked run", () => {
     expect(shouldShowAnswerForm(undefined)).toBe(false);
   });
+
+  it("hides the form for a continued-park run", () => {
+    expect(shouldShowAnswerForm({ ...parkedRun, parkedBy: "continued" })).toBe(false);
+  });
+
+  it("shows the form for a question-park run", () => {
+    expect(shouldShowAnswerForm({ ...parkedRun, parkedBy: "question" })).toBe(true);
+  });
+
+  it("shows the form for a legacy run without parkedBy (defaults to question)", () => {
+    // The schema default for parkedBy is "question". A RunDTOSchema.parse of a
+    // doc without parkedBy hydrates it as "question" via the zod default.
+    const legacy = { ...parkedRun } as Record<string, unknown>;
+    delete (legacy as { parkedBy?: string }).parkedBy;
+    const parsed = RunDTOSchema.parse(legacy);
+    expect(parsed.parkedBy).toBe("question");
+    expect(shouldShowAnswerForm(parsed)).toBe(true);
+  });
 });

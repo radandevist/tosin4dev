@@ -35,9 +35,10 @@ process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 process.env.DISCORD_WEBHOOK_URL = "";
 
 const { db, closeDb, ObjectId } = await import("./db");
-const { continueExecution, dispatchRun, recoverOrphans } = await import(
+const { continueExecution, dispatchRun, recoverOrphans, resumeRun } = await import(
   "./supervisor.server"
 );
+const { turnTailCore } = await import("./runs.server");
 
 let database: Db;
 let boards: Collection<BoardDoc>;
@@ -248,6 +249,7 @@ const seedRunDoc = async (
     executionSessionId: "s-smoke",
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
+    parkedBy: "question" as const,
     awaitingQuestion: null,
     exchanges: [],
     turns: [],
@@ -385,7 +387,7 @@ describe("continueExecution", () => {
       await waitForRun(runId, "awaiting_input");
     }, 20_000);
 
-    it("does not let a turn that lost its lease write its outcome", async () => {
+    it("does not let a turn that lost its lease change the run", async () => {
       const { runId, ticketId } = await parkRun(3);
       process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
 
@@ -421,8 +423,11 @@ describe("continueExecution", () => {
       }
 
       const run = await runs.findOne({ _id: new ObjectId(runId) });
+      // The turn's own outcome SHOULD be recorded (its id is unique)...
       const turn = run?.turns.find((t) => t.kind === "continue");
-      expect(turn?.outcome).toBeNull();
+      expect(turn?.outcome).toBe("completed");
+      // ...but the stale turn must NOT change run status, verdict, finishedAt,
+      // or the ticket.
       expect(run?.verdict).toBeNull();
       expect(run?.finishedAt).toBeNull();
       expect(run?.status).not.toBe("succeeded");
@@ -824,6 +829,158 @@ describe("continueExecution", () => {
 
       const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
       expect(ticket?.activeRunId).toBeNull();
+    }, 20_000);
+  });
+
+  describe("regression: round 3 — turn eof monotonic, continued-park rejection, ticket-move terminalization, restore-guard", () => {
+    function tail(args: {
+      runId: string;
+      turnId: string;
+      cursor: number;
+    }): Promise<{ chunk: string; nextCursor: number; eof: boolean }> {
+      return turnTailCore({ ...args, stream: "stdout", maxBytes: 20_000 });
+    }
+
+    it("eof is monotonic across a continue on the same dispatch turn", async () => {
+      const { runId } = await parkRun(21);
+
+      // Tail the dispatch turn to its end on the parked run: eof must be true.
+      const parkedRun = await runs.findOne({ _id: new ObjectId(runId) });
+      const dispatchTurn = parkedRun!.turns.find((t) => t.kind === "dispatch")!;
+      const preContinue = await tail({
+        runId,
+        turnId: dispatchTurn.id,
+        cursor: 0,
+      });
+      expect(preContinue.eof).toBe(true);
+
+      // Start a continue turn (no T4D_OUTCOME = continued).
+      delete process.env.T4D_OUTCOME;
+      await continueExecution(runId, "keep going");
+      await waitForContinueTurn(runId, 1);
+
+      // Tail the SAME dispatch turn again — it was superseded by the continue
+      // turn, so eof must STILL be true (non-monotonic eof was the bug).
+      const postContinue = await tail({
+        runId,
+        turnId: dispatchTurn.id,
+        cursor: 0,
+      });
+      expect(postContinue.eof).toBe(true);
+    }, 20_000);
+
+    it("a continued-park run rejects resumeRun with conflict and does NOT fail", async () => {
+      const { runId, ticketId } = await parkRun(22);
+      // No T4D_OUTCOME → the continue will resolve as `continued` (re-park).
+      delete process.env.T4D_OUTCOME;
+      await continueExecution(runId, "keep going");
+      await waitForContinueTurn(runId, 1);
+      const parked = await waitForRun(runId, "awaiting_input");
+      expect(parked.parkedBy).toBe("continued");
+
+      // resumeRun must reject a continued-park run with conflict...
+      await expect(resumeRun(runId, "any answer")).rejects.toMatchObject({
+        code: "conflict",
+      });
+      // ...and must NOT have failed the run or blocked the ticket.
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      expect(run?.status).toBe("awaiting_input");
+      const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+      expect(ticket?.status).toBe("needs_input");
+    }, 20_000);
+
+    it("terminalizes the run when the ticket moves underneath a continued re-park", async () => {
+      const { runId, ticketId } = await parkRun(23);
+      delete process.env.T4D_OUTCOME;
+
+      const pause = pauseNextTurnResolution(runId);
+      const continuePromise = continueExecution(runId, "keep going");
+      await pause.reached;
+      try {
+        // Archive the ticket while the continue turn is in flight — the re-park's
+        // ticket update will match nothing, and the run must be terminalized (not
+        // left stranded at awaiting_input).
+        const at = timestamp();
+        await tickets.updateOne(
+          { _id: new ObjectId(ticketId) },
+          { $set: { status: "archived", updatedAt: at } },
+        );
+        pause.release();
+        await continuePromise;
+
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          const run = await runs.findOne({ _id: new ObjectId(runId) });
+          if (run?.status === "failed") break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        pause.release();
+        pause.spy.mockRestore();
+      }
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      expect(run?.status).toBe("failed");
+      expect(run?.finishedAt).not.toBeNull();
+      expect(run?.failureKind).toBe("runner_exit");
+    }, 20_000);
+
+    it("restoreParkedResume does not resurrect a terminalized run", async () => {
+      const { runId } = await parkRun(24);
+      // Delete the runner binary so spawn will fail, hitting the restore path.
+      await rm(join(binDirectory, "claude"), { force: true });
+      process.env.PATH = binDirectory;
+
+      // Spy to interleave: terminalize the run between the resume claim and
+      // the spawn-failure restoreParkedResume call.
+      const originalUpdateOne = Collection.prototype.updateOne;
+      let reachedResolve!: () => void;
+      let proceedResolve!: () => void;
+      const reached = new Promise<void>((r) => { reachedResolve = r; });
+      const proceed = new Promise<void>((r) => { proceedResolve = r; });
+      let first = true;
+      const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+        async function (this: Collection, filter, update, options) {
+          const res = await originalUpdateOne.call(this, filter, update, options);
+          if (
+            first &&
+            String((filter as Record<string, unknown>)?._id) === runId &&
+            this.collectionName === "runs"
+          ) {
+            first = false;
+            reachedResolve();
+            await proceed;
+          }
+          return res;
+        },
+      );
+
+      try {
+        const promise = resumeRun(runId, "any answer");
+        await reached;
+        // While resumeRun is paused after claiming the run, terminalize it.
+        const at = timestamp();
+        await runs.updateOne(
+          { _id: new ObjectId(runId), status: "running" },
+          {
+            $set: {
+              status: "failed",
+              failureKind: "runner_exit",
+              finishedAt: at,
+            },
+          },
+        );
+        proceedResolve();
+        await expect(promise).rejects.toMatchObject({ code: "spawn_failed" });
+
+        const run = await runs.findOne({ _id: new ObjectId(runId) });
+        expect(run?.status).toBe("failed");
+        expect(run?.finishedAt).not.toBeNull();
+      } finally {
+        spy.mockRestore();
+        await writeRunner();
+        process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
+      }
     }, 20_000);
   });
 });

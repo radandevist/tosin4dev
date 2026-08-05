@@ -67,6 +67,7 @@ function runDocument(
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
+    parkedBy: "question" as const,
     awaitingQuestion: null,
     exchanges: [],
     turns: [],

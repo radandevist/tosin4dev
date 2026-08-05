@@ -209,6 +209,7 @@ async function insertTurnRun(params: {
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
+    parkedBy: "question",
     awaitingQuestion: null,
     exchanges: [],
     turns,
@@ -527,7 +528,7 @@ describe("per-turn logs and cursor polling", () => {
     expect(pieces.join("")).toBe(content);
   });
 
-  it("restarts from the top when a cursor is beyond EOF instead of throwing", async () => {
+  it("restarts from the top when a cursor is beyond EOF and reports eof: false", async () => {
     const { runId, turnId, stdoutFile } = await insertTurnRun({
       stdout: "one\ntwo\n",
       status: "succeeded",
@@ -542,7 +543,7 @@ describe("per-turn logs and cursor polling", () => {
         stream: "stdout",
         maxBytes: 20_000,
       }),
-    ).toEqual({ chunk: "", nextCursor: 0, eof: true });
+    ).toEqual({ chunk: "", nextCursor: 0, eof: false });
 
     const running = await insertTurnRun({
       stdout: "one\ntwo\n",
@@ -576,14 +577,16 @@ describe("per-turn logs and cursor polling", () => {
     });
   });
 
-  it("reports eof on a finished earlier turn while a later turn keeps the run running", async () => {
-    // An earlier turn with a declared outcome is definitively over even though
-    // the run is `running` again because of a later turn; its eof must not wait
-    // for the whole run to terminate.
+  it("reports eof on a superseded dispatch turn with no declared outcome", async () => {
+    // Production creates dispatch turns with `outcome: null` — a state no code
+    // path ever replaces. The turn becomes "finished" ONLY when a later turn
+    // (resume or continue) supersedes it. A dispatch turn with outcome: null
+    // followed by a later turn MUST report eof, otherwise a client tailing it
+    // polls forever.
     const { runId, turnIds } = await insertTurnRun({
       stdout: "done\n",
       status: "running",
-      outcome: "continued",
+      outcome: null,
       extraTurns: [{ stdout: "later\n" }],
     });
 
