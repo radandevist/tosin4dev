@@ -577,12 +577,36 @@ describe("per-turn logs and cursor polling", () => {
     });
   });
 
-  it("reports eof on a superseded dispatch turn with no declared outcome", async () => {
-    // Production creates dispatch turns with `outcome: null` — a state no code
-    // path ever replaces. The turn becomes "finished" ONLY when a later turn
-    // (resume or continue) supersedes it. A dispatch turn with outcome: null
-    // followed by a later turn MUST report eof, otherwise a client tailing it
-    // polls forever.
+  it("reports eof on an earlier turn that declared an outcome while a later turn runs", async () => {
+    // Turn completion is DECLARED, never inferred from array position: every
+    // terminal path writes the turn's outcome. A resolved earlier turn is eof
+    // even while the run keeps producing bytes for the turn after it.
+    const { runId, turnIds } = await insertTurnRun({
+      stdout: "done\n",
+      status: "running",
+      outcome: "needs_input",
+      extraTurns: [{ stdout: "later\n" }],
+    });
+
+    expect(await tail({ runId, turnId: turnIds[0], cursor: 0 })).toEqual({
+      chunk: "done\n",
+      nextCursor: 5,
+      eof: true,
+    });
+    // ...and the live later turn is NOT eof.
+    expect(await tail({ runId, turnId: turnIds[1], cursor: 0 })).toEqual({
+      chunk: "later\n",
+      nextCursor: 6,
+      eof: false,
+    });
+  });
+
+  it("does not call an outcome-less turn finished just because a later turn exists", async () => {
+    // Position-derived completion is unsound in the other direction: resumeRun
+    // and continueExecution flip the run to `running` in their claim and only
+    // push the new turn row after mkdir/writeFile/spawn. During that window the
+    // PREVIOUS turn is still last on a running run, so a position rule would
+    // report eof true → false → true and a polling client would stop early.
     const { runId, turnIds } = await insertTurnRun({
       stdout: "done\n",
       status: "running",
@@ -593,7 +617,7 @@ describe("per-turn logs and cursor polling", () => {
     expect(await tail({ runId, turnId: turnIds[0], cursor: 0 })).toEqual({
       chunk: "done\n",
       nextCursor: 5,
-      eof: true,
+      eof: false,
     });
   });
 
