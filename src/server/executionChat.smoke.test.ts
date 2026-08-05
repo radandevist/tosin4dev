@@ -349,6 +349,22 @@ describe("continueExecution", () => {
     delete process.env.T4D_ROTATE_SESSION;
     delete process.env.T4D_EXIT;
     await writeRunner();
+    const terminal = Date.now() + 5_000;
+    const pendingStatuses: Array<
+      "queued" | "running" | "verifying" | "awaiting_input"
+    > = [
+      "queued",
+      "running",
+      "verifying",
+      "awaiting_input",
+    ];
+    while (Date.now() < terminal) {
+      const pending = await runs.countDocuments({
+        status: { $in: pendingStatuses },
+      });
+      if (pending === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     await tickets.deleteMany({});
     await runs.deleteMany({});
   });
@@ -1705,6 +1721,7 @@ describe("continueExecution", () => {
 
       const originalUpdateOne = Collection.prototype.updateOne;
       let armed = true;
+      let firedOn: string | null = null;
       const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
         async function (this: Collection, filter, update, options) {
           const set = (update as { $set?: Record<string, unknown> }).$set;
@@ -1715,6 +1732,7 @@ describe("continueExecution", () => {
             "turns.$.outcome" in set
           ) {
             armed = false;
+            firedOn = String((filter as { _id?: unknown })._id);
             // The park has fully landed and already carries this turn's outcome.
             // Throwing here drives monitorChild into its catch, which re-invokes
             // finishRun with a synthetic exit -1.
@@ -1749,6 +1767,11 @@ describe("continueExecution", () => {
       expect(run?.turns.find((t) => t.kind === "dispatch")?.outcome).toBe(
         "needs_input",
       );
+      // The spy disarms on the first matching write from ANY run, so a stray
+      // write from an earlier test's in-flight monitor can consume it. Without this,
+      // the injection never fires and every assertion below describes the healthy
+      // state — the test can pass without exercising anything.
+      expect(firedOn).toBe(runId!);
     }, 20_000);
 
     it("restoreParkedResume does not resurrect a terminalized run", async () => {
