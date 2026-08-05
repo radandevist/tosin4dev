@@ -70,6 +70,9 @@ async function insertRun(
     verdict: null,
     failureKind: null,
     executionSessionId: null,
+    executionLeaseId: null,
+    executionLeaseExpiresAt: null,
+    parkedBy: "question" as const,
     awaitingQuestion: "Should we use signed cookies or server sessions?",
     exchanges: [
       {

@@ -51,6 +51,7 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     exitCode,
     summary,
     awaitingQuestion,
+    parkedBy,
     queuedAt,
     startedAt,
     finishedAt,
@@ -70,6 +71,7 @@ function toDTO(doc: WithId<RunDoc>): RunDTO {
     exitCode,
     summary,
     awaitingQuestion,
+    parkedBy,
     exchanges,
     exchangesDropped: dropped,
     turns,
@@ -178,12 +180,16 @@ export async function turnTailCore(
     throw new ServerResultError("not_found", `turn not found: ${input.turnId}`);
   }
   const file = input.stream === "stderr" ? turn.stderrFile : turn.stdoutFile;
-  // `eof` is a property of the TURN, not the run. A turn with a declared outcome
-  // is over even while the run keeps going (a later turn), and a `queued` run has
-  // not written a byte yet — reporting eof there makes a client that stops polling
-  // on eof render an empty log for the entire run.
+  // `eof` is a property of the TURN, not the run. Three ways a turn is over:
+  // it declared an outcome; a LATER turn exists, which can only happen once this
+  // one released the run (dispatch/resume turns never get an outcome written, so
+  // this is the clause that actually covers them); or the run itself is no longer
+  // producing. A `queued` run has not written a byte yet, so it is not eof.
+  const turnIndex = turns.findIndex((candidate) => candidate.id === input.turnId);
+  const superseded = turnIndex >= 0 && turnIndex < turns.length - 1;
   const finished =
     turn.outcome !== null ||
+    superseded ||
     (run.status !== "running" && run.status !== "queued");
 
   let handle;
@@ -198,7 +204,10 @@ export async function turnTailCore(
     // size is a normal completed read, not a truncation — >= would rewind it to
     // 0 and re-deliver the whole file on every poll.
     if (input.cursor > size) {
-      return { chunk: "", nextCursor: 0, eof: finished };
+      // Always `eof: false`: a restart means at least one more poll is required by
+      // construction, and a client that stops on eof would never read the
+      // replacement.
+      return { chunk: "", nextCursor: 0, eof: false };
     }
     const cursor = input.cursor;
     const length = Math.min(size - cursor, input.maxBytes);

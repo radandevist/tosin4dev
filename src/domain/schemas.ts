@@ -229,6 +229,10 @@ export const RunSchema = z.object({
   // executionLeaseId so a turn that lost its lease can never write.
   executionLeaseId: z.string().nullable().default(null),
   executionLeaseExpiresAt: z.string().datetime().nullable().default(null),
+  // Which park path produced the current `awaiting_input` state. A run parked by
+  // a `continued` turn has no real question and MUST NOT be answered through
+  // resumeRun, which is fail-closed and would terminalize a healthy run.
+  parkedBy: z.enum(["question", "continued"]).default("question"),
   // The question a `needs_input` run is parked on; null otherwise.
   awaitingQuestion: z.string().nullable().default(null),
   // Durable Q&A history. `awaitingQuestion` stays the denormalised OPEN

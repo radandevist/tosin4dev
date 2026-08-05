@@ -52,6 +52,7 @@ export const RunDTOSchema = z
     exitCode: z.number().int().nullable(),
     summary: z.string().nullable(),
     awaitingQuestion: z.string().nullable(),
+    parkedBy: z.enum(["question", "continued"]).default("question"),
     exchanges: z.array(InputExchangeSchema),
     exchangesDropped: z.number().int().nonnegative(),
     turns: z.array(RunTurnDTOSchema).default([]),

@@ -482,6 +482,7 @@ export async function parkTicketNeedsInput(
     {
       $set: {
         status: "awaiting_input",
+        parkedBy: "question",
         awaitingQuestion: question,
         summary,
       },
@@ -823,6 +824,7 @@ async function restoreParkedResume(
   const runs = database.collection<RunDoc>("runs");
   const parkedRunState = {
     status: "awaiting_input" as const,
+    parkedBy: "question" as const,
     awaitingQuestion: question,
     pid: null,
     startedAt: run.startedAt,
@@ -835,6 +837,7 @@ async function restoreParkedResume(
       const restored = await runs.updateOne(
         {
           _id: new ObjectId(runId),
+          status: { $in: ["running", "queued"] },
           exchanges: { $not: { $elemMatch: { answer: null } } },
         },
         {
@@ -863,10 +866,15 @@ async function restoreParkedResume(
       if (restored.matchedCount === 0) {
         // If the claim failed before writing, the original row is still open.
         // Restore status only rather than manufacturing a second open exchange.
-        await runs.updateOne(
-          { _id: new ObjectId(runId) },
+        // Guard against a run that was already terminalized while we raced.
+        const fallback = await runs.updateOne(
+          {
+            _id: new ObjectId(runId),
+            status: { $in: ["running", "queued"] },
+          },
           { $set: parkedRunState },
         );
+        if (fallback.matchedCount === 0) return;
       }
     })(),
     database.collection<TicketDoc>("tickets").updateOne(
@@ -898,6 +906,12 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
     throw new ServerResultError(
       "conflict",
       "run has no captured session to resume",
+    );
+  }
+  if (run.parkedBy === "continued") {
+    throw new ServerResultError(
+      "conflict",
+      "run was parked by a continued turn; use continue execution instead",
     );
   }
 
@@ -1205,8 +1219,16 @@ async function finishContinueTurn(
     // The release doubles as this turn's fencing token. If it matched nothing
     // the lease already moved to a newer turn, so this turn owns nothing —
     // finishRun would otherwise terminalize the run and ticket underneath the
-    // live one.
-    if (released.matchedCount === 0) return;
+    // live one. The turn is over even though it lost its claim. Record its
+    // outcome — the id is unique to this turn, so this touches nothing the
+    // winning turn owns.
+    if (released.matchedCount === 0) {
+      await runs.updateOne(
+        { _id: new ObjectId(runId), "turns.id": turnId },
+        { $set: { "turns.$.outcome": resolved } },
+      );
+      return;
+    }
 
     await finishRun(
       runId,
@@ -1237,7 +1259,7 @@ async function finishContinueTurn(
   // `awaitingQuestion` null — the schema's invariant is that a parked run has
   // exactly one open row and `awaitingQuestion` denormalises it.
   const continuedQuestion =
-    "(agent continued without a question — send another message to keep going)";
+    "(agent continued without asking a question)";
   // --resume forks a new session id on every turn, and `continued` is the path
   // designed to repeat. Without re-capturing it here the next turn resumes the
   // session as it stood BEFORE this one, silently discarding this turn.
@@ -1249,10 +1271,14 @@ async function finishContinueTurn(
       // Never resurrect a run that recoverOrphans (or any other path) already
       // terminalized while this turn was in flight.
       status: "running",
+      // Never manufacture a second open row: the row this turn answered was
+      // closed atomically, so a concurrent park cannot have slipped one in.
+      exchanges: { $not: { $elemMatch: { answer: null } } },
     },
     {
       $set: {
         status: "awaiting_input",
+        parkedBy: "continued",
         awaitingQuestion: continuedQuestion,
         // The child is gone; a stale pid reads as alive after PID recycling.
         pid: null,
@@ -1277,7 +1303,15 @@ async function finishContinueTurn(
       },
     },
   );
-  if (reparked.matchedCount === 0) return;
+  if (reparked.matchedCount === 0) {
+    // The turn is over even though it lost its claim. Record its outcome — the id
+    // is unique to this turn, so this touches nothing the winning turn owns.
+    await runs.updateOne(
+      { _id: new ObjectId(runId), "turns.id": turnId },
+      { $set: { "turns.$.outcome": resolved } },
+    );
+    return;
+  }
 
   const to = transition("running", "run_needs_input");
   const ticketReparked = await database
@@ -1290,8 +1324,20 @@ async function finishContinueTurn(
       },
     );
   if (ticketReparked.matchedCount === 0) {
-    // The ticket moved underneath us (archived, failed, reassigned). Never leave
-    // a dangling activeRunId: dispatchRun refuses every future run on that ticket.
+    // The ticket moved underneath us (archived, failed, reassigned). Leaving the
+    // run parked would strand it: nothing sweeps `awaiting_input`, and every entry
+    // point rejects a run whose ticket no longer owns it. Terminalize it instead.
+    await runs.updateOne(
+      { _id: new ObjectId(runId), status: "awaiting_input" },
+      {
+        $set: {
+          status: "failed",
+          failureKind: "runner_exit",
+          finishedAt: at,
+          summary: "ticket moved while the run was parked between turns",
+        },
+      },
+    );
     await database
       .collection<TicketDoc>("tickets")
       .updateOne(
@@ -1413,6 +1459,12 @@ export async function continueExecution(
   if (openIndex >= 0 && openRow) {
     claimFilter[`exchanges.${openIndex}.answer`] = { $type: "null" };
     claimFilter[`exchanges.${openIndex}.at`] = openRow.at;
+  } else {
+    // No open row in our snapshot. Pin both that absence and the parked question,
+    // exactly as resumeRun does, so a concurrent park cannot slip an open row in
+    // between our read and this claim — which would leave two open rows.
+    claimFilter.exchanges = { $not: { $elemMatch: { answer: null } } };
+    claimFilter.awaitingQuestion = run.awaitingQuestion ?? null;
   }
   const claimed = await runs.updateOne(claimFilter as Filter<RunDoc>, {
     $set: {
@@ -1695,6 +1747,7 @@ export async function dispatchRun(
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
+    parkedBy: "question" as const,
     awaitingQuestion: null,
     exchanges: [],
     turns: [dispatchTurn],

@@ -68,9 +68,11 @@ export function formatRunTimestamp(iso: string): string {
 }
 
 // Deliberately independent of `exchanges`: runs parked before exchange history
-// existed have none and must remain answerable.
+// existed have none and must remain answerable. But a run parked by a `continued`
+// turn has no real question, and answering it through resumeRun is fail-closed —
+// it would terminalize a healthy run.
 export function shouldShowAnswerForm(parkedRun: RunDTO | undefined): boolean {
-  return parkedRun !== undefined;
+  return parkedRun !== undefined && parkedRun.parkedBy !== "continued";
 }
 
 export function answeredExchanges(
