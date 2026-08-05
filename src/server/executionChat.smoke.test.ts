@@ -39,7 +39,6 @@ const { db, closeDb, ObjectId } = await import("./db");
 const { continueExecution, dispatchRun, recoverOrphans, resumeRun } = await import(
   "./supervisor.server"
 );
-const { turnTailCore } = await import("./runs.server");
 
 let database: Db;
 let boards: Collection<BoardDoc>;
@@ -243,52 +242,6 @@ function pauseNextTurnResolution(runId: string): {
   return { reached, release: releaseResolve, spy };
 }
 
-// Pause continueExecution the instant its claiming update lands: the run is
-// already `running` but the continue turn has NOT been pushed yet. That window
-// is exactly where a turn-completion rule derived from array position reports
-// the PREVIOUS, already-finished turn as unfinished.
-function pauseAfterContinueClaim(runId: string): {
-  reached: Promise<void>;
-  release: () => void;
-  spy: ReturnType<typeof vi.spyOn>;
-} {
-  const originalUpdateOne = Collection.prototype.updateOne;
-  let reachedResolve!: () => void;
-  let releaseResolve!: () => void;
-  let paused = false;
-  const reached = new Promise<void>((resolve) => {
-    reachedResolve = resolve;
-  });
-  const release = new Promise<void>((resolve) => {
-    releaseResolve = resolve;
-  });
-  const spy = vi
-    .spyOn(Collection.prototype, "updateOne")
-    .mockImplementation(async function (
-      this: Collection,
-      filter,
-      update,
-      options,
-    ) {
-      const set = (update as { $set?: Record<string, unknown> }).$set;
-      const isClaim =
-        typeof set?.executionLeaseId === "string" && set?.status === "running";
-      const id = (filter as { _id?: { toString(): string } })._id;
-      const result = await originalUpdateOne.call(this, filter, update, options);
-      if (
-        !paused &&
-        this.collectionName === "runs" &&
-        id?.toString() === runId &&
-        isClaim
-      ) {
-        paused = true;
-        reachedResolve();
-        await release;
-      }
-      return result;
-    });
-  return { reached, release: releaseResolve, spy };
-}
 
 // A pid that is guaranteed to be dead: spawn a process, wait for it to exit.
 function deadPid(): Promise<number> {
@@ -910,54 +863,45 @@ describe("continueExecution", () => {
     }, 20_000);
   });
 
-  describe("regression: rounds 3-4 — turn outcomes, eof, park kinds, compensation guards", () => {
-    function tail(args: {
-      runId: string;
-      turnId: string;
-      cursor: number;
-    }): Promise<{ chunk: string; nextCursor: number; eof: boolean }> {
-      return turnTailCore({ ...args, stream: "stdout", maxBytes: 20_000 });
+  // eof itself is exercised in turnTail.smoke.test.ts, which seeds run documents
+  // directly and can therefore assert eof FALSE where a position-derived rule
+  // would wrongly say true. An end-to-end eof assertion here could only ever
+  // assert eof TRUE, which every candidate rule satisfies — it would not
+  // discriminate. What this file owns is the writing of turn outcomes.
+  describe("regression: rounds 3-5 — turn outcomes, park kinds, compensation guards", () => {
+    // Pause a spawn-path turn the instant its run row goes live (pid + cleared
+    // question) and run `sabotage` there. That is the exact window between the
+    // run write and the ticket transition, where an abandoned turn row is born.
+    function sabotageAfterRunStarted(
+      runId: string,
+      sabotage: () => Promise<void>,
+    ): ReturnType<typeof vi.spyOn> {
+      const originalUpdateOne = Collection.prototype.updateOne;
+      let armed = true;
+      return vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+        async function (this: Collection, filter, update, options) {
+          const set = (update as { $set?: Record<string, unknown> }).$set;
+          const isRunStarted =
+            armed &&
+            this.collectionName === "runs" &&
+            String((filter as Record<string, unknown>)?._id) === runId &&
+            !!set &&
+            "pid" in set &&
+            "awaitingQuestion" in set;
+          const result = await originalUpdateOne.call(
+            this,
+            filter,
+            update,
+            options,
+          );
+          if (isRunStarted) {
+            armed = false;
+            await sabotage();
+          }
+          return result;
+        },
+      );
     }
-
-    it("keeps eof true on the dispatch turn THROUGH the continue claim window", async () => {
-      const { runId } = await parkRun(21);
-
-      // Tail the dispatch turn to its end on the parked run: eof must be true.
-      const parkedRun = await runs.findOne({ _id: new ObjectId(runId) });
-      const dispatchTurn = parkedRun!.turns.find((t) => t.kind === "dispatch")!;
-      expect(
-        (await tail({ runId, turnId: dispatchTurn.id, cursor: 0 })).eof,
-      ).toBe(true);
-
-      // Freeze continueExecution the moment its claim lands. This is the window
-      // the previous fix missed: the run is `running` again and the continue
-      // turn has not been appended, so the dispatch turn is BOTH last in the
-      // array and on a running run. eof must not flip back to false here — a
-      // client that stopped polling on the first eof would never resume, and a
-      // client that saw eof go false would re-open a finished stream.
-      delete process.env.T4D_OUTCOME;
-      const pause = pauseAfterContinueClaim(runId);
-      const continuePromise = continueExecution(runId, "keep going");
-      await pause.reached;
-      try {
-        const midClaim = await runs.findOne({ _id: new ObjectId(runId) });
-        expect(midClaim?.status).toBe("running");
-        expect(midClaim?.turns).toHaveLength(1);
-        expect(
-          (await tail({ runId, turnId: dispatchTurn.id, cursor: 0 })).eof,
-        ).toBe(true);
-      } finally {
-        pause.release();
-        pause.spy.mockRestore();
-      }
-      await continuePromise;
-      await waitForContinueTurn(runId, 1);
-
-      // ...and still true once the continue turn has come and gone.
-      expect(
-        (await tail({ runId, turnId: dispatchTurn.id, cursor: 0 })).eof,
-      ).toBe(true);
-    }, 20_000);
 
     it("writes the dispatch turn's outcome when the run parks for input", async () => {
       const { runId } = await parkRun(25);
@@ -1331,6 +1275,268 @@ describe("continueExecution", () => {
       const run = await runs.findOne({ _id: new ObjectId(runId) });
       expect(run?.status).toBe("awaiting_input");
       expect(run?.executionLeaseId).toBeNull();
+    }, 20_000);
+
+    it("leaves no unresolved turn when a continue's ticket transition misses", async () => {
+      const { runId, ticketId } = await parkRun(34);
+      delete process.env.T4D_OUTCOME;
+
+      const spy = sabotageAfterRunStarted(runId, async () => {
+        // Move the ticket so the transition that follows matches nothing. The
+        // throw takes continueExecution into its compensation path, which knows
+        // nothing about turns.
+        await tickets.updateOne(
+          { _id: new ObjectId(ticketId) },
+          { $set: { status: "blocked", updatedAt: timestamp() } },
+        );
+      });
+      try {
+        await expect(
+          continueExecution(runId, "keep going"),
+        ).rejects.toMatchObject({ code: "spawn_failed" });
+      } finally {
+        spy.mockRestore();
+      }
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      expect(run?.status).toBe("awaiting_input");
+      // A turn row nothing will ever close renders "running" forever and flips
+      // every later turn's eof true → false → true.
+      expect(run?.turns.filter((t) => t.outcome === null)).toHaveLength(0);
+      expect(run?.turns).toHaveLength(1);
+    }, 20_000);
+
+    it("leaves no unresolved turn when a resume's ticket transition misses", async () => {
+      const { runId, ticketId } = await parkRun(35);
+      process.env.T4D_OUTCOME = JSON.stringify({ outcome: "completed" });
+
+      const spy = sabotageAfterRunStarted(runId, async () => {
+        await tickets.updateOne(
+          { _id: new ObjectId(ticketId) },
+          { $set: { status: "blocked", updatedAt: timestamp() } },
+        );
+      });
+      try {
+        await expect(resumeRun(runId, "carry on")).rejects.toMatchObject({
+          code: "spawn_failed",
+        });
+      } finally {
+        spy.mockRestore();
+      }
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      expect(run?.status).toBe("awaiting_input");
+      expect(run?.turns.filter((t) => t.outcome === null)).toHaveLength(0);
+      expect(run?.turns).toHaveLength(1);
+    }, 20_000);
+
+    it("publishes the dispatch turn's outcome no later than the park it describes", async () => {
+      process.env.T4D_OUTCOME = JSON.stringify({
+        outcome: "needs_input",
+        question: "Atomic?",
+      });
+      const ticketId = await insertApproved(36);
+
+      // finishRun's trailing write is the LAST thing the park does. Snapshot the
+      // run as it stands immediately before it: if the outcome is not already
+      // there, then the park was publicly visible with a null outcome, and a
+      // continue claim landing in that window reads eof:false for a finished
+      // turn.
+      const snapshots: Array<{
+        status: string | undefined;
+        dispatchOutcome: string | null | undefined;
+        ticketStatus: string | undefined;
+      }> = [];
+      const originalUpdateOne = Collection.prototype.updateOne;
+      const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+        async function (this: Collection, filter, update, options) {
+          const set = (update as { $set?: Record<string, unknown> }).$set;
+          if (this.collectionName === "runs" && set && "turns.$.outcome" in set) {
+            const id = (filter as { _id?: unknown })._id;
+            const doc = await runs.findOne({ _id: id } as never);
+            const ticket = doc
+              ? await tickets.findOne({ _id: new ObjectId(doc.ticketId) })
+              : null;
+            snapshots.push({
+              status: doc?.status,
+              dispatchOutcome: doc?.turns.find((t) => t.kind === "dispatch")
+                ?.outcome,
+              ticketStatus: ticket?.status,
+            });
+          }
+          return originalUpdateOne.call(this, filter, update, options);
+        },
+      );
+
+      let runId: string;
+      try {
+        ({ runId } = await dispatchRun(ticketId, "execute"));
+        await waitForRun(runId, "awaiting_input");
+        await waitForResolvedTurns(runId);
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(snapshots).toHaveLength(1);
+      expect(snapshots[0]).toEqual({
+        status: "awaiting_input",
+        dispatchOutcome: "needs_input",
+        ticketStatus: "needs_input",
+      });
+    }, 20_000);
+
+    it("keeps a healthy `continued` outcome when the monitor re-enters the finish path", async () => {
+      const { runId } = await parkRun(37);
+      delete process.env.T4D_OUTCOME;
+
+      const originalUpdateOne = Collection.prototype.updateOne;
+      let armed = true;
+      const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+        async function (this: Collection, filter, update, options) {
+          const set = (update as { $set?: Record<string, unknown> }).$set;
+          if (
+            armed &&
+            this.collectionName === "tickets" &&
+            (filter as Record<string, unknown>)?.activeRunId === runId &&
+            set?.status === "needs_input"
+          ) {
+            armed = false;
+            // The re-park's run write has already landed: status awaiting_input,
+            // lease released, turn stamped `continued`. Throwing HERE is what
+            // sends monitorContinue's catch back into finishContinueTurn, which
+            // reads exit -1 and would overwrite the healthy outcome with
+            // `failed` without the write-once term.
+            throw new Error("injected ticket re-park failure");
+          }
+          return originalUpdateOne.call(this, filter, update, options);
+        },
+      );
+
+      try {
+        await continueExecution(runId, "keep going");
+        await waitForContinueTurn(runId, 1);
+        // Give the second pass a bounded window to corrupt the outcome, then
+        // assert it never did.
+        const deadline = Date.now() + 2_000;
+        while (Date.now() < deadline) {
+          const current = await runs.findOne({ _id: new ObjectId(runId) });
+          const turn = current?.turns.find((t) => t.kind === "continue");
+          if (turn?.outcome === "failed") break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        spy.mockRestore();
+      }
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      expect(run?.turns.find((t) => t.kind === "continue")?.outcome).toBe(
+        "continued",
+      );
+    }, 20_000);
+
+    it("terminalizes a run whose continued re-park lost its CAS while still running", async () => {
+      const { runId, ticketId } = await parkRun(38);
+      delete process.env.T4D_OUTCOME;
+
+      const pause = pauseNextTurnResolution(runId);
+      const continuePromise = continueExecution(runId, "keep going");
+      await pause.reached;
+      try {
+        // A concurrent park slips an open row in, so the re-park's CAS misses
+        // while the run is STILL `running` and the lease is still ours. Every
+        // entry point gates on `awaiting_input`, so releasing the lease alone
+        // leaves the run unreachable until a process restart.
+        await runs.updateOne(
+          { _id: new ObjectId(runId) },
+          {
+            $push: {
+              exchanges: {
+                v: 1 as const,
+                at: timestamp(),
+                question: "Concurrent park",
+                handoff: null,
+                answer: null,
+                answeredAt: null,
+              },
+            },
+          },
+        );
+        pause.release();
+        await continuePromise;
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const current = await runs.findOne({ _id: new ObjectId(runId) });
+          if (current?.status === "failed") break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        pause.release();
+        pause.spy.mockRestore();
+      }
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      expect(run?.status).toBe("failed");
+      expect(run?.failureKind).toBe("runner_exit");
+      expect(run?.finishedAt).not.toBeNull();
+      expect(run?.executionLeaseId).toBeNull();
+      // A ticket still naming a dead run can never be dispatched again.
+      const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+      expect(ticket?.activeRunId).toBeNull();
+    }, 20_000);
+
+    it("does not re-run a finished dispatch turn when the monitor's catch fires", async () => {
+      process.env.T4D_OUTCOME = JSON.stringify({
+        outcome: "needs_input",
+        question: "Guarded?",
+      });
+      const ticketId = await insertApproved(39);
+
+      const originalUpdateOne = Collection.prototype.updateOne;
+      let armed = true;
+      const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+        async function (this: Collection, filter, update, options) {
+          const set = (update as { $set?: Record<string, unknown> }).$set;
+          if (
+            armed &&
+            this.collectionName === "runs" &&
+            set &&
+            "turns.$.outcome" in set
+          ) {
+            armed = false;
+            // The park has fully landed and already carries this turn's outcome.
+            // Throwing here drives monitorChild into its catch, which re-invokes
+            // finishRun with a synthetic exit -1.
+            throw new Error("injected outcome-write failure");
+          }
+          return originalUpdateOne.call(this, filter, update, options);
+        },
+      );
+
+      let runId: string;
+      try {
+        ({ runId } = await dispatchRun(ticketId, "execute"));
+        await waitForRun(runId, "awaiting_input");
+        // Give an unguarded second pass a bounded window to clear the pointer.
+        const deadline = Date.now() + 2_000;
+        while (Date.now() < deadline) {
+          const current = await tickets.findOne({ _id: new ObjectId(ticketId) });
+          if (current?.activeRunId === null) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        spy.mockRestore();
+      }
+
+      const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+      // needs_input with a null activeRunId has no legal way out: provide_input
+      // has no run to resume and dispatchRun refuses the ticket's status.
+      expect(ticket?.status).toBe("needs_input");
+      expect(ticket?.activeRunId).toBe(runId!);
+      const run = await runs.findOne({ _id: new ObjectId(runId!) });
+      expect(run?.status).toBe("awaiting_input");
+      expect(run?.turns.find((t) => t.kind === "dispatch")?.outcome).toBe(
+        "needs_input",
+      );
     }, 20_000);
 
     it("restoreParkedResume does not resurrect a terminalized run", async () => {

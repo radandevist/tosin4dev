@@ -6,7 +6,13 @@ import {
 import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
-import type { Collection, Db, Filter, PushOperator } from "mongodb";
+import type {
+  Collection,
+  Db,
+  Filter,
+  PushOperator,
+  UpdateOptions,
+} from "mongodb";
 import { unmetDependencies } from "../domain/dependencies";
 import {
   BoardSchema,
@@ -269,6 +275,30 @@ async function recordTurnOutcome(
   );
 }
 
+// A turn's outcome must never become visible LATER than the state change it
+// describes. Written as its own trailing update, the park is already public (run
+// `awaiting_input`, ticket `needs_input`, operator notified) while the turn that
+// produced it still reads `outcome: null` — and a continueExecution claim landing
+// in that window reports `eof: false` for a turn that is over. This folds the
+// outcome into the SAME updateOne as the state change, so the pair is atomic.
+//
+// Both array-filter terms are load-bearing. `t.id` pins THIS turn — a bare
+// `t.outcome: null` would stamp every unresolved turn in the array. `t.outcome:
+// null` keeps the write once-only, exactly as recordTurnOutcome's $elemMatch
+// does. An array filter matching no element is a silent no-op, not an error.
+type TurnStamp = { set: Record<string, unknown>; options: UpdateOptions };
+
+function turnStamp(
+  turnId: string | null,
+  outcome: Exclude<RunTurn["outcome"], null>,
+): TurnStamp {
+  if (turnId === null) return { set: {}, options: {} };
+  return {
+    set: { "turns.$[t].outcome": outcome },
+    options: { arrayFilters: [{ "t.id": turnId, "t.outcome": null }] },
+  };
+}
+
 async function recordSetupFailure(
   runId: string,
   ticketId: string,
@@ -499,7 +529,11 @@ export async function parkTicketNeedsInput(
   summary: string | null,
   handoff: HandoffBrief | null,
   at: string,
+  // The turn this park resolves, or null when no turn is in play (direct callers
+  // in tests). Its outcome rides THIS update — see turnStamp.
+  turnId: string | null,
 ): Promise<void> {
+  const stamp = turnStamp(turnId, "needs_input");
   await database.collection<RunDoc>("runs").updateOne(
     {
       _id: new ObjectId(runId),
@@ -511,6 +545,7 @@ export async function parkTicketNeedsInput(
         parkedBy: "question",
         awaitingQuestion: question,
         summary,
+        ...stamp.set,
       },
       $push: {
         exchanges: {
@@ -528,6 +563,7 @@ export async function parkTicketNeedsInput(
         },
       },
     },
+    stamp.options,
   );
   const tickets = database.collection<TicketDoc>("tickets");
   const nextStatus = transition("running", "run_needs_input");
@@ -556,6 +592,7 @@ async function failVerifiedRun(
   exitCode: number,
   summary: string | null,
   at: string,
+  stamp: TurnStamp,
 ): Promise<void> {
   await database.collection<RunDoc>("runs").updateOne(
     { _id: new ObjectId(runId), status: { $in: ["queued", "running", "verifying"] } },
@@ -567,8 +604,10 @@ async function failVerifiedRun(
         verdict: "failed",
         failureKind,
         finishedAt: at,
+        ...stamp.set,
       },
     },
+    stamp.options,
   );
 }
 
@@ -591,6 +630,7 @@ async function applyRunCompletion(
   stderrFile: string | null,
   board: Board,
   runDir: string,
+  turnId: string,
 ): Promise<Exclude<RunTurn["outcome"], null>> {
   const database = await db();
   const at = now();
@@ -601,6 +641,7 @@ async function applyRunCompletion(
 
   // spec_draft: read-only, no verification; ticket stays inbox.
   if (phase === "spec_draft") {
+    const stamp = turnStamp(turnId, succeeded ? "completed" : "failed");
     await runs.updateOne(
       { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
       {
@@ -609,8 +650,10 @@ async function applyRunCompletion(
           exitCode,
           summary,
           finishedAt: at,
+          ...stamp.set,
         },
       },
+      stamp.options,
     );
     const upd = await tickets.updateOne(
       { _id: new ObjectId(ticketId), activeRunId: runId, status: "inbox" },
@@ -634,6 +677,7 @@ async function applyRunCompletion(
 
   // execute / review_fix — a nonzero runner exit fails fast, no verification.
   if (!succeeded) {
+    const stamp = turnStamp(turnId, "failed");
     await runs.updateOne(
       { _id: new ObjectId(runId), status: { $in: ["queued", "running", "verifying"] } },
       {
@@ -643,8 +687,10 @@ async function applyRunCompletion(
           summary,
           failureKind: "runner_exit",
           finishedAt: at,
+          ...stamp.set,
         },
       },
+      stamp.options,
     );
     await transitionTicketFailed(database, ticketId, runId, at, `run failed (exit ${exitCode})`);
     await notifyBlocked(
@@ -681,6 +727,7 @@ async function applyRunCompletion(
       outSummary,
       outcome.handoff,
       at,
+      turnId,
     );
     await notify(
       `⏸️ needs input: ${await ticketLabel(database, ticketId)} — ${outcome.question ?? ""}`,
@@ -696,6 +743,7 @@ async function applyRunCompletion(
       exitCode,
       outSummary,
       failedAt,
+      turnStamp(turnId, "failed"),
     );
     await transitionTicketFailed(
       database,
@@ -725,7 +773,8 @@ async function applyRunCompletion(
       { $set: { status: "verifying" } },
     );
     // Someone else already terminalized the run. Touch nothing further, but the
-    // turn still declared `completed` and its own row is ours to close.
+    // turn still declared `completed`. This is the one branch with no state
+    // change to fold the outcome into — finishRun's backstop closes the row.
     if (claimed.matchedCount === 0) return "completed";
     const run = await runs.findOne({ _id: new ObjectId(runId) });
     const result = await verifyRun({
@@ -748,6 +797,7 @@ async function applyRunCompletion(
     const doneAt = now();
     await database.collection("evidence").insertOne({ ...evidence, createdAt: doneAt });
     if (result.verdict === "passed") {
+      const stamp = turnStamp(turnId, "completed");
       await runs.updateOne(
         { _id: new ObjectId(runId), status: "verifying" },
         {
@@ -757,8 +807,10 @@ async function applyRunCompletion(
             summary: outSummary,
             verdict: "passed",
             finishedAt: doneAt,
+            ...stamp.set,
           },
         },
+        stamp.options,
       );
       await transitionTicketSucceeded(database, ticketId, runId, doneAt);
       await notifyReviewReady(database, ticketId, outSummary);
@@ -771,6 +823,7 @@ async function applyRunCompletion(
       exitCode,
       outSummary,
       doneAt,
+      turnStamp(turnId, "completed"),
     );
     await transitionTicketFailed(database, ticketId, runId, doneAt, `verification ${result.failureKind}`);
     await notifyBlocked(
@@ -794,6 +847,7 @@ async function applyRunCompletion(
       exitCode,
       outSummary,
       failAt,
+      turnStamp(turnId, "completed"),
     );
     await transitionTicketFailed(database, ticketId, runId, failAt, "verification error");
     await notifyBlocked(
@@ -807,9 +861,14 @@ async function applyRunCompletion(
   }
 }
 
-// Thin wrapper: apply the completion, then publish the turn's outcome. The
-// outcome is written LAST on purpose — writing it first opens a window where a
-// reader sees `completed` on a run that is still `running`.
+// Apply the completion, then close the turn. Every terminal branch of
+// applyRunCompletion folds the turn's outcome into the SAME updateOne as the
+// state change that outcome describes, so the outcome can never be observed
+// later than the state it explains. This call is the BACKSTOP for the branches
+// whose state CAS matched nothing (the run was terminalized underneath us) and
+// therefore wrote no outcome either: the turn is still over and must not render
+// as running forever. It is write-once, so when the folded write landed it is a
+// no-op.
 async function finishRun(
   runId: string,
   ticketId: string,
@@ -832,6 +891,7 @@ async function finishRun(
     stderrFile,
     board,
     runDir,
+    turnId,
   );
   const database = await db();
   await recordTurnOutcome(
@@ -876,6 +936,19 @@ async function monitorChild(
       logFile,
       `\nSupervisor stream failure: ${error instanceof Error ? error.message : "unknown error"}\n`,
     ).catch(() => undefined);
+    // Re-entry guard, mirroring the released-lease check in finishContinueTurn.
+    // The first pass writes a turn's outcome in the SAME update as the state it
+    // implies, so an outcome already present PROVES that state was applied.
+    // Re-running finishRun with a synthetic exit -1 would then fail a run that is
+    // legitimately parked and clear its ticket's activeRunId, dead-ending a
+    // needs_input ticket whose only outgoing edge needs that pointer.
+    const settled = await (await db())
+      .collection<RunDoc>("runs")
+      .findOne({
+        _id: new ObjectId(runId),
+        turns: { $elemMatch: { id: turnId, outcome: { $ne: null } } },
+      });
+    if (settled) return;
     await finishRun(
       runId,
       ticketId,
@@ -1168,15 +1241,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
 
     const runStarted = await runs.updateOne(
       { _id: new ObjectId(runId), status: "running" },
-      {
-        $set: { pid: spawnedChild.pid, awaitingQuestion: null },
-        $push: {
-          turns: {
-            $each: [resumeTurn],
-            $slice: -TURN_CAP,
-          },
-        },
-      },
+      { $set: { pid: spawnedChild.pid, awaitingQuestion: null } },
     );
     if (runStarted.matchedCount === 0) {
       throw new ServerResultError("conflict", "run left running");
@@ -1205,6 +1270,19 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
         "conflict",
         "ticket is no longer awaiting input",
       );
+    }
+    // The turn row is pushed LAST, after every write that can still throw. A row
+    // pushed earlier and then abandoned by the catch below keeps `outcome: null`
+    // forever — restoreParkedResume knows nothing about turns, so a healthy,
+    // re-parked, operator-facing run would render that turn "running" for good
+    // and flip every later turn's eof true → false → true. A turn row exists
+    // only once a monitor is guaranteed to close it.
+    const turnRecorded = await runs.updateOne(
+      { _id: new ObjectId(runId), status: "running" },
+      { $push: { turns: { $each: [resumeTurn], $slice: -TURN_CAP } } },
+    );
+    if (turnRecorded.matchedCount === 0) {
+      throw new ServerResultError("conflict", "run left running");
     }
 
     void monitorChild(
@@ -1328,6 +1406,9 @@ async function finishContinueTurn(
   // designed to repeat. Without re-capturing it here the next turn resumes the
   // session as it stood BEFORE this one, silently discarding this turn.
   const rotatedSessionId = parseSessionId(run.runner, stdout);
+  // Same rule as every other park: the outcome rides the update that publishes
+  // the park, never a later one.
+  const reparkStamp = turnStamp(turnId, resolved);
   const reparked = await runs.updateOne(
     {
       _id: new ObjectId(runId),
@@ -1347,6 +1428,7 @@ async function finishContinueTurn(
         executionLeaseId: null,
         executionLeaseExpiresAt: null,
         ...(rotatedSessionId ? { executionSessionId: rotatedSessionId } : {}),
+        ...reparkStamp.set,
       },
       $push: {
         exchanges: {
@@ -1364,6 +1446,7 @@ async function finishContinueTurn(
         },
       },
     },
+    reparkStamp.options,
   );
   if (reparked.matchedCount === 0) {
     // Release the lease FIRST. Every other early return in this function does,
@@ -1371,7 +1454,7 @@ async function finishContinueTurn(
     // the next continueExecution is rejected with "run is already executing" and
     // nothing clears it until a process restart runs recoverOrphans. The filter
     // pins our own lease id, so if the lease already moved on this is a no-op.
-    await runs.updateOne(
+    const released = await runs.updateOne(
       { _id: new ObjectId(runId), executionLeaseId: leaseId },
       {
         $set: {
@@ -1382,9 +1465,51 @@ async function finishContinueTurn(
         },
       },
     );
-    // The turn is over even though it lost its claim. Record its outcome — the id
-    // is unique to this turn, so this touches nothing the winning turn owns.
+    if (released.matchedCount === 0) {
+      // The lease already moved to a newer turn, which owns the run's state now.
+      // Record this turn — the id is unique to it — and touch nothing else.
+      await recordTurnOutcome(runs, runId, turnId, resolved);
+      return;
+    }
+    // We still held the lease, so no other turn is driving this run — yet the
+    // re-park missed, leaving the run `running` behind a dead child. Releasing
+    // the lease alone changes nothing: every entry point gates on
+    // `awaiting_input`, so the run is unreachable until a process restart.
+    // Terminalize it, exactly as the ticket-moved branch below does. The
+    // `status: "running"` term makes this a no-op when the run was already
+    // terminalized underneath us — the other way this CAS misses.
+    const terminalized = await runs.updateOne(
+      { _id: new ObjectId(runId), status: "running" },
+      {
+        $set: {
+          status: "failed",
+          failureKind: "runner_exit",
+          finishedAt: at,
+          summary: "run could not be re-parked between turns",
+          ...reparkStamp.set,
+        },
+      },
+      reparkStamp.options,
+    );
     await recordTurnOutcome(runs, runId, turnId, resolved);
+    if (terminalized.matchedCount > 0) {
+      // A ticket left pointing at a dead run has no legal way out: dispatchRun
+      // refuses a non-null activeRunId and needs_input's only edge is answered
+      // by a run that no longer exists.
+      await database
+        .collection<TicketDoc>("tickets")
+        .updateOne(
+          { _id: new ObjectId(run.ticketId), activeRunId: runId },
+          { $set: { activeRunId: null, updatedAt: at } },
+        );
+      await notifyBlocked(
+        database,
+        run.ticketId,
+        "run could not be re-parked between turns",
+        run.logFile,
+        run.stderrFile,
+      );
+    }
     return;
   }
 
@@ -1410,8 +1535,10 @@ async function finishContinueTurn(
           failureKind: "runner_exit",
           finishedAt: at,
           summary: "ticket moved while the run was parked between turns",
+          ...reparkStamp.set,
         },
       },
+      reparkStamp.options,
     );
     await database
       .collection<TicketDoc>("tickets")
@@ -1666,12 +1793,6 @@ export async function continueExecution(
       },
       {
         $set: { pid: spawnedChild.pid, awaitingQuestion: null },
-        $push: {
-          turns: {
-            $each: [continueTurn],
-            $slice: -TURN_CAP,
-          },
-        },
       },
     );
     if (runStarted.matchedCount === 0) {
@@ -1698,6 +1819,20 @@ export async function continueExecution(
         "conflict",
         "ticket is no longer awaiting input",
       );
+    }
+    // Pushed LAST, for the same reason as resumeRun's resume turn: a row written
+    // before a throw is a turn nothing will ever close. Carries the lease id so a
+    // turn that lost its claim can still never write.
+    const turnRecorded = await runs.updateOne(
+      {
+        _id: new ObjectId(runId),
+        status: "running",
+        executionLeaseId: leaseId,
+      },
+      { $push: { turns: { $each: [continueTurn], $slice: -TURN_CAP } } },
+    );
+    if (turnRecorded.matchedCount === 0) {
+      throw new ServerResultError("conflict", "run left running");
     }
 
     void monitorContinue(
