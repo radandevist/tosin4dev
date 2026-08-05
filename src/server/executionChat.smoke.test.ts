@@ -150,9 +150,12 @@ async function waitForContinueTurn(
   throw new Error(`run ${runId} continue turns did not resolve`);
 }
 
-// finishRun publishes a turn's outcome AFTER the run state that outcome implies,
-// so polling on run status alone races the write. Wait for every turn to carry
-// one — that is the point at which the run is fully settled.
+// A turn's outcome is now folded into the SAME update as the state change it
+// describes, so a run seen `awaiting_input` already carries it — but not every
+// path folds: the compensation paths stamp with a trailing recordTurnOutcome.
+// Waiting for every turn to carry an outcome is the one settle point that holds
+// for all of them. It is NOT the run's last write: finishRun's trailing backstop
+// still follows (see pauseNextTurnResolution).
 async function waitForResolvedTurns(
   runId: string,
   timeoutMs = 15_000,
@@ -185,20 +188,27 @@ async function parkRun(
   const { runId } = await dispatchRun(ticketId, "execute");
   await waitForRun(runId, "awaiting_input");
   const parked = await waitForResolvedTurns(runId);
-  // Settle the DISPATCH turn before handing the run back. Its outcome is
-  // published after the park, so a test that installs an updateOne spy the
-  // instant the run parks would otherwise intercept that trailing write instead
-  // of the continue-turn write it means to freeze.
+  // Settle the DISPATCH turn before handing the run back — its park, its ticket
+  // transition and its outcome are all public by the time this returns. One
+  // write still trails it (finishRun's backstop), which is why
+  // pauseNextTurnResolution must not match that write's shape.
   expect(parked.executionSessionId).toBe("s-smoke");
   return { runId, ticketId, parked };
 }
 
-// Pause the first state-mutating write a resolving continue turn makes for the
-// run. A turn resolves via one of: the `turns.$.outcome` write, the lease
-// release (terminal outcomes), or the re-park (continued outcomes). Which one
-// comes first is a property of the code under test — pausing on whichever
-// arrives first lets a test move the lease / run / ticket underneath the turn
-// at the earliest point it touches state, before any guard has a chance to run.
+// Pause the first STATE-MUTATING write a resolving continue turn makes for the
+// run: the lease release (terminal outcomes) or the re-park, which nulls the
+// lease and folds the turn's outcome into the same update (continued outcomes).
+// Pausing there lets a test move the lease / run / ticket underneath the turn at
+// the earliest point it touches state, before any guard has a chance to run.
+//
+// The bare `turns.$.outcome` shape is deliberately NOT matched. That is
+// finishRun's trailing backstop, a no-op once the folded stamp has landed — and
+// since the outcome became atomic with the state it describes, waitForResolvedTurns
+// returns one write BEFORE it. So parkRun hands back a run whose dispatch turn
+// still has that write in flight, and a helper matching it pauses on the previous
+// turn's backstop instead of the continue turn's first write: the sabotage then
+// lands before the continue turn has spawned and the test proves nothing.
 function pauseNextTurnResolution(runId: string): {
   reached: Promise<void>;
   release: () => void;
@@ -225,13 +235,14 @@ function pauseNextTurnResolution(runId: string): {
       const id = (filter as { _id?: { toString(): string } })._id;
       const set = (update as { $set?: Record<string, unknown> })
         .$set as Record<string, unknown> | undefined;
-      const isOutcomeWrite = typeof set?.["turns.$.outcome"] === "string";
+      const isFoldedOutcomeWrite =
+        typeof set?.["turns.$[t].outcome"] === "string";
       const isLeaseMutation = set?.executionLeaseId === null;
       if (
         !paused &&
         this.collectionName === "runs" &&
         id?.toString() === runId &&
-        (isOutcomeWrite || isLeaseMutation)
+        (isLeaseMutation || isFoldedOutcomeWrite)
       ) {
         paused = true;
         reachedResolve();
@@ -1336,6 +1347,23 @@ describe("continueExecution", () => {
         question: "Atomic?",
       });
       const ticketId = await insertApproved(36);
+      // A foreign run whose turn is still unresolved, standing in for an earlier
+      // test's in-flight monitor.
+      const strayTurnId = new ObjectId().toString();
+      const strayRunId = await seedRunDoc(await insertApproved(42), {
+        turns: [
+          {
+            v: 1 as const,
+            id: strayTurnId,
+            index: 0,
+            at: timestamp(),
+            kind: "dispatch" as const,
+            outcome: null,
+            stdoutFile: `${repo}/.tosin4dev/turns/${strayTurnId}/stdout.log`,
+            stderrFile: `${repo}/.tosin4dev/turns/${strayTurnId}/stderr.log`,
+          },
+        ],
+      });
 
       // finishRun's trailing write is the LAST thing the park does. Snapshot the
       // run as it stands immediately before it: if the outcome is not already
@@ -1354,9 +1382,19 @@ describe("continueExecution", () => {
           if (this.collectionName === "runs" && set && "turns.$.outcome" in set) {
             const id = (filter as { _id?: unknown })._id;
             const doc = await runs.findOne({ _id: id } as never);
-            const ticket = doc
-              ? await tickets.findOne({ _id: new ObjectId(doc.ticketId) })
-              : null;
+            // Scope the snapshot to THIS test's run. The spy sees every run, and
+            // a monitor still in flight from an earlier test lands its own
+            // trailing outcome write in this window — a doc already deleted by
+            // beforeEach at that, which would push a snapshot of `undefined` and
+            // break the length assertion below. Match on the ticket rather than
+            // the run id: runId is only bound after dispatchRun returns, which is
+            // after this spy is armed.
+            if (doc?.ticketId !== ticketId) {
+              return originalUpdateOne.call(this, filter, update, options);
+            }
+            const ticket = await tickets.findOne({
+              _id: new ObjectId(doc.ticketId),
+            });
             snapshots.push({
               status: doc?.status,
               dispatchOutcome: doc?.turns.find((t) => t.kind === "dispatch")
@@ -1370,6 +1408,16 @@ describe("continueExecution", () => {
 
       let runId: string;
       try {
+        // A monitor still in flight from an EARLIER test lands its own trailing
+        // outcome write in this window; stand one in explicitly so the scoping
+        // above is pinned rather than left to timing.
+        await runs.updateOne(
+          {
+            _id: new ObjectId(strayRunId),
+            turns: { $elemMatch: { id: strayTurnId, outcome: null } },
+          },
+          { $set: { "turns.$.outcome": "failed" } },
+        );
         ({ runId } = await dispatchRun(ticketId, "execute"));
         await waitForRun(runId, "awaiting_input");
         await waitForResolvedTurns(runId);
@@ -1479,9 +1527,173 @@ describe("continueExecution", () => {
       expect(run?.failureKind).toBe("runner_exit");
       expect(run?.finishedAt).not.toBeNull();
       expect(run?.executionLeaseId).toBeNull();
-      // A ticket still naming a dead run can never be dispatched again.
+      // The persisted turn must describe the run it produced. `continued` here
+      // would be a history that claims the turn carried on.
+      expect(run?.turns.find((t) => t.kind === "continue")?.outcome).toBe(
+        "failed",
+      );
+      // A ticket still naming a dead run can never be dispatched again...
       const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
       expect(ticket?.activeRunId).toBeNull();
+      // ...and a ticket left `running` has no outgoing edge at all: no gate, no
+      // public event, and dispatchRun needs `approved`. `blocked` is the status
+      // the operator was just notified about, and it has a resume gate.
+      expect(ticket?.status).toBe("blocked");
+    }, 20_000);
+
+    it("never fails a run a newer turn has claimed when its re-park misses", async () => {
+      const { runId, ticketId } = await parkRun(40);
+      delete process.env.T4D_OUTCOME;
+
+      const originalUpdateOne = Collection.prototype.updateOne;
+      let sabotaged = false;
+      let claimed = false;
+      const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+        async function (this: Collection, filter, update, options) {
+          const set = (update as { $set?: Record<string, unknown> }).$set;
+          const isThisRun =
+            this.collectionName === "runs" &&
+            String((filter as Record<string, unknown>)?._id) === runId;
+          if (!sabotaged && isThisRun && set?.status === "awaiting_input") {
+            // Slip an open exchange row in just before the re-park lands, so its
+            // CAS misses while the run is still `running` under this turn's lease.
+            sabotaged = true;
+            // Re-entering the mock is harmless: this write matches neither arm.
+            await runs.updateOne(
+              { _id: new ObjectId(runId) },
+              {
+                $push: {
+                  exchanges: {
+                    v: 1 as const,
+                    at: timestamp(),
+                    question: "Concurrent park",
+                    handoff: null,
+                    answer: null,
+                    answeredAt: null,
+                  },
+                },
+              },
+            );
+          }
+          const result = await originalUpdateOne.call(
+            this,
+            filter,
+            update,
+            options,
+          );
+          // A write that frees this run's lease WITHOUT terminalizing it is the
+          // unfenced ordering's tell: the run is `running`, its lease is free,
+          // and a real continueExecution can claim it right here. Simulate that
+          // claim — turn N+1 now owns the run, and nothing turn N does afterwards
+          // may touch it.
+          if (
+            !claimed &&
+            isThisRun &&
+            set?.executionLeaseId === null &&
+            !("status" in (set ?? {}))
+          ) {
+            claimed = true;
+            await runs.updateOne(
+              { _id: new ObjectId(runId), executionLeaseId: null },
+              {
+                $set: {
+                  status: "running",
+                  executionLeaseId: "turn-n-plus-1",
+                  executionLeaseExpiresAt: new Date(
+                    Date.now() + 60_000,
+                  ).toISOString(),
+                },
+              },
+            );
+          }
+          return result;
+        },
+      );
+
+      try {
+        await continueExecution(runId, "keep going");
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const current = await runs.findOne({ _id: new ObjectId(runId) });
+          if (current?.status === "failed") break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        spy.mockRestore();
+      }
+
+      const run = await runs.findOne({ _id: new ObjectId(runId) });
+      // The terminalize is fenced on this turn's lease and clears it in the same
+      // update, so no claim can interleave: a lease still reading
+      // `turn-n-plus-1` means turn N failed a run a live turn owned.
+      expect(run?.executionLeaseId).toBeNull();
+      expect(run?.status).toBe("failed");
+      const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+      expect(ticket?.status).toBe("blocked");
+    }, 20_000);
+
+    it("pauses a continue turn on a state-mutating write, not on the trailing outcome backstop", async () => {
+      const ticketId = await insertApproved(41);
+      const turnId = new ObjectId().toString();
+      const runId = await seedRunDoc(ticketId, {
+        executionLeaseId: "lease-under-test",
+        turns: [
+          {
+            v: 1 as const,
+            id: turnId,
+            index: 0,
+            at: timestamp(),
+            kind: "dispatch" as const,
+            outcome: null,
+            stdoutFile: `${repo}/.tosin4dev/turns/${turnId}/stdout.log`,
+            stderrFile: `${repo}/.tosin4dev/turns/${turnId}/stderr.log`,
+          },
+        ],
+      });
+
+      const pause = pauseNextTurnResolution(runId);
+      // Never awaited: if the helper wrongly matches this shape it blocks inside
+      // the spy until release, and awaiting it would hang the test instead of
+      // failing an assertion.
+      let backstop: Promise<unknown> | undefined;
+      let folded: Promise<unknown> | undefined;
+      try {
+        // finishRun's trailing backstop: the bare positional outcome write, a
+        // no-op once the folded stamp landed. parkRun returns BEFORE it, so every
+        // test installing this spy races it. Pausing here freezes the previous
+        // turn and the sabotage lands before the continue turn has spawned.
+        backstop = runs.updateOne(
+          {
+            _id: new ObjectId(runId),
+            turns: { $elemMatch: { id: turnId, outcome: null } },
+          },
+          { $set: { "turns.$.outcome": "needs_input" } },
+        );
+        const raced = await Promise.race([
+          pause.reached.then(() => "paused"),
+          new Promise((resolve) => setTimeout(() => resolve("idle"), 250)),
+        ]);
+        expect(raced).toBe("idle");
+
+        // The re-park's shape — lease released, outcome folded in. THIS is what
+        // the helper must freeze.
+        folded = runs.updateOne(
+          { _id: new ObjectId(runId) },
+          {
+            $set: {
+              status: "awaiting_input",
+              executionLeaseId: null,
+              "turns.$[t].outcome": "continued",
+            },
+          },
+          { arrayFilters: [{ "t.id": turnId }] } as never,
+        );
+        await pause.reached;
+      } finally {
+        pause.release();
+        await Promise.allSettled([backstop, folded]);
+        pause.spy.mockRestore();
+      }
     }, 20_000);
 
     it("does not re-run a finished dispatch turn when the monitor's catch fires", async () => {
