@@ -248,14 +248,37 @@ async function removeUnusedWorktree(
   }
 }
 
+// A turn's outcome is written EXACTLY once. The `outcome: null` term is what
+// makes that true: monitorContinue's catch can re-enter finishContinueTurn after
+// a healthy turn already resolved, and would otherwise overwrite `continued`
+// with `failed`. $elemMatch rather than dotted paths — dotted conditions on an
+// array match across DIFFERENT elements, so the positional `$` could bind an
+// element that satisfies only one of the two terms.
+async function recordTurnOutcome(
+  runs: Collection<RunDoc>,
+  runId: string,
+  turnId: string,
+  outcome: Exclude<RunTurn["outcome"], null>,
+): Promise<void> {
+  await runs.updateOne(
+    {
+      _id: new ObjectId(runId),
+      turns: { $elemMatch: { id: turnId, outcome: null } },
+    },
+    { $set: { "turns.$.outcome": outcome } },
+  );
+}
+
 async function recordSetupFailure(
   runId: string,
   ticketId: string,
   originalStatus: TicketStatus,
+  turnId: string,
 ): Promise<void> {
   const database = await db();
+  const runs = database.collection<RunDoc>("runs");
   const at = now();
-  await database.collection<RunDoc>("runs").updateOne(
+  await runs.updateOne(
     { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
     {
       $set: {
@@ -266,6 +289,9 @@ async function recordSetupFailure(
       },
     },
   );
+  // The dispatch turn never ran, but it is over. A turn with no outcome renders
+  // as "running" forever.
+  await recordTurnOutcome(runs, runId, turnId, "failed");
   await database.collection<TicketDoc>("tickets").updateOne(
     { _id: new ObjectId(ticketId), activeRunId: runId },
     {
@@ -546,7 +572,16 @@ async function failVerifiedRun(
   );
 }
 
-async function finishRun(
+// Apply everything a finished process implies (run status, verification, ticket
+// transitions, notifications) and RETURN what that turn produced. The non-null
+// return type is the mechanism: TypeScript refuses to compile a terminal branch
+// that forgets to declare an outcome, which is how `finishRun` can promise that
+// every dispatch/resume/continue turn ends with one written exactly once.
+//
+// The returned value describes THE TURN, not the run: a turn that declared
+// `completed` returns "completed" even when Tosin4dev's own verification then
+// fails the run. The run's status carries that verdict.
+async function applyRunCompletion(
   runId: string,
   ticketId: string,
   phase: Phase,
@@ -556,7 +591,7 @@ async function finishRun(
   stderrFile: string | null,
   board: Board,
   runDir: string,
-): Promise<void> {
+): Promise<Exclude<RunTurn["outcome"], null>> {
   const database = await db();
   const at = now();
   const succeeded = exitCode === 0;
@@ -594,7 +629,7 @@ async function finishRun(
         { $set: { activeRunId: null, updatedAt: at } },
       );
     }
-    return;
+    return succeeded ? "completed" : "failed";
   }
 
   // execute / review_fix — a nonzero runner exit fails fast, no verification.
@@ -619,7 +654,7 @@ async function finishRun(
       logFile,
       stderrFile,
     );
-    return;
+    return "failed";
   }
 
   // exit 0: capture the session id, then read the runner's declared outcome.
@@ -650,7 +685,7 @@ async function finishRun(
     await notify(
       `⏸️ needs input: ${await ticketLabel(database, ticketId)} — ${outcome.question ?? ""}`,
     );
-    return;
+    return "needs_input";
   }
   if (outcome.outcome === "failed") {
     const failedAt = now();
@@ -676,7 +711,7 @@ async function finishRun(
       logFile,
       stderrFile,
     );
-    return;
+    return "failed";
   }
 
   // outcome.outcome === "completed" falls through to the existing verification gate.
@@ -689,7 +724,9 @@ async function finishRun(
       { _id: new ObjectId(runId), status: { $in: ["queued", "running"] } },
       { $set: { status: "verifying" } },
     );
-    if (claimed.matchedCount === 0) return;
+    // Someone else already terminalized the run. Touch nothing further, but the
+    // turn still declared `completed` and its own row is ours to close.
+    if (claimed.matchedCount === 0) return "completed";
     const run = await runs.findOne({ _id: new ObjectId(runId) });
     const result = await verifyRun({
       repoPath: board.repoPath,
@@ -725,7 +762,7 @@ async function finishRun(
       );
       await transitionTicketSucceeded(database, ticketId, runId, doneAt);
       await notifyReviewReady(database, ticketId, outSummary);
-      return;
+      return "completed";
     }
     await failVerifiedRun(
       database,
@@ -743,6 +780,7 @@ async function finishRun(
       logFile,
       stderrFile,
     );
+    return "completed";
   } catch (error) {
     await appendFile(
       logFile,
@@ -765,7 +803,43 @@ async function finishRun(
       logFile,
       stderrFile,
     );
+    return "completed";
   }
+}
+
+// Thin wrapper: apply the completion, then publish the turn's outcome. The
+// outcome is written LAST on purpose — writing it first opens a window where a
+// reader sees `completed` on a run that is still `running`.
+async function finishRun(
+  runId: string,
+  ticketId: string,
+  phase: Phase,
+  exitCode: number,
+  stdout: string,
+  logFile: string,
+  stderrFile: string | null,
+  board: Board,
+  runDir: string,
+  turnId: string,
+): Promise<void> {
+  const resolved = await applyRunCompletion(
+    runId,
+    ticketId,
+    phase,
+    exitCode,
+    stdout,
+    logFile,
+    stderrFile,
+    board,
+    runDir,
+  );
+  const database = await db();
+  await recordTurnOutcome(
+    database.collection<RunDoc>("runs"),
+    runId,
+    turnId,
+    resolved,
+  );
 }
 
 async function monitorChild(
@@ -777,6 +851,7 @@ async function monitorChild(
   stderrFile: string | null,
   board: Board,
   runDir: string,
+  turnId: string,
 ): Promise<void> {
   try {
     const [stdout, , exitCode] = await Promise.all([
@@ -794,6 +869,7 @@ async function monitorChild(
       stderrFile,
       board,
       runDir,
+      turnId,
     );
   } catch (error) {
     await appendFile(
@@ -810,6 +886,7 @@ async function monitorChild(
       stderrFile,
       board,
       runDir,
+      turnId,
     );
   }
 }
@@ -824,75 +901,70 @@ async function restoreParkedResume(
   const runs = database.collection<RunDoc>("runs");
   const parkedRunState = {
     status: "awaiting_input" as const,
-    parkedBy: "question" as const,
+    // Restore the park EXACTLY as it was. This is the compensation path for
+    // continueExecution too, so hardcoding "question" would downgrade a
+    // `continued` park — and resumeRun, which is fail-closed, would then accept
+    // and terminalize a perfectly healthy continuable run.
+    parkedBy: run.parkedBy ?? ("question" as const),
     awaitingQuestion: question,
     pid: null,
     startedAt: run.startedAt,
   };
-  const updates = [
-    (async () => {
-      // Restore the parked status and its open row in one document write. A
-      // concurrent retry must never observe awaiting_input without an open
-      // exchange and claim the run before the row is reopened.
-      const restored = await runs.updateOne(
-        {
-          _id: new ObjectId(runId),
-          status: { $in: ["running", "queued"] },
-          exchanges: { $not: { $elemMatch: { answer: null } } },
-        },
-        {
-          $set: parkedRunState,
-          $push: {
-            exchanges: {
-              $each: [
-                {
-                  v: 1 as const,
-                  at,
-                  // Keep compensation rows valid when legacy data lacks a question.
-                  question: questionOrFallback(
-                    question,
-                    "(question unavailable)",
-                  ),
-                  handoff: null,
-                  answer: null,
-                  answeredAt: null,
-                },
-              ],
-              $slice: -EXCHANGE_CAP,
+  // Restore the parked status and its open row in one document write. A
+  // concurrent retry must never observe awaiting_input without an open
+  // exchange and claim the run before the row is reopened.
+  const restored = await runs.updateOne(
+    {
+      _id: new ObjectId(runId),
+      status: { $in: ["running", "queued"] },
+      exchanges: { $not: { $elemMatch: { answer: null } } },
+    },
+    {
+      $set: parkedRunState,
+      $push: {
+        exchanges: {
+          $each: [
+            {
+              v: 1 as const,
+              at,
+              // Keep compensation rows valid when legacy data lacks a question.
+              question: questionOrFallback(question, "(question unavailable)"),
+              handoff: null,
+              answer: null,
+              answeredAt: null,
             },
-          },
-        },
-      );
-      if (restored.matchedCount === 0) {
-        // If the claim failed before writing, the original row is still open.
-        // Restore status only rather than manufacturing a second open exchange.
-        // Guard against a run that was already terminalized while we raced.
-        const fallback = await runs.updateOne(
-          {
-            _id: new ObjectId(runId),
-            status: { $in: ["running", "queued"] },
-          },
-          { $set: parkedRunState },
-        );
-        if (fallback.matchedCount === 0) return;
-      }
-    })(),
-    database.collection<TicketDoc>("tickets").updateOne(
-      { _id: new ObjectId(run.ticketId), activeRunId: runId },
-      {
-        $set: {
-          status: "needs_input",
-          activeRunId: runId,
-          updatedAt: at,
+          ],
+          $slice: -EXCHANGE_CAP,
         },
       },
-    ),
-  ];
-  const results = await Promise.allSettled(updates);
-  const failed = results.find(
-    (result): result is PromiseRejectedResult => result.status === "rejected",
+    },
   );
-  if (failed) throw failed.reason;
+  if (restored.matchedCount === 0) {
+    // If the claim failed before writing, the original row is still open.
+    // Restore status only rather than manufacturing a second open exchange.
+    // Guard against a run that was already terminalized while we raced.
+    const fallback = await runs.updateOne(
+      { _id: new ObjectId(runId), status: { $in: ["running", "queued"] } },
+      { $set: parkedRunState },
+    );
+    // The run is gone. The ticket half MUST be skipped, not merely "returned
+    // past": a needs_input ticket whose activeRunId points at a terminalized run
+    // has no legal way out — needs_input's only outgoing edge is provide_input,
+    // which resumeRun rejects, and dispatchRun refuses a non-null activeRunId.
+    // Sequential, not Promise.all: array literals evaluate eagerly, so a ticket
+    // update sitting beside this one would fire no matter what we return.
+    if (fallback.matchedCount === 0) return;
+  }
+  await database.collection<TicketDoc>("tickets").updateOne(
+    { _id: new ObjectId(run.ticketId), activeRunId: runId },
+    {
+      $set: {
+        status: "needs_input",
+        activeRunId: runId,
+        updatedAt: at,
+      },
+    },
+  );
 }
 
 export async function resumeRun(runId: string, answer: string): Promise<void> {
@@ -1144,6 +1216,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
       run.stderrFile,
       board,
       runDir,
+      resumeTurnId,
     ).catch((error) =>
       console.error(`Resume monitor failed for run ${runId}:`, error),
     );
@@ -1223,10 +1296,7 @@ async function finishContinueTurn(
     // outcome — the id is unique to this turn, so this touches nothing the
     // winning turn owns.
     if (released.matchedCount === 0) {
-      await runs.updateOne(
-        { _id: new ObjectId(runId), "turns.id": turnId },
-        { $set: { "turns.$.outcome": resolved } },
-      );
+      await recordTurnOutcome(runs, runId, turnId, resolved);
       return;
     }
 
@@ -1240,13 +1310,7 @@ async function finishContinueTurn(
       run.stderrFile,
       board,
       runDir,
-    );
-    // Publish the declared outcome only after the state it implies is durable.
-    // Writing it first opens a window where readers see `completed` on a run
-    // that is still `running` — which is what makes this suite flaky.
-    await runs.updateOne(
-      { _id: new ObjectId(runId), "turns.id": turnId },
-      { $set: { "turns.$.outcome": resolved } },
+      turnId,
     );
     return;
   }
@@ -1270,10 +1334,8 @@ async function finishContinueTurn(
       executionLeaseId: leaseId,
       // Never resurrect a run that recoverOrphans (or any other path) already
       // terminalized while this turn was in flight.
-      status: "running",
-      // Never manufacture a second open row: the row this turn answered was
-      // closed atomically, so a concurrent park cannot have slipped one in.
       exchanges: { $not: { $elemMatch: { answer: null } } },
+      status: "running",
     },
     {
       $set: {
@@ -1304,12 +1366,25 @@ async function finishContinueTurn(
     },
   );
   if (reparked.matchedCount === 0) {
+    // Release the lease FIRST. Every other early return in this function does,
+    // and returning with it held strands the run `running` behind a dead pid:
+    // the next continueExecution is rejected with "run is already executing" and
+    // nothing clears it until a process restart runs recoverOrphans. The filter
+    // pins our own lease id, so if the lease already moved on this is a no-op.
+    await runs.updateOne(
+      { _id: new ObjectId(runId), executionLeaseId: leaseId },
+      {
+        $set: {
+          executionLeaseId: null,
+          executionLeaseExpiresAt: null,
+          // The child is gone; a stale pid reads as alive after PID recycling.
+          pid: null,
+        },
+      },
+    );
     // The turn is over even though it lost its claim. Record its outcome — the id
     // is unique to this turn, so this touches nothing the winning turn owns.
-    await runs.updateOne(
-      { _id: new ObjectId(runId), "turns.id": turnId },
-      { $set: { "turns.$.outcome": resolved } },
-    );
+    await recordTurnOutcome(runs, runId, turnId, resolved);
     return;
   }
 
@@ -1344,12 +1419,20 @@ async function finishContinueTurn(
         { _id: new ObjectId(run.ticketId), activeRunId: runId },
         { $set: { activeRunId: null, updatedAt: at } },
       );
+    // The run is dead. Record the turn and tell the operator the truth: falling
+    // through to the "awaiting input" notice below announces that a terminalized
+    // run is waiting for a message nothing will ever accept.
+    await recordTurnOutcome(runs, runId, turnId, resolved);
+    await notifyBlocked(
+      database,
+      run.ticketId,
+      "ticket moved while the run was parked between turns",
+      run.logFile,
+      run.stderrFile,
+    );
+    return;
   }
-  // Publish the declared outcome only once the re-park is durable.
-  await runs.updateOne(
-    { _id: new ObjectId(runId), "turns.id": turnId },
-    { $set: { "turns.$.outcome": resolved } },
-  );
+  await recordTurnOutcome(runs, runId, turnId, resolved);
   // Every other park in this file notifies. A silently parked run waits forever.
   await notify(
     `⏸️ continued, awaiting input: ${await ticketLabel(database, run.ticketId)}`,
@@ -1762,7 +1845,12 @@ export async function dispatchRun(
       ...run,
     });
   } catch (error) {
-    await recordSetupFailure(runId, ticketId, policy.requiredStatus);
+    await recordSetupFailure(
+      runId,
+      ticketId,
+      policy.requiredStatus,
+      dispatchTurnId,
+    );
     throw error;
   }
 
@@ -1847,6 +1935,7 @@ export async function dispatchRun(
       paths.stderrFile,
       board,
       paths.runDir,
+      dispatchTurnId,
     ).catch((error) =>
       console.error(`Supervisor monitor failed for run ${runId}:`, error),
     );
@@ -1859,7 +1948,12 @@ export async function dispatchRun(
     if (worktreeCreated) {
       await removeUnusedWorktree(board.repoPath, paths.workDir, runBranch);
     }
-    await recordSetupFailure(runId, ticketId, policy.requiredStatus);
+    await recordSetupFailure(
+      runId,
+      ticketId,
+      policy.requiredStatus,
+      dispatchTurnId,
+    );
     throw new ServerResultError("spawn_failed", "run could not be started");
   }
 }

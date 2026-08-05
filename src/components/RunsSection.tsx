@@ -350,9 +350,13 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
             </div>
           ) : null}
 
-          {shouldShowAnswerForm(parkedRun) ? (
-            <div className="space-y-2">
-              <div className="flex items-start gap-2">
+          {/* Consult is read-only and always available on a parked run. It sits
+              OUTSIDE the answer-form guard: hiding the answer form on a
+              `continued` park must not also remove the operator's only way to
+              open a consultation. */}
+          <div className="space-y-2">
+            <div className="flex items-start gap-2">
+              {shouldShowAnswerForm(parkedRun) ? (
                 <form
                   className="min-w-0 flex-1 space-y-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
                   onSubmit={(event) => {
@@ -396,23 +400,22 @@ export function RunsSection({ ticket }: { ticket: TicketDTO }) {
                     </p>
                   ) : null}
                 </form>
-                <button
-                  type="button"
-                  disabled={createConsultation.isPending}
-                  onClick={consult}
-                  className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium whitespace-nowrap text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {createConsultation.isPending ? "Opening…" : "Consult"}
-                </button>
-              </div>
-              {createConsultation.isError ? (
-                <p role="alert" className="text-sm text-rose-600">
-                  Could not start consultation:{" "}
-                  {createConsultation.error.message}
-                </p>
               ) : null}
+              <button
+                type="button"
+                disabled={createConsultation.isPending}
+                onClick={consult}
+                className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium whitespace-nowrap text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {createConsultation.isPending ? "Opening…" : "Consult"}
+              </button>
             </div>
-          ) : null}
+            {createConsultation.isError ? (
+              <p role="alert" className="text-sm text-rose-600">
+                Could not start consultation: {createConsultation.error.message}
+              </p>
+            ) : null}
+          </div>
 
           <div className="space-y-2 border-t border-zinc-200 pt-3">
             <div className="space-y-1">
