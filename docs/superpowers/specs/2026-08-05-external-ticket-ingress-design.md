@@ -104,8 +104,10 @@ Ingress-specific requirements on top:
 
 **Ingress creates a `ChatSession` instead of a ticket.** Closer to the chat-first model: the payload seeds a brainstorm you later continue. Rejected for now as strictly more machinery for the same outcome — you still have to sit down and drive the session. Reconsider if ingressed tickets pile up unspecced, which would be the signal that capture was never the real bottleneck.
 
-## 8. Open questions
+## 8. Decisions (owner, 2026-08-05)
 
-1. Does `source` want to be a free string or an enum? An enum is tidier but every new integration becomes a migration. Leaning free string with a length cap.
-2. Should an ingressed ticket notify (Discord), or is silent arrival correct? Leaning silent — the board is the queue, and a notification per captured thought is noise.
-3. Should ingress accept an optional `boardId` as an alternative to `boardSlug`? Slug is friendlier for hand-written integrations; id is stabler across renames.
+1. **`source` is a free string**, lowercased on write and capped at 40 characters — not an enum. A new integration must never require a code change and a migration just to identify itself. The cost is that a typo produces a stray source value on the board; that is cosmetic and editable, and it is the cheaper failure.
+
+2. **Ingress does not notify.** The ticket appears in `inbox` and waits. Discord notifications currently mean *something needs you now* — `blocked` and `review_ready` are both states where the system is stuck without you. A captured, unspecced ticket is not stuck; it is a queue entry. Notifying on arrival would dilute the signal until the channel stops being read, which costs more than the delay in noticing a new ticket.
+
+3. **The board is named by slug only.** `boardSlug` is the single accepted reference; `boardId` is not accepted. A slug is writable by hand and readable in a payload during debugging. The failure mode of a renamed board is a loud 404 at the sender, not silent misrouting, and the number of integrations pointing at any one board is small enough to fix by hand. Accepting both would add a second validation path and an ambiguity (slug and id present but disagreeing) for a problem that has not occurred yet.
