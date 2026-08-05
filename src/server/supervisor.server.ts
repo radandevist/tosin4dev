@@ -285,7 +285,16 @@ async function recordTurnOutcome(
 // Both array-filter terms are load-bearing. `t.id` pins THIS turn — a bare
 // `t.outcome: null` would stamp every unresolved turn in the array. `t.outcome:
 // null` keeps the write once-only, exactly as recordTurnOutcome's $elemMatch
-// does. An array filter matching no element is a silent no-op, not an error.
+// does.
+//
+// Precondition: the `turns` path must EXIST on the matched document. An array
+// filter matching no ELEMENT is a silent no-op, but an absent `turns` field
+// makes the whole updateOne throw MongoServerError 2 ("The path 'turns' must
+// exist in the document in order to apply array updates") — which would reject
+// the state change this stamp rides along with. Every caller satisfies it today:
+// the stamp always runs after the turn's own `$push`, on a document inserted
+// with `turns: []`. Do not fold a stamp into an update that can run before the
+// run document has a `turns` array.
 type TurnStamp = { set: Record<string, unknown>; options: UpdateOptions };
 
 function turnStamp(
@@ -1409,6 +1418,9 @@ async function finishContinueTurn(
   // Same rule as every other park: the outcome rides the update that publishes
   // the park, never a later one.
   const reparkStamp = turnStamp(turnId, resolved);
+  // The compensation paths below fail the run instead of parking it, so the turn
+  // they stamp must read `failed`, not `resolved`.
+  const failedStamp = turnStamp(turnId, "failed");
   const reparked = await runs.updateOne(
     {
       _id: new ObjectId(runId),
@@ -1449,12 +1461,65 @@ async function finishContinueTurn(
     reparkStamp.options,
   );
   if (reparked.matchedCount === 0) {
-    // Release the lease FIRST. Every other early return in this function does,
-    // and returning with it held strands the run `running` behind a dead pid:
-    // the next continueExecution is rejected with "run is already executing" and
-    // nothing clears it until a process restart runs recoverOrphans. The filter
-    // pins our own lease id, so if the lease already moved on this is a no-op.
-    const released = await runs.updateOne(
+    // Terminalize BEFORE releasing the lease, and clear the lease in the SAME
+    // update. Released first, the lease is free the instant this turn stops
+    // owning the run: continueExecution can legitimately claim it and spawn turn
+    // N+1, putting the run back to `running` — and an unfenced `status:
+    // "running"` terminalize would then match and fail a run with a live child.
+    // Pinning `executionLeaseId` keeps every write in this branch inside the
+    // window this turn owns. The `status: "running"` term still makes this a
+    // no-op when the run was already terminalized underneath us — the other way
+    // this CAS misses.
+    const terminalized = await runs.updateOne(
+      { _id: new ObjectId(runId), status: "running", executionLeaseId: leaseId },
+      {
+        $set: {
+          status: "failed",
+          failureKind: "runner_exit",
+          finishedAt: at,
+          summary: "run could not be re-parked between turns",
+          executionLeaseId: null,
+          executionLeaseExpiresAt: null,
+          // The child is gone; a stale pid reads as alive after PID recycling.
+          pid: null,
+          // The run this turn produced is `failed`, so `failed` is what the
+          // persisted turn must say. Stamping `resolved` (`continued`) here
+          // would leave a history that claims the turn carried on.
+          ...failedStamp.set,
+        },
+      },
+      failedStamp.options,
+    );
+    if (terminalized.matchedCount > 0) {
+      // A ticket left `running` behind a dead run has no legal way out:
+      // gatesForStatus offers nothing, no public event has an edge from
+      // `running`, and dispatchRun refuses a non-null activeRunId. Every sibling
+      // failure path uses transitionTicketFailed, which moves it to `blocked` —
+      // the status the operator is about to be notified about, and the one with
+      // a `resume` gate.
+      await transitionTicketFailed(
+        database,
+        run.ticketId,
+        runId,
+        at,
+        "run could not be re-parked between turns",
+      );
+      await notifyBlocked(
+        database,
+        run.ticketId,
+        "run could not be re-parked between turns",
+        run.logFile,
+        run.stderrFile,
+      );
+      return;
+    }
+    // The run is no longer `running` under our lease. Either a newer turn owns
+    // it — in which case the release below matches nothing and we touch nothing
+    // that turn owns — or it was terminalized while we were in flight and the
+    // lease is still ours, and returning with it held strands the run: the next
+    // continueExecution is rejected with "run is already executing" and nothing
+    // clears it until a process restart runs recoverOrphans.
+    await runs.updateOne(
       { _id: new ObjectId(runId), executionLeaseId: leaseId },
       {
         $set: {
@@ -1465,51 +1530,9 @@ async function finishContinueTurn(
         },
       },
     );
-    if (released.matchedCount === 0) {
-      // The lease already moved to a newer turn, which owns the run's state now.
-      // Record this turn — the id is unique to it — and touch nothing else.
-      await recordTurnOutcome(runs, runId, turnId, resolved);
-      return;
-    }
-    // We still held the lease, so no other turn is driving this run — yet the
-    // re-park missed, leaving the run `running` behind a dead child. Releasing
-    // the lease alone changes nothing: every entry point gates on
-    // `awaiting_input`, so the run is unreachable until a process restart.
-    // Terminalize it, exactly as the ticket-moved branch below does. The
-    // `status: "running"` term makes this a no-op when the run was already
-    // terminalized underneath us — the other way this CAS misses.
-    const terminalized = await runs.updateOne(
-      { _id: new ObjectId(runId), status: "running" },
-      {
-        $set: {
-          status: "failed",
-          failureKind: "runner_exit",
-          finishedAt: at,
-          summary: "run could not be re-parked between turns",
-          ...reparkStamp.set,
-        },
-      },
-      reparkStamp.options,
-    );
+    // This turn is over either way, and its id is unique to it, so recording its
+    // real outcome touches nothing a winning turn owns.
     await recordTurnOutcome(runs, runId, turnId, resolved);
-    if (terminalized.matchedCount > 0) {
-      // A ticket left pointing at a dead run has no legal way out: dispatchRun
-      // refuses a non-null activeRunId and needs_input's only edge is answered
-      // by a run that no longer exists.
-      await database
-        .collection<TicketDoc>("tickets")
-        .updateOne(
-          { _id: new ObjectId(run.ticketId), activeRunId: runId },
-          { $set: { activeRunId: null, updatedAt: at } },
-        );
-      await notifyBlocked(
-        database,
-        run.ticketId,
-        "run could not be re-parked between turns",
-        run.logFile,
-        run.stderrFile,
-      );
-    }
     return;
   }
 
@@ -1535,10 +1558,14 @@ async function finishContinueTurn(
           failureKind: "runner_exit",
           finishedAt: at,
           summary: "ticket moved while the run was parked between turns",
-          ...reparkStamp.set,
+          // The re-park above landed, so it already stamped this turn
+          // `continued` and the write-once array filter makes this a no-op on
+          // that path. It is here for the same reason the filter is: whatever
+          // stamp does land must describe the run this update leaves behind.
+          ...failedStamp.set,
         },
       },
-      reparkStamp.options,
+      failedStamp.options,
     );
     await database
       .collection<TicketDoc>("tickets")
