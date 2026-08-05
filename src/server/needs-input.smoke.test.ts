@@ -299,6 +299,8 @@ describe("runner outcomes", () => {
       parkedRun.summary,
       null,
       timestamp(),
+      // No turn in play: this call exercises parkTicketNeedsInput directly.
+      null,
     );
 
     const run = await runs.findOne({ _id: new ObjectId(runId) });
@@ -396,6 +398,8 @@ describe("runner outcomes", () => {
       null,
       null,
       parkAt,
+      // No turn in play: this call exercises parkTicketNeedsInput directly.
+      null,
     );
 
     const run = await runs.findOne({ _id: new ObjectId(runId) });
