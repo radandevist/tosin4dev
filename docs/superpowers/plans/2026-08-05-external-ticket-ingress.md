@@ -25,7 +25,16 @@ Record the file/test counts. Everything below must keep them green.
 
 - `TicketSchema` (`src/domain/schemas.ts`): add
   ```ts
-  source: z.string().min(1).max(40).nullable().default(null),
+  // Free string, not an enum: a new integration must never need a code change
+  // and a migration just to name itself. Lowercased on write so `GitHub` and
+  // `github` are one source, not two.
+  source: z
+    .string()
+    .min(1)
+    .max(40)
+    .transform((value) => value.toLowerCase())
+    .nullable()
+    .default(null),
   sourceUrl: z.string().url().max(2048).nullable().default(null),
   ```
 - Add the identical fields to the ticket DTO schema. It is `.strict()`, so omitting them there silently drops the fields from every ticket the UI receives — the same failure mode that bit `RunTurnDTOSchema` during the slice 4–6 stack.
@@ -56,12 +65,16 @@ export async function createIngressTicketCore(input: {
 - Insert at `status: "inbox"`. Status is a literal in the insert, never from input.
 - Push an activity row recording the ingress and its source.
 - Leave `activeRunId` null and touch nothing else.
+- **Do not notify.** No `notify()` call on this path. Discord means "something needs you now"; an unspecced ticket in `inbox` does not.
+- Board is resolved by **slug only**. Do not accept a `boardId` — one reference, one validation path, no slug/id disagreement to resolve.
 
 **Proves it:**
 - Creates exactly one ticket, at `inbox`, on the named board.
 - Unknown slug throws and writes nothing.
 - Two identical calls with the same `source`+`sourceUrl` yield one ticket, `created: false` on the second.
 - Two calls with the same pair but *different* boards yield two tickets.
+- `source: "GitHub"` is stored as `github`, so casing does not fork a source.
+- No Discord notification is emitted on this path (spy on `notify` and assert it was not called).
 - Concurrent identical calls yield one ticket (drive both without awaiting the first).
 - **The invariant test:** an ingressed ticket cannot be dispatched. Call `dispatchRun` on it and assert it is refused, and that only `submit_spec` moves it forward.
 
