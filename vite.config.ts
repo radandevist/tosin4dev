@@ -13,10 +13,14 @@ import tailwindcss from '@tailwindcss/vite'
 const config = defineConfig({
   resolve: { tsconfigPaths: true },
   server: {
-    // Bind so the dev server is reachable from the SSH Windows client
-    // (192.168.0.248 → host 192.168.0.68). DEV_HOST=0.0.0.0 by default
-    // (listen on all interfaces); set a hostname slug in .env to override.
-    host: process.env.DEV_HOST ?? true,
+    // Loopback by default, deliberately. There is no auth anywhere in this app
+    // and a server function can point a board at any absolute path and spawn a
+    // workspace-write agent against it, so an open bind hands every host on the
+    // LAN the ability to run code here. Reach it from the Windows client through
+    // the SSH session instead of over the network:
+    //   ssh -L 3141:localhost:3141 radan@192.168.0.68   → http://localhost:3141
+    // DEV_HOST still overrides for the cases that genuinely need a wider bind.
+    host: process.env.DEV_HOST ?? "127.0.0.1",
     port: 3141,
     strictPort: true,
   },
