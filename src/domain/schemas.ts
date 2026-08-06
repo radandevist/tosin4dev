@@ -119,6 +119,33 @@ export const BoardSchema = z.object({
 });
 export type Board = z.infer<typeof BoardSchema>;
 
+// The update boundary for a board's acceptance checks. `.strict()` keeps every
+// other board field server-owned, and the superRefine enforces key uniqueness
+// AT THE SCHEMA, not the UI: `key` is the identity Evidence files under
+// `<runDir>/checks/<key>.log` are filed under, so two checks sharing one key
+// would silently overwrite each other's log.
+export const UpdateBoardChecksSchema = z
+  .object({
+    slug: z.string().min(1),
+    checks: z.array(BoardCheck),
+  })
+  .strict()
+  .superRefine(({ checks }, ctx) => {
+    const seen = new Set<string>();
+    for (const check of checks) {
+      if (seen.has(check.key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["checks", check.key],
+          message: `duplicate check key: ${check.key}`,
+        });
+        continue;
+      }
+      seen.add(check.key);
+    }
+  });
+export type UpdateBoardChecksInput = z.infer<typeof UpdateBoardChecksSchema>;
+
 export const RunPhase = z.enum(["spec_draft", "execute", "review_fix"]);
 export const RunStatus = z.enum([
   "queued",

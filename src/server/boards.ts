@@ -1,10 +1,15 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { BoardSchema, type Board } from "../domain/schemas";
+import {
+  BoardSchema,
+  UpdateBoardChecksSchema,
+  type Board,
+} from "../domain/schemas";
 import {
   createBoardCore,
   getBoardCore,
   listBoardsCore,
+  updateBoardChecksCore,
 } from "./boards.server";
 import { boundary, type ServerResult } from "./result";
 
@@ -32,4 +37,10 @@ export const getBoard = createServerFn({ method: "GET" })
     boundary(z.object({ slug: z.string().min(1) }).strict(), data, (input) =>
       getBoardCore(input.slug),
     ),
+  );
+
+export const updateBoardChecks = createServerFn({ method: "POST" })
+  .validator(passthrough)
+  .handler(({ data }): Promise<ServerResult<BoardDTO>> =>
+    boundary(UpdateBoardChecksSchema, data, updateBoardChecksCore),
   );
