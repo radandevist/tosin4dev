@@ -1,3 +1,4 @@
+import type { Dirent, Stats } from "node:fs";
 import { realpath, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve, sep } from "node:path";
@@ -36,6 +37,21 @@ function browseRoot(): Promise<string> {
   return rootPromise;
 }
 
+// A fs error that the operator cannot do anything about by retrying — the path
+// is missing, or a segment on the way (or the target itself) denies traversal.
+// Mapping to a typed ServerResultError keeps these off the "unexpected
+// incident" path, which would otherwise log a stack and collapse to `internal`.
+// Any other error code is genuinely unexpected and is rethrown for the boundary
+// to handle. This is the ONE mapping for permission errors across the module —
+// the realpath containment pass and the target listing must agree on the code.
+function fsAccessError(err: unknown): ServerResultError | null {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "ENOENT") return new ServerResultError("not_found", "path does not exist");
+  if (code === "EACCES" || code === "EPERM")
+    return new ServerResultError("forbidden", "path is not accessible");
+  return null;
+}
+
 // The containment check. Resolve the requested path against the root, then
 // realpath the RESULT so `..` segments and any symlink on the path are
 // collapsed to a real location before the boundary is judged. Comparing with
@@ -49,15 +65,8 @@ async function resolveInsideRoot(requested: string, root: string): Promise<strin
   try {
     real = await realpath(joined);
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // ENOENT: the requested path does not exist. EACCES/EPERM: a segment on
-    // the way cannot be traversed, which is as unreachable as not existing.
-    if (code === "ENOENT") {
-      throw new ServerResultError("not_found", "path does not exist");
-    }
-    if (code === "EACCES" || code === "EPERM") {
-      throw new ServerResultError("forbidden", "path is not accessible");
-    }
+    const mapped = fsAccessError(err);
+    if (mapped) throw mapped;
     throw err;
   }
   if (real !== root && !real.startsWith(root + sep)) {
@@ -76,12 +85,29 @@ export async function listDirectoriesCore(input: {
 
   // Confirm the resolved target is a directory, not a file — readdir would
   // otherwise throw ENOTDIR and surface as an opaque internal error.
-  const targetStat = await stat(target);
-  if (!targetStat.isDirectory()) {
-    throw new ServerResultError("not_a_directory", "path is not a directory");
-  }
+  let targetStat: Stats;
+  let dirents: Dirent[];
+  try {
+    targetStat = await stat(target);
+    if (!targetStat.isDirectory()) {
+      throw new ServerResultError("not_a_directory", "path is not a directory");
+    }
 
-  const dirents = await readdir(target, { withFileTypes: true });
+    // Both stat and readdir can hit the permission boundary the realpath pass
+    // does: realpath on a chmod 000 directory SUCCEEDS (resolving the
+    // directory itself needs no traverse permission), so the EACCES that
+    // denies the listing is raised here. Such a directory is still listed in
+    // its parent and is clickable, so it must surface as the same typed
+    // `forbidden` error a locked segment on the path already produces — not as
+    // an unexpected incident that logs a stack and collapses to `internal`.
+    // readdir's own ENOTDIR cannot happen (stat just confirmed a directory)
+    // and any other code is genuinely unexpected, so the mapping rethrows both.
+    dirents = await readdir(target, { withFileTypes: true });
+  } catch (err) {
+    const mapped = fsAccessError(err);
+    if (mapped) throw mapped;
+    throw err;
+  }
   const dirs = dirents
     .filter((d) => d.isDirectory())
     // Hidden directories are noise here (`.git`, `.cache`, `.config` would
