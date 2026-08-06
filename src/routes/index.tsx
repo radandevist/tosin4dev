@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Board } from "../domain/schemas";
 import { useBoards, useCreateBoard } from "../queries/boards";
+import { useBrowse } from "../queries/browse";
 
 export const Route = createFileRoute("/")({ component: Home });
 
@@ -87,6 +88,7 @@ function CreateBoardForm() {
   const queryClient = useQueryClient();
   const createBoard = useCreateBoard();
   const [form, setForm] = useState<Board>(DEFAULT_BOARD);
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   const set = <K extends keyof Board>(key: K, value: Board[K]) =>
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -138,15 +140,33 @@ function CreateBoardForm() {
             className={`${inputClass} font-mono`}
           />
         </Field>
-        <Field label="Repo path" htmlFor="board-repo" hint="absolute host path">
-          <input
-            id="board-repo"
-            required
-            value={form.repoPath}
-            onChange={(e) => set("repoPath", e.target.value)}
-            placeholder="/home/radan/Projects/PublyApp"
-            className={`${inputClass} font-mono`}
-          />
+        <Field
+          label="Repo path"
+          htmlFor="board-repo"
+          hint="absolute host path"
+        >
+          <div className="flex gap-2">
+            <input
+              id="board-repo"
+              required
+              value={form.repoPath}
+              onChange={(e) => set("repoPath", e.target.value)}
+              placeholder="/home/radan/Projects/PublyApp"
+              className={`${inputClass} font-mono`}
+            />
+            <button
+              type="button"
+              aria-expanded={pickerOpen}
+              aria-controls="repo-path-picker"
+              onClick={() => setPickerOpen((open) => !open)}
+              className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
+            >
+              {pickerOpen ? "Close" : "Browse"}
+            </button>
+          </div>
+          {pickerOpen ? (
+            <RepoPathPicker onPick={(path) => set("repoPath", path)} />
+          ) : null}
         </Field>
         <Field label="Default base branch" htmlFor="board-branch">
           <input
@@ -175,6 +195,98 @@ function CreateBoardForm() {
         </div>
       </form>
     </section>
+  );
+}
+
+// The inline file explorer for the repo path field. The free-text input stays
+// usable even when this errors, so a failed read degrades to typing the path
+// rather than blocking board creation. Navigating into a directory and picking
+// it are deliberately separate actions: a row click moves you down a level, and
+// only "Pick this folder" writes the path — otherwise there would be no way to
+// select a folder that also has children.
+function RepoPathPicker({ onPick }: { onPick: (path: string) => void }) {
+  const [current, setCurrent] = useState<string | undefined>(undefined);
+  // The picker lists the current directory. `current` is deliberately NOT
+  // derived from `value`: the free-text field and the picker navigate
+  // independently, and only an explicit pick copies the picker's location into
+  // the field. react-query-kit builds the query key as [queryKey, variables],
+  // so changing `current` changes the key and TanStack refetches automatically.
+  const browse = useBrowse({ variables: { path: current } });
+
+  const isRoot = browse.data ? browse.data.parent === null : false;
+
+  const pick = () => {
+    if (browse.data) onPick(browse.data.path);
+  };
+
+  const navigate = (path: string) => {
+    setCurrent(path);
+  };
+
+  return (
+    <div
+      id="repo-path-picker"
+      className="mt-2 space-y-2 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-mono text-xs text-zinc-600">
+          {browse.data ? browse.data.path : current ?? "…"}
+        </span>
+        <div className="flex shrink-0 gap-2">
+          {isRoot ? null : (
+            <button
+              type="button"
+              onClick={() => browse.data?.parent && navigate(browse.data.parent)}
+              className="rounded-lg border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
+            >
+              Up
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={!browse.data || browse.isPending}
+            onClick={pick}
+            className="rounded-lg bg-zinc-900 px-2 py-1 text-xs font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Pick this folder
+          </button>
+        </div>
+      </div>
+
+      {browse.isPending ? (
+        <p className="text-sm text-zinc-500">Loading…</p>
+      ) : browse.isError ? (
+        // A failed read must not render as an empty directory — the two are
+        // indistinguishable to the operator otherwise, and the free-text field
+        // above remains the escape hatch.
+        <p role="alert" className="text-sm text-rose-600">
+          Could not browse: {browse.error.message}
+        </p>
+      ) : browse.data.entries.length === 0 ? (
+        <p className="rounded-lg border border-dashed border-zinc-300 p-4 text-center text-sm text-zinc-400">
+          No subdirectories
+        </p>
+      ) : (
+        <ul className="max-h-56 space-y-1 overflow-y-auto">
+          {browse.data.entries.map((entry) => (
+            <li key={entry.path}>
+              <button
+                type="button"
+                onClick={() => navigate(entry.path)}
+                className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1 text-left text-sm text-zinc-800 transition-colors hover:bg-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
+              >
+                <span className="truncate font-mono">{entry.name}</span>
+                {entry.isGitRepo ? (
+                  <span className="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+                    git
+                  </span>
+                ) : null}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
