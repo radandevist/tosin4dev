@@ -6,7 +6,13 @@ import {
   useNavigate,
 } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import type { Board, BoardCheck } from "../../domain/schemas";
+import type { Board } from "../../domain/schemas";
+import {
+  draftFromCheck,
+  emptyDraftCheck,
+  payloadsFromDrafts,
+  type DraftCheck,
+} from "../../domain/check-draft";
 import type { TicketDTO } from "../../server/tickets";
 import { useBoard, useUpdateBoardChecks } from "../../queries/boards";
 import { useCreateChatSession } from "../../queries/chat";
@@ -193,42 +199,6 @@ function BoardColumns({
   );
 }
 
-// Draft check row, kept separately from BoardCheck so the editor can hold a
-// partially-typed check that the save button validates against. `commandText`
-// holds the raw textarea (NOT a split argv) so a mid-edit trailing newline
-// round-trips instead of being silently dropped on the next keystroke; the
-// argv is derived at save time. `key` is a stable React identity for the row's
-// inputs and doubles as the check's identity once saved — the schema rejects
-// duplicate keys, and the "add argument" re-key on rename would break
-// text-selection mid-typing, so rows get a plain running integer.
-type DraftCheck = {
-  key: string;
-  label: string;
-  commandText: string;
-  timeoutMs: string;
-};
-
-const emptyDraft = (): DraftCheck => ({
-  key: "",
-  label: "",
-  commandText: "",
-  timeoutMs: "120000",
-});
-
-const draftFromCheck = (check: BoardCheck): DraftCheck => ({
-  key: check.key,
-  label: check.label,
-  commandText: check.command.join("\n"),
-  timeoutMs: String(check.timeoutMs),
-});
-
-// One non-blank line is one argv element. Blank lines carry no argument (a
-// trailing newline — the natural way a textarea ends — must not silently become
-// an empty-string argument that the schema rejects). Same shape as
-// parseAcceptanceLines in the new-ticket form.
-const commandFromLines = (text: string): string[] =>
-  text.split("\n").filter((line) => line.length > 0);
-
 function ChecksEditor({ board }: { board: Board & { _id: string } }) {
   const queryClient = useQueryClient();
   const updateChecks = useUpdateBoardChecks();
@@ -240,20 +210,15 @@ function ChecksEditor({ board }: { board: Board & { _id: string } }) {
   const rows = draft ?? board.checks.map(draftFromCheck);
 
   // A save fails validation or the write itself; the board query is refetched
-  // by invalidate on success, then the draft is cleared so the editor renders
-  // the freshly-persisted checks (which also drops any empty-command row that
-  // the filter below excluded from the payload).
+  // by invalidate on success, then the draft is cleared. payloadsFromDrafts is
+  // the ONLY place drafts become payloads and it sends every row the operator
+  // can see — dropping a half-typed row here would report success over
+  // discarded work. Let the boundary schema reject the invalid row instead, so
+  // the save fails visibly and the draft survives (setDraft(null) only runs on
+  // success) for the operator to fix.
   const handleSave = () => {
-    const checks: BoardCheck[] = rows
-      .filter((r) => commandFromLines(r.commandText).length > 0)
-      .map((r) => ({
-        key: r.key,
-        label: r.label,
-        command: commandFromLines(r.commandText),
-        timeoutMs: Number(r.timeoutMs),
-      }));
     updateChecks.mutate(
-      { slug: board.slug, checks },
+      { slug: board.slug, checks: payloadsFromDrafts(rows) },
       {
         onSuccess: () => {
           queryClient.invalidateQueries({
@@ -279,6 +244,48 @@ function ChecksEditor({ board }: { board: Board & { _id: string } }) {
     });
   };
 
+  const patchCommandArg = (index: number, argIndex: number, value: string) => {
+    setDraft((prev) => {
+      const base = prev ?? board.checks.map(draftFromCheck);
+      return base.map((row, i) =>
+        i === index
+          ? {
+              ...row,
+              command: row.command.map((arg, a) =>
+                a === argIndex ? value : arg,
+              ),
+            }
+          : row,
+      );
+    });
+  };
+
+  const addCommandArg = (index: number) => {
+    setDraft((prev) => {
+      const base = prev ?? board.checks.map(draftFromCheck);
+      return base.map((row, i) =>
+        i === index ? { ...row, command: [...row.command, ""] } : row,
+      );
+    });
+  };
+
+  const removeCommandArg = (index: number, argIndex: number) => {
+    setDraft((prev) => {
+      const base = prev ?? board.checks.map(draftFromCheck);
+      return base.map((row, i) => {
+        if (i !== index) return row;
+        // Keep at least one argument slot: argv[0] is the executable, so a
+        // zero-argument command is not a partially-typed check, it is an
+        // unrepresentable one.
+        const command =
+          row.command.length <= 1
+            ? [""]
+            : row.command.filter((_, a) => a !== argIndex);
+        return { ...row, command };
+      });
+    });
+  };
+
   return (
     <section
       aria-labelledby="checks-heading"
@@ -296,7 +303,7 @@ function ChecksEditor({ board }: { board: Board & { _id: string } }) {
           onClick={() =>
             setDraft((prev) => {
               const base = prev ?? board.checks.map(draftFromCheck);
-              return [...base, emptyDraft()];
+              return [...base, emptyDraftCheck()];
             })
           }
           className="rounded-lg border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
@@ -307,9 +314,9 @@ function ChecksEditor({ board }: { board: Board & { _id: string } }) {
 
       <p className="mb-4 text-xs text-zinc-400">
         Each check runs in the run's fresh git worktree, so commands run against
-        the agent's committed work. One argument per line — a line containing a
-        space is a single argument, never split. The command is executed with no
-        shell.
+        the agent's committed work. Each field is exactly one argument, verbatim;
+        spaces and newlines inside a field are part of that argument, never a
+        separator. The command is executed with no shell.
       </p>
 
       {rows.length === 0 ? (
@@ -365,25 +372,52 @@ function ChecksEditor({ board }: { board: Board & { _id: string } }) {
               </Field>
 
               <div className="sm:col-span-2 lg:col-span-6">
-                <label className="block space-y-1">
-                  <span className="flex items-baseline justify-between">
-                    <span className="text-sm font-medium text-zinc-700">
-                      Command
-                    </span>
-                    <span className="text-xs text-zinc-400">
-                      one argument per line
-                    </span>
+                <span className="mb-1 flex items-baseline justify-between">
+                  <span className="text-sm font-medium text-zinc-700">
+                    Command
                   </span>
-                  <textarea
-                    rows={2}
-                    value={row.commandText}
-                    onChange={(e) =>
-                      patch(index, { commandText: e.target.value })
-                    }
-                    placeholder={"git\nrev-parse\n--verify\nHEAD"}
-                    className={`${inputClass} resize-y font-mono`}
-                  />
-                </label>
+                  <span className="text-xs text-zinc-400">
+                    one argument per field
+                  </span>
+                </span>
+                <div className="space-y-2">
+                  {row.command.map((arg, argIndex) => (
+                    <div key={argIndex} className="flex gap-1.5">
+                      {/* Each argument is a <textarea>, not an <input>: an input
+                          cannot hold a newline, which would reintroduce the
+                          join/split encoding bug through the UI instead of the
+                          data shape. Keyed by index, not value, so typing does
+                          not remount the field and destroy the caret. */}
+                      <textarea
+                        id={`check-arg-${index}-${argIndex}`}
+                        rows={1}
+                        value={arg}
+                        onChange={(e) =>
+                          patchCommandArg(index, argIndex, e.target.value)
+                        }
+                        placeholder={argIndex === 0 ? "git" : "--flag"}
+                        className={`${inputClass} resize-y font-mono`}
+                      />
+                      {row.command.length > 1 ? (
+                        <button
+                          type="button"
+                          aria-label={`Remove argument ${argIndex + 1}`}
+                          onClick={() => removeCommandArg(index, argIndex)}
+                          className="shrink-0 rounded-lg border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
+                        >
+                          ✕
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => addCommandArg(index)}
+                    className="rounded-lg border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
+                  >
+                    + Add argument
+                  </button>
+                </div>
               </div>
 
               <div className="flex items-end justify-end sm:col-span-2 lg:col-span-12">

@@ -1,5 +1,5 @@
 import type { WithId } from "mongodb";
-import type { Board } from "../domain/schemas";
+import { BoardSchema, type Board } from "../domain/schemas";
 import { db } from "./db";
 import type { BoardDTO } from "./boards";
 import { ServerResultError } from "./result";
@@ -15,9 +15,22 @@ function boards() {
   return db().then((d) => d.collection<BoardDoc>("boards"));
 }
 
+// BoardDTO's type claims `checks: BoardCheck[]`, but boards written before the
+// checks feature (or hand-authored straight into Mongo — which is how checks
+// were configured until the editor landed) may carry no `checks` key at all.
+// Parsing the field through its own schema default turns that missing key into
+// `[]` at the one place a stored board becomes a wire DTO, so every consumer
+// inherits the guarantee instead of each dereferencing `board.checks` on its
+// own. Malformed-but-present checks still throw loudly: rendering "no checks"
+// for a board that has some would let an operator save that empty list over
+// the real one, silently disarming verification.
 function toDTO(doc: WithId<BoardDoc>): BoardDTO {
   const { _id, ...rest } = doc;
-  return { _id: _id.toString(), ...rest };
+  return {
+    _id: _id.toString(),
+    ...rest,
+    checks: BoardSchema.shape.checks.parse(rest.checks),
+  };
 }
 
 export async function listBoardsCore(): Promise<BoardDTO[]> {
