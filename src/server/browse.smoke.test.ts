@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -41,6 +41,9 @@ beforeAll(async () => {
   await mkdir(join(root, "repo-dir"), { recursive: true });
   await mkdir(join(root, ".hidden"), { recursive: true });
   await mkdir(join(root, "node_modules"), { recursive: true });
+  // The unreadable-target test (chmod 000) is skip-if-root and restores the
+  // mode in a finally, so this starts world-readable like the other fixtures.
+  await mkdir(join(root, "locked"), { recursive: true });
   await writeFile(join(root, "file.txt"), "x");
   // isGitRepo via a `.git` DIRECTORY (the plain-repo case)…
   await mkdir(join(root, "repo-dir", ".git"));
@@ -72,7 +75,7 @@ describe("listDirectoriesCore", () => {
     // dirent and isDirectory() is false for it, so the "directories only" rule
     // keeps it out — it is only reachable by requesting it by path, which the
     // symlink-escape test pins as forbidden.
-    expect(listing.entries.map((e) => e.name)).toEqual(["alpha", "repo-dir", "zeta"]);
+    expect(listing.entries.map((e) => e.name)).toEqual(["alpha", "locked", "repo-dir", "zeta"]);
     // file.txt, .hidden and node_modules must not appear.
     expect(listing.entries.map((e) => e.name)).not.toContain("file.txt");
     expect(listing.entries.map((e) => e.name)).not.toContain(".hidden");
@@ -124,5 +127,24 @@ describe("listDirectoriesCore", () => {
   it("unknown path is not_found and a file path is not_a_directory", async () => {
     await expectCode(listDirectoriesCore({ path: "nope" }), "not_found");
     await expectCode(listDirectoriesCore({ path: "file.txt" }), "not_a_directory");
+  });
+
+  it("maps an unreadable directory to a typed error, not an internal one", async () => {
+    // mode 000 does not deny access to uid 0, so the test would fail for the
+    // wrong reason; the condition is only meaningful for an unprivileged run.
+    if (process.getuid?.() === 0) return;
+    const locked = join(root, "locked");
+    try {
+      await chmod(locked, 0o000);
+      // realpath on a mode-000 directory succeeds, so the EACCES that denies
+      // the listing is raised by readdir — it must come back as the same
+      // `forbidden` a locked path segment produces, not as a raw Error that
+      // boundary collapses to `internal`.
+      await expectCode(listDirectoriesCore({ path: "locked" }), "forbidden");
+    } finally {
+      // Restore the mode or the temp-dir cleanup cannot delete the fixture
+      // and leaves litter behind in /tmp.
+      await chmod(locked, 0o755);
+    }
   });
 });
