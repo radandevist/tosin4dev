@@ -98,15 +98,29 @@ export const TicketSchema = z.object({
 });
 export type Ticket = z.infer<typeof TicketSchema>;
 
+// Bounds for a board's acceptance checks. `key` becomes a filename component
+// (<runDir>/checks/<key>.log), so its length is capped well under the
+// filesystem's 255-byte per-name limit; `timeoutMs` is a setTimeout delay, so
+// it is capped below 2^31-1 where Node would silently clamp a larger value to
+// 1ms instead of honoring the operator's choice.
+export const MAX_CHECK_KEY_LENGTH = 64;
+export const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
+export const MAX_CHECK_TIMEOUT_MS = 1_800_000; // 30 minutes
+
 // One acceptance command Tosin4dev runs itself to verify a ticket's work.
 // `command` is an argv array executed with no shell (execFile semantics), so a
 // board's stored check can never be a shell-injection vector. `key` is stable
 // and referenced by Evidence; `timeoutMs` bounds a hung check.
 export const BoardCheck = z.object({
-  key: z.string().min(1).regex(/^[a-z0-9_-]+$/),
+  key: z.string().min(1).max(MAX_CHECK_KEY_LENGTH).regex(/^[a-z0-9_-]+$/),
   label: z.string().min(1),
   command: z.array(z.string().min(1)).min(1),
-  timeoutMs: z.number().int().positive().default(120_000),
+  timeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .max(MAX_CHECK_TIMEOUT_MS)
+    .default(DEFAULT_CHECK_TIMEOUT_MS),
 });
 export type BoardCheck = z.infer<typeof BoardCheck>;
 

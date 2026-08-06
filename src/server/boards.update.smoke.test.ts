@@ -1,10 +1,14 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { UpdateBoardChecksSchema } from "../domain/schemas";
+import {
+  MAX_CHECK_KEY_LENGTH,
+  MAX_CHECK_TIMEOUT_MS,
+  UpdateBoardChecksSchema,
+} from "../domain/schemas";
 import { verifyRun } from "./verify.server";
 
 const exec = promisify(execFile);
@@ -18,6 +22,7 @@ const { db, closeDb } = await import("./db");
 const {
   createBoardCore,
   getBoardCore,
+  listBoardsCore,
   updateBoardChecksCore,
 } = await import("./boards.server");
 
@@ -48,16 +53,54 @@ describe("updateBoardChecksCore", () => {
     await createBoardCore(BOARD);
     const before = await getBoardCore("publyapp");
     expect(before.checks).toEqual([]);
+    // createBoardCore stamps createdAt and updatedAt with the same value.
+    expect(before.createdAt).toBe(before.updatedAt);
+
+    // Back-date the row to a timestamp the clock cannot produce. Comparing
+    // against a value taken moments earlier would be same-millisecond flaky in
+    // one direction and vacuous in the other (>= is satisfied by equality);
+    // back-dating makes the refresh provable by strict inequality, no sleep.
+    const STALE = "2000-01-01T00:00:00.000Z";
+    await (await db())
+      .collection("boards")
+      .updateOne({ slug: "publyapp" }, { $set: { updatedAt: STALE } });
 
     const updated = await updateBoardChecksCore({ slug: "publyapp", checks: CHECKS });
 
     // The returned DTO is the persisted document, not a build-up of the input.
     expect(updated.checks).toEqual(CHECKS);
-    // updatedAt is refreshed in the same atomic write; it can never run backwards.
-    expect(updated.updatedAt >= before.updatedAt).toBe(true);
+    expect(updated.updatedAt > STALE).toBe(true);
+    expect(updated.updatedAt).not.toBe(STALE);
+    // The refresh is persisted, not just present on the returned DTO.
+    expect((await getBoardCore("publyapp")).updatedAt).not.toBe(STALE);
+  });
 
-    const reread = await getBoardCore("publyapp");
-    expect(reread.checks).toEqual(CHECKS);
+  it("normalises a stored board with no checks field to an empty array", async () => {
+    // Boards written before the checks feature (or hand-authored straight into
+    // Mongo, which is how checks were configured until the editor landed) carry
+    // no `checks` key at all. BoardDTO's type claims `checks` is always present,
+    // so toDTO must normalise the missing field — every read path returns the
+    // same [] instead of each consumer dereferencing undefined.
+    await (await db()).collection("boards").insertOne({
+      slug: "legacy",
+      name: "Legacy",
+      repoPath: "/home/radan/Projects/PublyApp",
+      defaultBaseBranch: "develop",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      updatedAt: "2020-01-01T00:00:00.000Z",
+    });
+
+    expect((await getBoardCore("legacy")).checks).toEqual([]);
+    const listed = await listBoardsCore();
+    expect(listed.find((b) => b.slug === "legacy")?.checks).toEqual([]);
+    expect(
+      (
+        await updateBoardChecksCore({
+          slug: "legacy",
+          checks: [{ key: "lint", label: "lint", command: ["echo", "ok"], timeoutMs: 10_000 }],
+        })
+      ).checks,
+    ).toEqual([{ key: "lint", label: "lint", command: ["echo", "ok"], timeoutMs: 10_000 }]);
   });
 
   it("rejects an unknown slug with not_found", async () => {
@@ -94,6 +137,74 @@ describe("updateBoardChecksCore", () => {
       checks: [{ key: "../etc/passwd", label: "bad", command: ["echo", "ok"] }],
     });
     expect(parsed.success).toBe(false);
+  });
+
+  it("rejects a key longer than MAX_CHECK_KEY_LENGTH", () => {
+    const over = UpdateBoardChecksSchema.safeParse({
+      slug: "publyapp",
+      checks: [
+        {
+          key: "a".repeat(MAX_CHECK_KEY_LENGTH + 1),
+          label: "too long",
+          command: ["echo", "ok"],
+        },
+      ],
+    });
+    expect(over.success).toBe(false);
+
+    const atLimit = UpdateBoardChecksSchema.safeParse({
+      slug: "publyapp",
+      checks: [
+        {
+          key: "a".repeat(MAX_CHECK_KEY_LENGTH),
+          label: "at limit",
+          command: ["echo", "ok"],
+        },
+      ],
+    });
+    expect(atLimit.success).toBe(true);
+  });
+
+  it("a key at the permitted maximum is a writable evidence filename", async () => {
+    // `key` becomes <runDir>/checks/<key>.log, written by verifyRun's
+    // writeFile. Pin the VALUE of MAX_CHECK_KEY_LENGTH: it must stay under the
+    // filesystem's 255-byte per-name limit, so raising the cap into a territory
+    // the filesystem rejects goes red instead of silently re-admitting a
+    // durable ENAMETOOLONG denial of verification.
+    const dir = await mkdtemp(join(tmpdir(), "t4d-key-"));
+    try {
+      const file = join(dir, `${"a".repeat(MAX_CHECK_KEY_LENGTH)}.log`);
+      await writeFile(file, "ok");
+      expect(await readFile(file, "utf8")).toBe("ok");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a timeoutMs above MAX_CHECK_TIMEOUT_MS", () => {
+    // Node's child_process timeout is a setTimeout delay. Above 2^31-1 it
+    // silently clamps to 1ms (instantly SIGTERM'ing the check); below that a
+    // single hung check parks the supervisor for days. The cap is what makes
+    // both values rejected at the schema instead of at runtime.
+    for (const bad of [3_000_000_000, 2_000_000_000]) {
+      const parsed = UpdateBoardChecksSchema.safeParse({
+        slug: "publyapp",
+        checks: [{ key: "lint", label: "lint", command: ["echo", "ok"], timeoutMs: bad }],
+      });
+      expect(parsed.success).toBe(false);
+    }
+    const atLimit = UpdateBoardChecksSchema.safeParse({
+      slug: "publyapp",
+      checks: [{ key: "lint", label: "lint", command: ["echo", "ok"], timeoutMs: MAX_CHECK_TIMEOUT_MS }],
+    });
+    expect(atLimit.success).toBe(true);
+  });
+
+  it("the permitted maximum timeout does not overflow a 32-bit delay", () => {
+    // Constant guard, not a behaviour test: raising the cap to a value
+    // setTimeout cannot represent must go red instead of silently re-admitting
+    // the exact bug the cap excludes.
+    expect(MAX_CHECK_TIMEOUT_MS).toBeLessThanOrEqual(2 ** 31 - 1);
   });
 
   it("an updated check is what verifyRun subsequently executes", async () => {
