@@ -13,6 +13,8 @@ dist-ssr/
 
 # runner runtime (worktrees, run logs, prompts)
 .tosin4dev/
+# in-repo git worktrees, one per isolated task branch
+.worktrees/
 
 # env & secrets
 .env
