@@ -18,9 +18,12 @@ const config = defineConfig({
     // workspace-write agent against it, so an open bind hands every host on the
     // LAN the ability to run code here. Reach it from the Windows client through
     // the SSH session instead of over the network:
-    //   ssh -L 3141:localhost:3141 radan@192.168.0.68   → http://localhost:3141
+    //   ssh -L 3141:127.0.0.1:3141 radan@192.168.0.68   → http://localhost:3141
     // DEV_HOST still overrides for the cases that genuinely need a wider bind.
-    host: process.env.DEV_HOST ?? "127.0.0.1",
+    // `||` is deliberate: Bun loads .env, so a blank `DEV_HOST=` arrives as ""
+    // and `??` would pass that through to an all-interfaces bind. Any falsy
+    // value must fall back to loopback.
+    host: process.env.DEV_HOST || "127.0.0.1",
     port: 3141,
     strictPort: true,
   },

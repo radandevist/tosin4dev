@@ -1483,6 +1483,13 @@ git commit -m "feat(chat): chat route + Brainstorm entry (no component harness; 
 - Create/Modify: `.env` (or `.env.local`) — add `DEV_HOST`
 - Modify: `package.json` `dev` script only if needed
 
+> **SUPERSEDED — do not follow the steps below.** The wide bind described here
+> was reverted to loopback (`127.0.0.1`) for security: this app has no auth, and
+> an all-interfaces bind lets any host on the LAN run code on this machine. Do
+> NOT set `DEV_HOST=0.0.0.0`. Access from the Windows client goes through the SSH
+> tunnel instead: `ssh -L 3141:127.0.0.1:3141 radan@192.168.0.68`. The steps
+> remain below as a historical record only.
+
 - [ ] **Step 1: Bind the dev server host**
 
 In `vite.config.ts`, add a `server` block so the dev server listens on all interfaces (reachable from the Windows client at `192.168.0.68`), reading an optional `DEV_HOST`:
