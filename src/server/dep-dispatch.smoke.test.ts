@@ -119,7 +119,7 @@ describe("dependency-serialized dispatch", () => {
       name: "Dependency Dispatch",
       repoPath: repo,
       defaultBaseBranch: "main",
-      checks: [],
+      checks: [{ key: "ok", label: "ok", command: ["true"], timeoutMs: 10_000 }],
       createdAt: at,
       updatedAt: at,
     });

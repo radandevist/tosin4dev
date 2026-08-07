@@ -121,7 +121,7 @@ describe("verification gate", () => {
   });
 
   it("blocks with failureKind no_commit when the runner exits 0 but commits nothing", async () => {
-    await seedBoard([]);
+    await seedBoard([{ key: "ok", label: "ok", command: ["true"], timeoutMs: 10_000 }]);
     await writeRunner(false);
     const ticketId = await insertApproved(2);
     const { runId } = await dispatchRun(ticketId, "execute");

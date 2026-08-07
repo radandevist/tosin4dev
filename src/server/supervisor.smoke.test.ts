@@ -166,7 +166,7 @@ describe("supervisor smoke", () => {
       name: "Supervisor Smoke",
       repoPath: repo,
       defaultBaseBranch: "main",
-      checks: [],
+      checks: [{ key: "ok", label: "ok", command: ["true"], timeoutMs: 10_000 }],
       createdAt: at,
       updatedAt: at,
     });

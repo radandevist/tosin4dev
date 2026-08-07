@@ -1932,6 +1932,17 @@ export async function dispatchRun(
     throw new ServerResultError("not_found", `board not found: ${ticket.boardId}`);
   }
   const board = BoardSchema.parse(rawBoard);
+
+  // A board with no acceptance checks degrades verification to "a commit
+  // appeared" (verdictFrom's no-checks branch), which is the exact claim this
+  // app exists to be better than. Refuse before anything is claimed or spawned.
+  // spec_draft is exempt: it is read-only and produces no commit to verify.
+  if (phase !== "spec_draft" && board.checks.length === 0) {
+    throw new ServerResultError(
+      "no_acceptance_checks",
+      `board "${board.slug}" has no acceptance checks — add at least one before dispatching`,
+    );
+  }
   const runId = new ObjectId().toString();
   const paths = runPaths(board, runId, phase);
   // Turn 0: the dispatch turn. Id is an ObjectId so it is unique within the
