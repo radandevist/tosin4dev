@@ -32,6 +32,7 @@ import { claudeAdapter } from "../runners/claude";
 import { codexAdapter } from "../runners/codex";
 import type { RunnerAdapter, RunnerBrief } from "../runners/types";
 import { db, ObjectId } from "./db";
+import { readDraftedSpec } from "./draftedSpec.server";
 import { notify } from "./notify.server";
 import { parseSessionId, readOutcome } from "./outcome.server";
 import { ServerResultError } from "./result";
@@ -488,6 +489,41 @@ async function transitionTicketSucceeded(
   }
 }
 
+// Write a completed spec_draft's structured output into its ticket and move it
+// to spec_review for the owner to approve.
+//
+// The `status: "inbox"` filter IS the guard: inbox is the only status carrying
+// a submit_spec edge, so a draft that completes after the owner has already
+// moved the ticket on is refused by the state machine's own rule rather than
+// clobbering work. A null return from readDraftedSpec is a no-op for the same
+// reason a partial spec is refused — it would look approval-ready while
+// missing the acceptance criteria the whole contract rests on.
+export async function applyDraftedSpec(
+  ticketId: string,
+  runDir: string,
+  at: string,
+): Promise<void> {
+  const draft = await readDraftedSpec(runDir);
+  if (!draft) return;
+  const database = await db();
+  await database.collection<TicketDoc>("tickets").updateOne(
+    { _id: new ObjectId(ticketId), status: "inbox" },
+    {
+      $set: {
+        status: transition("inbox", "submit_spec"),
+        "spec.intent": draft.intent,
+        "spec.scope": draft.scope,
+        "spec.nonGoals": draft.nonGoals,
+        "spec.acceptance": draft.acceptance,
+        "spec.links": draft.links,
+        "spec.risk": draft.risk,
+        updatedAt: at,
+      },
+      $push: pushActivity("spec", "drafted spec applied", at),
+    },
+  );
+}
+
 async function transitionTicketFailed(
   database: Db,
   ticketId: string,
@@ -648,7 +684,8 @@ async function applyRunCompletion(
   const runs = database.collection<RunDoc>("runs");
   const tickets = database.collection<TicketDoc>("tickets");
 
-  // spec_draft: read-only, no verification; ticket stays inbox.
+  // spec_draft: read-only, no verification. A successful draft writes itself
+  // into the ticket; a failed one leaves it alone.
   if (phase === "spec_draft") {
     const stamp = turnStamp(turnId, succeeded ? "completed" : "failed");
     await runs.updateOne(
@@ -680,6 +717,9 @@ async function applyRunCompletion(
         { _id: new ObjectId(ticketId), activeRunId: runId },
         { $set: { activeRunId: null, updatedAt: at } },
       );
+    }
+    if (succeeded) {
+      await applyDraftedSpec(ticketId, runDir, at);
     }
     return succeeded ? "completed" : "failed";
   }
@@ -2057,6 +2097,7 @@ export async function dispatchRun(
       board,
       workDir: paths.workDir,
       phase,
+      specPath: phase === "spec_draft" ? `${paths.runDir}/spec.json` : undefined,
     };
     await writeFile(paths.promptFile, buildPrompt(brief));
     await writeFile(paths.logFile, "");
