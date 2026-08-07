@@ -504,7 +504,18 @@ export async function applyDraftedSpec(
   at: string,
 ): Promise<void> {
   const draft = await readDraftedSpec(runDir);
-  if (!draft) return;
+  if (!draft) {
+    // Visible no-op: an absent or invalid draft must not look like a successful
+    // apply, so record activity naming the cause. No status/spec change — the
+    // ticket stays in inbox and the whole point is that a bad draft writes
+    // nothing to the spec.
+    const database = await db();
+    await database.collection<TicketDoc>("tickets").updateOne(
+      { _id: new ObjectId(ticketId) },
+      { $push: pushActivity("spec", "spec draft produced no usable spec.json", at) },
+    );
+    return;
+  }
   const database = await db();
   await database.collection<TicketDoc>("tickets").updateOne(
     { _id: new ObjectId(ticketId), status: "inbox" },

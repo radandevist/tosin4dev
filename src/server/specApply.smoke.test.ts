@@ -85,6 +85,17 @@ describe("applyDraftedSpec", () => {
       .findOne({ _id: new ObjectId(ticketId) });
     expect(t?.status).toBe("inbox");
     expect(t?.spec.intent).toBe("confetti on landing");
+    // A failed draft must be visible, not a silent no-op: record activity
+    // naming the failure while leaving status and spec untouched.
+    expect(t?.spec).toEqual(
+      expect.objectContaining({ intent: "confetti on landing" }),
+    );
+    expect(t?.activity).toContainEqual(
+      expect.objectContaining({
+        kind: "spec",
+        message: "spec draft produced no usable spec.json",
+      }),
+    );
   });
 
   it("refuses to clobber a ticket that has left inbox", async () => {
@@ -99,5 +110,8 @@ describe("applyDraftedSpec", () => {
       .collection("tickets")
       .findOne({ _id: new ObjectId(moved) });
     expect(t?.spec.intent).toBe("confetti on landing");
+    // The refusal must be a total no-op: no activity, no timestamp bump.
+    expect(t?.updatedAt).toBe("2026-08-07T00:00:00.000Z");
+    expect(t?.activity).toEqual([]);
   });
 });
