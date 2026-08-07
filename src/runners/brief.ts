@@ -14,7 +14,7 @@ export function buildPrompt(brief: RunnerBrief): string {
       `You are drafting the executable spec for ticket #${ticket.seq}: ${ticket.title}.`,
       `Repo: ${board.repoPath} (base branch: ${board.defaultBaseBranch}).`,
       `Intent: ${ticket.spec.intent}`,
-      "Investigate the repo READ-ONLY and produce: a concrete plan, affected files, verification commands, and risks. Do not modify any file.",
+      "Investigate the repo READ-ONLY and produce: a concrete plan, affected files, verification commands, and risks. Do not modify any file in the repository — the single exception is the spec JSON named below, which you must write.",
       `Acceptance criteria:\n${acceptance || "none provided"}`,
       `When you finish, write this JSON to ${brief.specPath ?? "<runDir>/spec.json"} and nothing else to it:`,
       `{"intent":"<one sentence>","scope":"<files/areas to touch>","nonGoals":"<what must NOT change>","acceptance":["<checkable criterion>"],"links":["<url>"],"risk":"low|medium|high"}`,

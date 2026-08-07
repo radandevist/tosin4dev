@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Board, Ticket } from "../domain/schemas";
+import { DraftedSpecSchema, type Board, type Ticket } from "../domain/schemas";
 import { buildPrompt } from "./brief";
 import { claudeAdapter } from "./claude";
 import { codexAdapter } from "./codex";
@@ -117,6 +117,40 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("Non-goals (must NOT change): none");
     expect(prompt).toContain("Acceptance criteria:\nnone provided");
     expect(prompt).toContain("Links:\nhttps://example.com/ticket/7");
+  });
+
+  it("pins the spec_draft prompt's JSON keys to DraftedSpecSchema", () => {
+    const specPath = "/r/spec.json";
+    const prompt = buildPrompt({
+      ticket,
+      board,
+      workDir: "/unused",
+      phase: "spec_draft",
+      specPath,
+    });
+
+    // The write target must reach the prompt so the runner actually produces
+    // the file applyDraftedSpec reads.
+    expect(prompt).toContain(specPath);
+
+    // The prompt's inline JSON template and DraftedSpecSchema must agree:
+    // a field renamed on either side alone makes .strict() reject every real
+    // draft. Build the object from the keys the prompt itself names so the
+    // assertion fails if the two ever drift apart.
+    const keys = Object.keys(JSON.parse(prompt.match(/\{".*"\}/)![0]));
+    const draft = Object.fromEntries(
+      keys.map((key, i) => [
+        key,
+        key === "acceptance"
+          ? [`criterion ${i}`]
+          : key === "links"
+            ? [`url ${i}`]
+            : key === "risk"
+              ? "low"
+              : "x",
+      ]),
+    );
+    expect(DraftedSpecSchema.safeParse(draft).success).toBe(true);
   });
 
   it("makes spec drafting read-only and identifies the repo base branch", () => {
