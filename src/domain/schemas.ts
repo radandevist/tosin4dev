@@ -71,6 +71,22 @@ export const SpecSchema = z.object({
 });
 export type Spec = z.infer<typeof SpecSchema>;
 
+// The subset of a Spec a spec_draft runner is allowed to author. Approval
+// fields are absent by construction, so a runner can never mark its own draft
+// approved — that is the owner's gate and the only thing separating a draft
+// from a dispatchable spec.
+export const DraftedSpecSchema = z
+  .object({
+    intent: z.string().min(1),
+    scope: z.string().default(""),
+    nonGoals: z.string().default(""),
+    acceptance: z.array(z.string().min(1)).default([]),
+    links: z.array(z.string()).default([]),
+    risk: Risk.default("low"),
+  })
+  .strict();
+export type DraftedSpec = z.infer<typeof DraftedSpecSchema>;
+
 export const ActivityEntry = z.object({
   at: z.string().datetime(),
   kind: z.string(),
