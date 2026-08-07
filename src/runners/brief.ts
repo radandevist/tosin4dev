@@ -16,6 +16,9 @@ export function buildPrompt(brief: RunnerBrief): string {
       `Intent: ${ticket.spec.intent}`,
       "Investigate the repo READ-ONLY and produce: a concrete plan, affected files, verification commands, and risks. Do not modify any file.",
       `Acceptance criteria:\n${acceptance || "none provided"}`,
+      `When you finish, write this JSON to ${brief.specPath ?? "<runDir>/spec.json"} and nothing else to it:`,
+      `{"intent":"<one sentence>","scope":"<files/areas to touch>","nonGoals":"<what must NOT change>","acceptance":["<checkable criterion>"],"links":["<url>"],"risk":"low|medium|high"}`,
+      "Every acceptance criterion must be checkable by a command or an observation, not a feeling. Do not include approval fields; approval is the owner's.",
       "End your output with a section titled SUMMARY containing at most 10 lines.",
     ].join("\n\n");
   }
