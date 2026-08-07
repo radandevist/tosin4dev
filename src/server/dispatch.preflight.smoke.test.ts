@@ -1,15 +1,24 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ObjectId } from "mongodb";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Point the lazy db() singleton at a throwaway database *before* anything
 // triggers a connection. Unique per run so parallel suites never collide.
 const TEST_DB = `tosin4dev-test-dispatch-preflight-${process.pid}-${Date.now()}`;
 process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 
-const { db } = await import("./db");
+const { db, closeDb } = await import("./db");
 const { dispatchRun } = await import("./supervisor.server");
 
-async function seed(checks: unknown[]): Promise<string> {
+let binDirectory: string;
+const ORIGINAL_PATH = process.env.PATH;
+
+async function seed(
+  checks: unknown[],
+  status: "inbox" | "approved" = "approved",
+): Promise<string> {
   const database = await db();
   await database.collection("boards").deleteMany({});
   await database.collection("tickets").deleteMany({});
@@ -32,7 +41,7 @@ async function seed(checks: unknown[]): Promise<string> {
     seq: 1,
     title: "t",
     type: "implement",
-    status: "approved",
+    status,
     runner: "claude",
     activeRunId: null,
     dependsOn: [],
@@ -54,7 +63,22 @@ async function seed(checks: unknown[]): Promise<string> {
 }
 
 describe("dispatchRun acceptance-check preflight", () => {
+  beforeAll(async () => {
+    // spec_draft bypasses the guard and reaches the spawn, so point PATH at an
+    // empty bin dir: the runner lookup fails with ENOENT and dispatch rejects
+    // with spawn_failed instead of launching a real `claude` on PATH.
+    binDirectory = await mkdtemp(join(tmpdir(), "dispatch-preflight-"));
+  });
+
+  afterAll(async () => {
+    await (await db()).dropDatabase();
+    await closeDb();
+    process.env.PATH = ORIGINAL_PATH;
+    await rm(binDirectory, { recursive: true, force: true });
+  });
+
   beforeEach(async () => {
+    process.env.PATH = binDirectory;
     const database = await db();
     await database.collection("runs").deleteMany({});
   });
@@ -76,5 +100,16 @@ describe("dispatchRun acceptance-check preflight", () => {
     expect(ticket?.activeRunId).toBeNull();
     expect(ticket?.status).toBe("approved");
     expect(await database.collection("runs").countDocuments()).toBe(0);
+  });
+
+  it("does not refuse a spec_draft run on a checkless board", async () => {
+    const ticketId = await seed([], "inbox");
+    const error = await dispatchRun(ticketId, "spec_draft").catch(
+      (e: unknown) => e,
+    );
+    // It still fails — the stubbed PATH has no `claude` — but it must not fail
+    // for THIS reason: a fresh board has no checks, and drafting a spec is how
+    // a user gets any.
+    expect((error as { code?: string }).code).not.toBe("no_acceptance_checks");
   });
 });
