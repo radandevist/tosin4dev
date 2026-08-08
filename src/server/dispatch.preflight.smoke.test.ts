@@ -229,4 +229,79 @@ describe("dispatchRun acceptance-check preflight", () => {
     await rm(ghDir, { recursive: true, force: true });
     process.env.PATH = ORIGINAL_PATH;
   });
+
+  it("refuses a review_fix run with no_remote before anything is claimed", async () => {
+    // The publish block runs for every phase but spec_draft, so the preflight
+    // must cover review_fix too — a direct call reaches it even though the UI
+    // only offers spec_draft and execute. Same fixture shape as the execute
+    // case: a temp repo with no origin, a gh auth shim on a stubbed PATH that
+    // replaces the original so the real authenticated gh can never resolve.
+    const dir = await mkdtemp(join(tmpdir(), "t4d-no-origin-rf-"));
+    const ghDir = await mkdtemp(join(tmpdir(), "t4d-gh-rf-"));
+    try {
+      await writeFile(
+        join(ghDir, "gh"),
+        '#!/bin/sh\necho "shim: logged in"\nexit 0\n',
+        { mode: 0o755 },
+      );
+    } catch (err) {
+      await rm(ghDir, { recursive: true, force: true });
+      throw err;
+    }
+    process.env.PATH = stubPath(ghDir);
+    const database = await db();
+    const boardId = new ObjectId();
+    const at = "2026-08-07T00:00:00.000Z";
+    await database.collection("boards").insertOne({
+      _id: boardId,
+      slug: `no-origin-rf-${process.pid}-${Date.now()}`,
+      name: "No Origin Review Fix",
+      repoPath: dir,
+      defaultBaseBranch: "develop",
+      checks: [{ key: "ok", label: "ok", command: ["true"], timeoutMs: 10_000 }],
+      createdAt: at,
+      updatedAt: at,
+    });
+    const ticketId = new ObjectId();
+    await database.collection("tickets").insertOne({
+      _id: ticketId,
+      boardId: boardId.toString(),
+      seq: 3,
+      title: "t",
+      type: "implement",
+      // review_fix requires a running ticket.
+      status: "running",
+      runner: "claude",
+      activeRunId: null,
+      dependsOn: [],
+      activity: [],
+      spec: {
+        intent: "do the thing",
+        scope: "",
+        nonGoals: "",
+        acceptance: ["it works"],
+        links: [],
+        risk: "low",
+        approvedAt: at,
+        approvedBy: "radan",
+      },
+      createdAt: at,
+      updatedAt: at,
+    });
+
+    await expect(dispatchRun(ticketId.toString(), "review_fix")).rejects.toMatchObject({
+      code: "no_remote",
+    });
+
+    // The preflight refuses before anything is claimed or a run is created.
+    const ticket = await database
+      .collection("tickets")
+      .findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.activeRunId).toBeNull();
+    expect(ticket?.status).toBe("running");
+    expect(await database.collection("runs").countDocuments()).toBe(0);
+    await rm(dir, { recursive: true, force: true });
+    await rm(ghDir, { recursive: true, force: true });
+    process.env.PATH = ORIGINAL_PATH;
+  });
 });

@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Collection, Db } from "mongodb";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Board, Run, Ticket } from "../domain/schemas";
 import { addOriginRemote, writeGhShim } from "./publish.fixture";
 
@@ -34,6 +34,8 @@ let repo: string;
 let binDirectory: string;
 let boardId: string;
 let origin: string;
+let notifyBodies: string[];
+let fetchSpy: ReturnType<typeof vi.spyOn>;
 
 const timestamp = () => new Date().toISOString();
 type BootGlobal = typeof globalThis & { __tosin4devRecovered?: Promise<void> };
@@ -186,7 +188,21 @@ describe("supervisor smoke", () => {
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
     await tickets.deleteMany({ boardId });
     await runs.deleteMany({ boardId });
+    await database.collection("evidence").deleteMany({});
+    notifyBodies = [];
+    process.env.DISCORD_WEBHOOK_URL = "https://discord.invalid/webhook";
+    fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (_input, init) => {
+        notifyBodies.push(String((init as RequestInit | undefined)?.body ?? ""));
+        return new Response("", { status: 204 });
+      });
     await writeRunner(["runner output", "## SUMMARY", "smoke ok"]);
+  });
+
+  afterEach(async () => {
+    fetchSpy?.mockRestore();
+    process.env.DISCORD_WEBHOOK_URL = "";
   });
 
   afterAll(async () => {
@@ -407,6 +423,64 @@ describe("supervisor smoke", () => {
     expect(run?.failureKind).toBe("verification_failed");
     expect(ticket?.status).toBe("blocked");
     expect(ticket?.activeRunId).toBeNull();
+  });
+
+  it("does not fail a verifying orphan whose evidence row says passed", async () => {
+    (globalThis as BootGlobal).__tosin4devRecovered = undefined;
+    const { ticketId, runId } = await seedOrphan(43, "verifying");
+    // A verifying run that reached the publish block has a real branch; the
+    // notification names it so the operator can find the PR that may already
+    // be open on the remote.
+    const branch = "tosin4dev/run/43";
+    await runs.updateOne(
+      { _id: runId },
+      { $set: { branch } },
+    );
+    const at = timestamp();
+    await database.collection("evidence").insertOne({
+      runId: runId.toString(),
+      ticketId,
+      commitSha: "a".repeat(40),
+      commitRef: "tosin4dev/run/x",
+      checks: [],
+      verdict: "passed",
+      createdAt: at,
+    });
+    await recoverOrphans();
+    const run = await runs.findOne({ _id: runId });
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    // Verified work must not be reported as broken: the run is succeeded, the
+    // ticket is review_ready, and the notification names the branch so the
+    // operator can find the PR that may already be open on the remote.
+    expect(run?.status).toBe("succeeded");
+    expect(run?.verdict).toBe("passed");
+    expect(run?.failureKind).toBeNull();
+    expect(ticket?.status).toBe("review_ready");
+    expect(ticket?.activeRunId).toBeNull();
+    expect(notifyBodies.some((body) => body.includes("verification passed"))).toBe(true);
+    expect(notifyBodies.some((body) => body.includes(branch))).toBe(true);
+  });
+
+  it("still fails a verifying orphan whose evidence row says failed", async () => {
+    (globalThis as BootGlobal).__tosin4devRecovered = undefined;
+    const { ticketId, runId } = await seedOrphan(44, "verifying");
+    const at = timestamp();
+    await database.collection("evidence").insertOne({
+      runId: runId.toString(),
+      ticketId,
+      commitSha: "a".repeat(40),
+      commitRef: "tosin4dev/run/x",
+      checks: [],
+      verdict: "failed",
+      createdAt: at,
+    });
+    await recoverOrphans();
+    const run = await runs.findOne({ _id: runId });
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    // A failed evidence row is an ordinary orphan: terminalize as failed.
+    expect(run?.status).toBe("failed");
+    expect(run?.failureKind).toBe("verification_failed");
+    expect(ticket?.status).toBe("blocked");
   });
 
   it("runs orphan recovery exactly once per process", async () => {

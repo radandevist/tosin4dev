@@ -688,6 +688,7 @@ async function failVerifiedRun(
 // `suppressed` (the spec's lease-expired suppression trigger).
 async function failSuppressedTail(
   database: Db,
+  run: RunDoc,
   runId: string,
   ticketId: string,
   exitCode: number,
@@ -697,6 +698,10 @@ async function failSuppressedTail(
   logFile: string,
   stderrFile: string | null,
 ): Promise<"completed"> {
+  // The count rides on the run document already in hand — no second read. The
+  // spec wants the attempt count alongside the stop reason, so "suppressed
+  // after two attempts" reads differently from "stopped without trying".
+  const attempts = run.fixAttempts ?? 0;
   await failVerifiedRun(
     database,
     runId,
@@ -710,7 +715,7 @@ async function failSuppressedTail(
   await notifyBlocked(
     database,
     ticketId,
-    "verification failed (verification_failed); fix loop stopped: suppressed",
+    `verification failed (verification_failed); fix loop stopped: suppressed after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
     logFile,
     stderrFile,
   );
@@ -1067,6 +1072,7 @@ export async function applyRunCompletion(
           );
         return failSuppressedTail(
           database,
+          run,
           runId,
           ticketId,
           exitCode,
@@ -1097,6 +1103,7 @@ export async function applyRunCompletion(
       // operator sees the run stop rather than it vanishing into `verifying`.
       return failSuppressedTail(
         database,
+        run,
         runId,
         ticketId,
         exitCode,
@@ -1126,8 +1133,12 @@ export async function applyRunCompletion(
       ticketId,
       // Budget exhausted and a repeated failure are different diagnoses and must
       // not read the same — one says "it kept trying", the other "it gave up
-      // because nothing changed".
-      `verification failed (${result.failureKind}); fix loop stopped: ${decision.reason}`,
+      // because nothing changed". The count is the parsed `attempts` value the
+      // decision was made from (deliverFixFeedback's `attempts`), already in
+      // hand — no second database read. It distinguishes "gave up after N
+      // attempts" from "stopped without trying", which is what the spec asks
+      // notifyBlocked to carry.
+      `verification failed (${result.failureKind}); fix loop stopped: ${decision.reason} after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
       logFile,
       stderrFile,
     );
@@ -2620,10 +2631,13 @@ export async function dispatchRun(
       `board "${board.slug}" has no acceptance checks — add at least one before dispatching`,
     );
   }
-  // Publishing is the last step of an execute run, so its prerequisites are
-  // checked first. A broken token discovered after twenty minutes of agent work
-  // is the worst available ordering.
-  if (phase === "execute") {
+  // Publishing is the last step of any run that reaches a passed verdict, and
+  // the publish block runs for every phase but spec_draft — including
+  // review_fix. The preflight must cover exactly that same surface, so it is
+  // gated on the same `phase !== "spec_draft"` the checks guard above uses: a
+  // broken token discovered after twenty minutes of agent work is the worst
+  // available ordering, and review_fix pays the same twenty minutes.
+  if (phase !== "spec_draft") {
     await preflightPublish(board.repoPath);
   }
   const runId = new ObjectId().toString();
@@ -2848,15 +2862,48 @@ export async function recoverOrphans(): Promise<void> {
   for (const run of staleRuns) {
     if (isProcessAlive(run.pid)) continue;
     const at = now();
-    const orphaned: Record<string, unknown> = {
-      status: "failed",
-      exitCode: null,
-      failureKind:
-        run.status === "verifying" ? "verification_failed" : "runner_exit",
-      verdict: run.status === "verifying" ? "failed" : null,
-      summary: "Run orphaned after supervisor restart",
-      finishedAt: at,
-    };
+    // A `verifying` run is mid-verification OR mid-publish: the run stays
+    // `verifying` while it pushes its branch and opens its PR, so a restart
+    // in that window can orphan a run whose work already passed. The evidence
+    // row records what the verification actually decided. A passed row means
+    // the run is NOT a failure — the process died after verifying, while
+    // publishing — so recovery must not write verdict failed over it and block
+    // the ticket. The PR itself may already exist on the remote with its url
+    // recorded nowhere (the process died before the $set that writes prUrl),
+    // which is why the notification names the branch. Failure here is also
+    // fine: a missing row, or one that did not pass, is an ordinary orphan.
+    let passedEvidence = false;
+    if (run.status === "verifying") {
+      const evidenceRow = await database
+        .collection<Evidence>("evidence")
+        .findOne({ runId: run._id.toString(), verdict: "passed" });
+      if (evidenceRow) {
+        // Parse the row at the boundary: the verdict gates which terminal write
+        // happens, and an untyped row would let a renamed field silently fall
+        // through to the failure path.
+        passedEvidence =
+          EvidenceSchema.pick({ verdict: true }).parse(evidenceRow).verdict ===
+          "passed";
+      }
+    }
+    const orphaned: Record<string, unknown> = passedEvidence
+      ? {
+          status: "succeeded",
+          exitCode: null,
+          verdict: "passed",
+          failureKind: null,
+          summary: "Run orphaned during publish after verification passed",
+          finishedAt: at,
+        }
+      : {
+          status: "failed",
+          exitCode: null,
+          failureKind:
+            run.status === "verifying" ? "verification_failed" : "runner_exit",
+          verdict: run.status === "verifying" ? "failed" : null,
+          summary: "Run orphaned after supervisor restart",
+          finishedAt: at,
+        };
     // A continue turn's lease is a claim on a live process. When that process is
     // dead AND the lease has run out, clear the lease so the parked run can be
     // claimed again. Runs that hold no lease are untouched.
@@ -2881,6 +2928,40 @@ export async function recoverOrphans(): Promise<void> {
           $set: { activeRunId: null, updatedAt: at },
           $push: pushActivity("run", "orphaned spec draft failed", at),
         },
+      );
+      continue;
+    }
+
+    if (passedEvidence) {
+      // The run verified and the ticket's work is on a real branch — the draft
+      // PR may already be open on the remote. The ticket moves to review_ready,
+      // never blocked: verified work must not be reported as broken. prUrl
+      // cannot be recovered (the process died before it was written), so the
+      // notification names the branch as the recovery path.
+      const reviewReady = await ticketCollection.updateOne(
+        {
+          _id: new ObjectId(run.ticketId),
+          activeRunId: run._id.toString(),
+          status: "running",
+        },
+        {
+          $set: { activeRunId: null, status: "review_ready", updatedAt: at },
+          $push: pushActivity(
+            "run",
+            "orphaned during publish; verification passed",
+            at,
+          ),
+        },
+      );
+      if (reviewReady.matchedCount === 0) {
+        await ticketCollection.updateOne(
+          { _id: new ObjectId(run.ticketId), activeRunId: run._id.toString() },
+          { $set: { activeRunId: null, updatedAt: at } },
+        );
+      }
+      const branch = run.branch ?? "the run branch";
+      await notify(
+        `⚠️ orphaned during publish: ${await ticketLabel(database, run.ticketId)} — verification passed; an open PR may exist on ${branch}. Log: ${run.logFile}${run.stderrFile ? ` (stderr: ${run.stderrFile})` : ""}`,
       );
       continue;
     }
