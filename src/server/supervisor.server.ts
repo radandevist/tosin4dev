@@ -1927,17 +1927,32 @@ async function recordFixDelivery(
   const database = await db();
   // RunSchema has no `updatedAt` field; a previous write set it here and it was
   // stripped on every parse. Drop it so the write only touches typed fields.
+  //
   // The value comes from deliverFixFeedback's RunSchema.parse, which rejects
-  // NaN, so a stale key — the write matching no current document — is now
-  // genuinely unexpected. Log it rather than silently undercounting.
+  // NaN. A key of 0 must ALSO match a document that genuinely lacks the field:
+  // for a counter that has never been written, absent and zero are the same
+  // state, and `{ fixAttempts: 0 }` does not match an absent field in Mongo —
+  // only `null` / `$exists: false` does. A legacy run whose fixAttempts was
+  // never written would otherwise never match, the delivery would land nowhere,
+  // and every failed verification would retry forever. `$in` widens only the
+  // zero case; every non-zero key stays exact so two concurrent paths cannot
+  // both increment. One delivery repairs the document permanently.
+  //
+  // `Filter<RunDoc>` types fixAttempts as number, which would reject null in
+  // `$in`, so widen the object the same way the claim filters do elsewhere in
+  // this file.
+  const filter = {
+    _id: new ObjectId(runId),
+    fixAttempts: fixAttempts === 0 ? { $in: [0, null] } : fixAttempts,
+  } as unknown as Filter<RunDoc>;
   const matched = await database.collection<RunDoc>("runs").updateOne(
-    { _id: new ObjectId(runId), fixAttempts },
+    filter,
     { $set: { fixAttempts: fixAttempts + 1, lastFixSignature: signature } },
   );
   if (matched.matchedCount === 0) {
     console.error(
       `recordFixDelivery matched no run for ${runId} at fixAttempts ${fixAttempts}; ` +
-        "the delivery will go uncounted",
+        "did not count this delivery (expected if a concurrent path already recorded one)",
     );
   }
 }

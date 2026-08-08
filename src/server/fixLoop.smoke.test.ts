@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { ObjectId } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { MAX_FIX_ATTEMPTS, fixSignature } from "../domain/fix-loop";
-import type { Board } from "../domain/schemas";
+import type { Board, Run } from "../domain/schemas";
 
 const TEST_DB = `tosin4dev-test-fix-loop-${process.pid}-${Date.now()}`;
 process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
@@ -83,6 +83,47 @@ async function initFixRepo(): Promise<{ repo: string; sha: string }> {
   return { repo, sha };
 }
 
+// A run document with the fix-loop counter fields ABSENT — the pre-4d legacy
+// shape. `seedRun` always writes fixAttempts/lastFixSignature, so the field
+// would exist even at their defaults; the legacy bug is precisely that the
+// field does NOT exist on disk, which the bare CAS `{fixAttempts: 0}` never
+// matches. Insert the row without them (and drive deliverFixFeedback past
+// recordFixDelivery) to prove the widened key matches and repairs the doc.
+async function insertLegacyRun(over: Record<string, unknown> = {}): Promise<string> {
+  const database = await db();
+  await database.collection("runs").deleteMany({});
+  const id = new ObjectId();
+  await database.collection("runs").insertOne({
+    _id: id,
+    ticketId: new ObjectId().toString(),
+    boardId: new ObjectId().toString(),
+    runner: "claude",
+    phase: "execute",
+    status: "verifying",
+    workDir: "/tmp/wd",
+    promptFile: "/tmp/p",
+    logFile: "/tmp/l",
+    stderrFile: null,
+    exitCode: 0,
+    summary: null,
+    branch: "tosin4dev/run/x",
+    baseSha: "a".repeat(40),
+    verdict: null,
+    failureKind: null,
+    executionSessionId: "sess-1",
+    executionLeaseId: null,
+    executionLeaseExpiresAt: null,
+    parkedBy: "question",
+    awaitingQuestion: null,
+    exchanges: [],
+    turns: [],
+    queuedAt: "2026-08-07T00:00:00.000Z",
+    startedAt: "2026-08-07T00:00:00.000Z",
+    ...over,
+  });
+  return id.toString();
+}
+
 async function seedRun(over: Record<string, unknown>): Promise<string> {
   const database = await db();
   await database.collection("runs").deleteMany({});
@@ -122,12 +163,14 @@ async function seedRun(over: Record<string, unknown>): Promise<string> {
 
 let binDirectory: string;
 
-// The tail test that must reach a REAL successful spawn (sent === true) installs
-// a `claude` stub in its OWN temp dir and points PATH at it for the duration of
+// The tail tests that must reach a REAL successful spawn (sent === true) install
+// a `claude` stub in their OWN temp dir and point PATH at it for the duration of
 // the test — the shared bin dir stays empty so the ENOENT test above still sees
-// a spawn failure. The stub writes a valid outcome.json and exits 0, so the
-// send succeeds against THIS stub — the only `claude` on the stubbed PATH — and
-// never the real billable binary at /home/radan/.local/bin/claude.
+// a spawn failure. The stub writes a valid outcome.json (reporting FAILURE, so
+// the follow-on monitor turn terminates early instead of re-verifying) and
+// exits 0, so the send succeeds against THIS stub — the only `claude` on the
+// stubbed PATH — and never the real billable binary at
+// /home/radan/.local/bin/claude.
 async function installRunnerStub(dir: string): Promise<void> {
   const stub = join(dir, "claude");
   await writeFile(
@@ -138,13 +181,20 @@ async function installRunnerStub(dir: string): Promise<void> {
       // turn's result. The only required shape is a valid RunOutcome; the
       // supervisor resolves it against the runDir captured in T4D_OUTCOME_PATH,
       // which lives under <repo>/.tosin4dev/runs/<runId> and may not exist yet.
+      //
+      // The outcome is `failed`, NOT `completed`: a `completed` follow-on turn
+      // would re-enter applyRunCompletion and run a SECOND full verification
+      // (git + checks) against the fixture repo and spawn machinery, after the
+      // test's own teardown has started removing that repo and while PATH still
+      // holds a real `claude`. `failed` takes the early runner_reported_failure
+      // terminal path and never re-verifies or spawns again.
       "if [ -n \"$T4D_OUTCOME_PATH\" ]; then",
       "  mkdir -p \"$(dirname \"$T4D_OUTCOME_PATH\")\"",
-      "  echo '{\"outcome\":\"completed\"}' > \"$T4D_OUTCOME_PATH\"",
+      "  echo '{\"outcome\":\"failed\",\"reason\":\"stub\"}' > \"$T4D_OUTCOME_PATH\"",
       "fi",
       // stdout is drained to the turn's stdout file; parseSessionId reads it for
-      // a session id. A `completed` continue rotates the session id on re-park —
-      // omitting it leaves the existing session untouched, which is fine here.
+      // a session id. Omitting one leaves the existing session untouched, which
+      // is fine here.
       "exit 0",
     ].join("\n"),
     { mode: 0o755 },
@@ -162,7 +212,13 @@ beforeEach(async () => {
 afterAll(async () => {
   await (await db()).dropDatabase();
   await closeDb();
-  process.env.PATH = ORIGINAL_PATH;
+  // PATH is NEVER restored to the original here. ORIGINAL_PATH is the only
+  // PATH in this file that resolves the real, billable `claude` at
+  // /home/radan/.local/bin/claude, and a successful spawn can still have a
+  // monitor in flight when this runs (the tail test's monitor is
+  // fire-and-forget). A stale PATH could hand a live auth token to a bare
+  // `claude` spawn. Leaving PATH stubbed for the rest of this fork's life costs
+  // nothing — the fork is discarded — and removes that exposure outright.
   await rm(binDirectory, { recursive: true, force: true });
 });
 
@@ -474,6 +530,85 @@ describe("fix-loop verification tail", () => {
     return { runId, ticketId: ticketId.toString() };
   }
 
+  async function seedLegacyRetryFixture(): Promise<{
+    runId: string;
+    ticketId: string;
+    promptFile: string;
+  }> {
+    const database = await db();
+    const at = new Date().toISOString();
+    const ticketId = new ObjectId();
+    const promptFile = join(runDir, "legacy-retry-prompt.txt");
+    // The legacy document: fixAttempts and lastFixSignature are ABSENT on disk,
+    // exactly as for a run created before the fields existed.
+    const runId = await insertLegacyRun({
+      status: "running",
+      branch,
+      baseSha,
+      workDir: repo,
+      // A retry resumes the SAME provider session; give the run one so the
+      // decision is `retry: true` and the send path is reached.
+      executionSessionId: "sess-retry",
+      // The lease is FREE: the claim must win so the send is actually attempted.
+      executionLeaseId: null,
+      executionLeaseExpiresAt: null,
+      promptFile,
+    });
+    await database.collection("tickets").insertOne({
+      _id: ticketId,
+      boardId: new ObjectId().toString(),
+      seq: 1,
+      title: "fix loop legacy retry",
+      type: "implement",
+      status: "running",
+      runner: "claude",
+      spec: {
+        intent: "verify the legacy retry",
+        scope: "",
+        nonGoals: "",
+        acceptance: [],
+        links: [],
+        risk: "low",
+        approvedAt: at,
+        approvedBy: "radan",
+      },
+      activeRunId: runId,
+      prUrl: null,
+      activity: [],
+      dependsOn: [],
+      createdAt: at,
+      updatedAt: at,
+    });
+    return { runId, ticketId: ticketId.toString(), promptFile };
+  }
+
+  // Poll until the monitor chain behind a successful spawn has FULLY settled.
+  // applyRunCompletion returns as soon as recordFixDelivery lands, but the chain
+  // it leaves behind — monitorContinue → finishContinueTurn → finishRun — is
+  // fire-and-forget: it keeps draining the child's streams into
+  // <repo>/.tosin4dev/runs/<runId>/turns/ and then re-enters applyRunCompletion
+  // to terminalize. Asserting before that chain settles lets the describe-level
+  // afterAll rm -rf the repo and runDir while those streams are still open
+  // (ENOTEMPTY) and leaves a database write racing the file-level closeDb. The
+  // continue turn's outcome is the LAST write in the chain (recordTurnOutcome in
+  // finishRun), so a non-null outcome proves every stream drain and status/ticket
+  // write has completed. Needed after FIX 2: the stub's `failed` outcome makes
+  // the follow-on turn terminate early, but the chain still runs.
+  async function pollSettledContinue(runId: string, timeoutMs = 5_000): Promise<void> {
+    const database = await db();
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const run = await database
+        .collection<Run>("runs")
+        .findOne({ _id: new ObjectId(runId) });
+      if (run?.turns?.some((turn) => turn.outcome !== null)) return;
+      if (Date.now() > deadline) {
+        throw new Error(`continue turn for run ${runId} never settled`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   it("leaves a run whose fix feedback was never sent unrecorded and blocked", async () => {
     const { runId, ticketId } = await seedBlockedPathFixture();
     const outcome = await applyRunCompletion(
@@ -569,11 +704,59 @@ describe("fix-loop verification tail", () => {
     }
     expect(outcome).toBe("completed");
     const database = await db();
+    // Drain the fire-and-forget monitor chain before asserting so no stream,
+    // spawn or database write is still in flight when these assertions run.
+    await pollSettledContinue(runId);
     const run = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
     // A delivery that actually landed: the budget advanced and the signature is
-    // pinned. The record is the parse of what was decided on — a stale/NaN write
-    // would fail here (toBe, not a truthiness check), which is exactly the
-    // legacy-document bug FIX 1 kills.
+    // pinned. `sent === true` is decided by the spawn succeeding, not by the
+    // outcome the stub wrote (which is `failed` to keep the follow-on turn from
+    // re-verifying) — and the write is the record of the parse of what was
+    // decided on, so a stale/NaN write would fail here (toBe, not a truthiness
+    // check).
+    expect(run?.fixAttempts).toBe(1);
+    expect(run?.lastFixSignature).toBe(
+      fixSignature([
+        {
+          key: "bad",
+          exitCode: 1,
+          output: await readFile(join(runDir, "checks/bad.log"), "utf8"),
+        },
+      ]),
+    );
+  });
+
+  it("repairs a legacy document that lacks the counter fields when the delivery lands", async () => {
+    const { runId, ticketId } = await seedLegacyRetryFixture();
+    const stubDir = await mkdtemp(join(tmpdir(), "t4d-fixstub-"));
+    await installRunnerStub(stubDir);
+    process.env.PATH = stubPath(stubDir);
+    let outcome: string;
+    try {
+      outcome = await applyRunCompletion(
+        runId,
+        ticketId,
+        "execute",
+        0,
+        "out\n",
+        logFile,
+        null,
+        board,
+        runDir,
+        new ObjectId().toString(),
+      );
+    } finally {
+      await rm(stubDir, { recursive: true, force: true });
+      process.env.PATH = stubPath(binDirectory);
+    }
+    expect(outcome).toBe("completed");
+    const database = await db();
+    await pollSettledContinue(runId);
+    const run = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
+    // The document on disk had NO fixAttempts field, so `{fixAttempts: 0}` in
+    // the CAS key matched nothing and the delivery never landed — the legacy
+    // document stayed broken forever. The widened key matches absent-or-zero,
+    // so the delivery lands and $set writes a real `1`, repairing the document.
     expect(run?.fixAttempts).toBe(1);
     expect(run?.lastFixSignature).toBe(
       fixSignature([
