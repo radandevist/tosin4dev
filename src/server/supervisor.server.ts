@@ -3,7 +3,7 @@ import {
   spawn,
   type ChildProcess,
 } from "node:child_process";
-import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 import type {
@@ -15,10 +15,17 @@ import type {
 } from "mongodb";
 import { unmetDependencies } from "../domain/dependencies";
 import {
+  decideFix,
+  fixSignature,
+  FIX_SIGNATURE_TAIL_BYTES,
+  type FixDecision,
+} from "../domain/fix-loop";
+import {
   BoardSchema,
   EvidenceSchema,
   ObjectIdString,
   RunPhase,
+  RunSchema,
   TicketSchema,
   type Board,
   type HandoffBrief,
@@ -876,6 +883,65 @@ async function applyRunCompletion(
       await notifyReviewReady(database, ticketId, outSummary);
       return "completed";
     }
+    const failing = result.checks.filter((c) => c.exitCode !== 0);
+    const failingWithOutput = await failingChecksWithOutput(failing);
+    const decision =
+      result.failureKind === "verification_failed"
+        ? await deliverFixFeedback(runId, failingWithOutput, doneAt)
+        : ({ retry: false, reason: "not_retryable" } as const);
+
+    if (decision.retry) {
+      // Back to the agent on the existing leased session. The ticket stays
+      // `running` — a retry is not a new state, it is the same run continuing.
+      const rawRetryTicket = await database
+        .collection<TicketDoc>("tickets")
+        .findOne({ _id: new ObjectId(ticketId) });
+      if (!rawRetryTicket) {
+        throw new ServerResultError("not_found", `ticket not found: ${ticketId}`);
+      }
+      const retryTicket = TicketSchema.parse(rawRetryTicket);
+      const leaseId = new ObjectId().toString();
+      let sent: boolean;
+      try {
+        sent = await sendContinueTurn({
+          database,
+          run: run!,
+          board,
+          ticket: retryTicket,
+          runId,
+          message: formatCheckFailures(failingWithOutput),
+          leaseId,
+          // A retry is not answering a human's question: the run is mid-verification,
+          // not parked. Pin `verifying` so an unrelated claim can never be resumed
+          // by the fix loop, and leave the ticket untouched — it is already `running`.
+          claimFilter: { _id: new ObjectId(runId), status: "verifying" },
+          claimSet: {},
+        });
+      } catch {
+        // Spawn failed. Release the lease and let the verification catch below
+        // terminalize the run — a retry that could not start is a failed check.
+        await database
+          .collection<RunDoc>("runs")
+          .updateOne(
+            { _id: new ObjectId(runId), executionLeaseId: leaseId },
+            {
+              $set: {
+                executionLeaseId: null,
+                executionLeaseExpiresAt: null,
+              },
+            },
+          );
+        throw new ServerResultError("spawn_failed", "run could not be continued");
+      }
+      // The run was terminalized between verification and this claim (orphan
+      // recovery or a competing path). Nothing was claimed, so there is no turn
+      // to close and no state to unwind — the retry is simply moot.
+      if (!sent) {
+        return "completed";
+      }
+      return "completed";
+    }
+
     await failVerifiedRun(
       database,
       runId,
@@ -889,7 +955,10 @@ async function applyRunCompletion(
     await notifyBlocked(
       database,
       ticketId,
-      `verification failed (${result.failureKind})`,
+      // Budget exhausted and a repeated failure are different diagnoses and must
+      // not read the same — one says "it kept trying", the other "it gave up
+      // because nothing changed".
+      `verification failed (${result.failureKind}); fix loop stopped: ${decision.reason}`,
       logFile,
       stderrFile,
     );
@@ -1644,6 +1713,116 @@ async function finishContinueTurn(
   );
 }
 
+// The message that rides the resume slot is what buildPrompt interpolates into
+// the "human answered" section. The fix loop reuses the same slot with the
+// acceptance-check failure text, so the agent reads it as the operator's reply.
+export async function deliverFixFeedback(
+  runId: string,
+  failing: { key: string; exitCode: number; output: string }[],
+  at: string,
+): Promise<FixDecision> {
+  const database = await db();
+  const runs = database.collection<RunDoc>("runs");
+  const raw = await runs.findOne({ _id: new ObjectId(runId) });
+  if (!raw) return { retry: false, reason: "not_retryable" };
+  const run = RunSchema.parse(raw);
+
+  // Suppressed, not sent. A parked run cannot receive a turn, and marking this
+  // delivered would leave the agent waiting on advice it never got. Fail closed:
+  // no budget consumed, no signature recorded, so it re-fires on resume.
+  if (run.status === "awaiting_input") {
+    return { retry: false, reason: "suppressed" };
+  }
+
+  // A retry resumes the SAME provider session. Without a captured session id
+  // there is nothing to resume, so the failure is not fixable by a retry — fail
+  // closed rather than let the send machinery throw after the budget was spent.
+  if (!run.executionSessionId) {
+    return { retry: false, reason: "not_retryable" };
+  }
+
+  const signature = fixSignature(failing);
+  const decision = decideFix({
+    failureKind: "verification_failed",
+    attempts: run.fixAttempts,
+    signature,
+    lastSignature: run.lastFixSignature,
+  });
+  if (!decision.retry) return decision;
+
+  // The branch tip moved while checks were running, so these failures describe a
+  // commit that no longer exists. Delivering them would be a lie. Re-verify.
+  const evidence = await database
+    .collection("evidence")
+    .findOne({ runId }, { sort: { createdAt: -1 } });
+  // The latest evidence row for this run records the commit that was verified.
+  // No row yet means verification never produced one — treat the tip as stable.
+  // Only when a row exists is the git read worth doing; an unreadable tip (workdir
+  // gone, transient error) must not lose the whole verification outcome, so it
+  // fails OPEN and the feedback is delivered rather than the run suppressed.
+  if (evidence && run.branch !== null) {
+    let tipNow: string | null = null;
+    try {
+      tipNow = (
+        await execFileAsync("git", ["-C", run.workDir, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        })
+      ).stdout.trim();
+    } catch {
+      tipNow = null;
+    }
+    if (tipNow !== null && tipNow !== evidence.commitSha) {
+      return { retry: false, reason: "suppressed" };
+    }
+  }
+
+  await runs.updateOne(
+    { _id: new ObjectId(runId), fixAttempts: run.fixAttempts },
+    { $set: { fixAttempts: run.fixAttempts + 1, lastFixSignature: signature, updatedAt: at } },
+  );
+  return decision;
+}
+
+// The pure fix-loop module needs each failing check's CONTENT, but verifyRun
+// persists check output to `<runDir>/checks/<key>.log` and returns only the
+// path. Read those logs back at the boundary. A log that cannot be read (missing
+// after a crash, cleaned up, permission denied) contributes an empty string: the
+// signature then fingerprints the check identity + exit code, so a repeated
+// failure still dedupes, and the agent still sees the check key even without
+// its output. Losing the whole verification outcome because a log vanished is
+// the worse failure.
+async function failingChecksWithOutput(
+  checks: { key: string; exitCode: number; outputRef: string }[],
+): Promise<{ key: string; exitCode: number; output: string }[]> {
+  const loaded: { key: string; exitCode: number; output: string }[] = [];
+  for (const check of checks) {
+    let output = "";
+    try {
+      output = await readFile(check.outputRef, "utf8");
+    } catch {
+      output = "";
+    }
+    loaded.push({ key: check.key, exitCode: check.exitCode, output });
+  }
+  return loaded;
+}
+
+// What the agent actually receives. Only failing checks, each with its command
+// and the tail of its output — the whole log would bury the signal.
+function formatCheckFailures(
+  failing: { key: string; exitCode: number; output: string }[],
+): string {
+  const blocks = failing.map(
+    (c) =>
+      `Check "${c.key}" failed with exit code ${c.exitCode}:\n${c.output.slice(-FIX_SIGNATURE_TAIL_BYTES)}`,
+  );
+  return [
+    "Your commit did not pass this board's acceptance checks.",
+    ...blocks,
+    "Fix the cause, commit again on the same branch, and do not push.",
+  ].join("\n\n");
+}
+
 async function monitorContinue(
   child: RunningChild,
   runId: string,
@@ -1678,120 +1857,87 @@ async function monitorContinue(
   }
 }
 
-export async function continueExecution(
-  runId: string,
-  message: string,
-): Promise<void> {
-  const database = await db();
+// Send one `continue` turn to a run. The caller owns the precondition (which
+// state the run must be in to claim it) and the spawn-failure compensation; this
+// owns the lease claim, prompt rewrite, turn record, spawn, stream drain,
+// ticket transition hook, turn push, and monitor handoff.
+//
+// `claimFilter`/`claimSet`/`claimPush` encode the caller's precondition:
+// continueExecution pins the parked row + open exchange so the human's message
+// lands on the question they saw; the fix loop pins `verifying` so a retry
+// resumes a run mid-verification. The lease terms are appended here so every
+// claim is fenced identically. `afterRunStarted` runs in the window between the
+// pid being published and the turn row being pushed — the only place a ticket
+// move can land without leaking an uncloseable turn row.
+// Returns true when the turn was claimed AND sent; false when the caller's
+// claim missed (run was terminalized underneath, lease lost, precondition no
+// longer holds). A miss is not an error: nothing was claimed, so no
+// compensation is due — the caller decides what a lost race means for its own
+// precondition (continueExecution reports `conflict`, the fix loop treats the
+// run as already terminalized).
+async function sendContinueTurn(opts: {
+  database: Db;
+  run: RunDoc;
+  board: Board;
+  ticket: Ticket;
+  runId: string;
+  message: string;
+  leaseId: string;
+  claimFilter: Filter<RunDoc>;
+  claimSet: Record<string, unknown>;
+  claimPush?: PushOperator<RunDoc>;
+  afterRunStarted?: () => Promise<void>;
+}): Promise<boolean> {
+  const {
+    database,
+    run,
+    board,
+    ticket,
+    runId,
+    message,
+    leaseId,
+    claimFilter,
+    claimSet,
+    claimPush,
+    afterRunStarted,
+  } = opts;
   const runs = database.collection<RunDoc>("runs");
-  const run = await runs.findOne({ _id: new ObjectId(runId) });
-  if (!run || run.status !== "awaiting_input") {
-    throw new ServerResultError("conflict", "run is not awaiting input");
-  }
+  // A retry and a human continue both resume the SAME provider session; without
+  // one there is nothing to send. Checked before the claim so a session-less run
+  // is never half-claimed.
   if (!run.executionSessionId) {
     throw new ServerResultError(
       "conflict",
       "run has no captured session to continue",
     );
   }
-
-  const rawBoard = await database.collection<BoardDoc>("boards").findOne({
-    _id: new ObjectId(run.boardId),
-  });
-  if (!rawBoard) {
-    throw new ServerResultError("not_found", `board not found: ${run.boardId}`);
-  }
-  const board = BoardSchema.parse(rawBoard);
-  const rawTicket = await database.collection<TicketDoc>("tickets").findOne({
-    _id: new ObjectId(run.ticketId),
-  });
-  if (!rawTicket) {
-    throw new ServerResultError(
-      "not_found",
-      `ticket not found: ${run.ticketId}`,
-    );
-  }
-  const ticket = TicketSchema.parse(rawTicket);
-  if (ticket.status !== "needs_input" || ticket.activeRunId !== runId) {
-    throw new ServerResultError(
-      "conflict",
-      "ticket is not parked on this run",
-    );
-  }
-
-  // Claim the run's execution lease in ONE atomic update: only wins when the
-  // run is parked and no live lease exists. A loser must not retry or force.
-  const leaseId = new ObjectId().toString();
+  // Claim the run's execution lease in ONE atomic update. The caller's filter
+  // pins its precondition; the `$or` here refuses a run with a live lease, so a
+  // loser never overwrites a turn in flight.
   const claimAt = now();
-  const leaseExpiresAt = new Date(
-    Date.now() + EXECUTION_LEASE_MS,
-  ).toISOString();
-  // The message must ride the claiming update, exactly as resumeRun carries its
-  // answer: a second write could fail after status flips to running, losing the
-  // human's text with no safe retry. Pin the exact row — see resumeRun for why
-  // `{$type:"null"}` and the `at` identity term are both required.
-  const priorExchanges = run.exchanges ?? [];
-  let openIndex = -1;
-  priorExchanges.forEach((exchange, index) => {
-    if (exchange.answer === null) openIndex = index;
-  });
-  const openRow = openIndex >= 0 ? priorExchanges[openIndex] : null;
-  const claimFilter: Record<string, unknown> = {
-    _id: new ObjectId(runId),
-    status: "awaiting_input",
-    $or: [
-      { executionLeaseId: null },
-      { executionLeaseExpiresAt: { $lt: claimAt } },
-    ],
-  };
-  if (openIndex >= 0 && openRow) {
-    claimFilter[`exchanges.${openIndex}.answer`] = { $type: "null" };
-    claimFilter[`exchanges.${openIndex}.at`] = openRow.at;
-  } else {
-    // No open row in our snapshot. Pin both that absence and the parked question,
-    // exactly as resumeRun does, so a concurrent park cannot slip an open row in
-    // between our read and this claim — which would leave two open rows.
-    claimFilter.exchanges = { $not: { $elemMatch: { answer: null } } };
-    claimFilter.awaitingQuestion = run.awaitingQuestion ?? null;
-  }
-  const claimed = await runs.updateOne(claimFilter as Filter<RunDoc>, {
-    $set: {
-      executionLeaseId: leaseId,
-      executionLeaseExpiresAt: leaseExpiresAt,
-      status: "running",
-      startedAt: claimAt,
-      ...(openIndex >= 0
-        ? {
-            [`exchanges.${openIndex}.answer`]: message,
-            [`exchanges.${openIndex}.answeredAt`]: claimAt,
-          }
-        : {}),
+  const claimed = await runs.updateOne(
+    {
+      ...claimFilter,
+      $or: [
+        { executionLeaseId: null },
+        { executionLeaseExpiresAt: { $lt: claimAt } },
+      ],
     },
-    ...(openIndex === -1
-      ? {
-          $push: {
-            exchanges: {
-              $each: [
-                {
-                  v: 1 as const,
-                  at: claimAt,
-                  question: questionOrFallback(
-                    run.awaitingQuestion,
-                    "(continued execution)",
-                  ),
-                  handoff: null,
-                  answer: message,
-                  answeredAt: claimAt,
-                },
-              ],
-              $slice: -EXCHANGE_CAP,
-            },
-          },
-        }
-      : {}),
-  });
+    {
+      $set: {
+        ...claimSet,
+        executionLeaseId: leaseId,
+        executionLeaseExpiresAt: new Date(
+          Date.now() + EXECUTION_LEASE_MS,
+        ).toISOString(),
+        status: "running",
+        startedAt: claimAt,
+      },
+      ...(claimPush ? { $push: claimPush } : {}),
+    },
+  );
   if (claimed.matchedCount === 0) {
-    throw new ServerResultError("conflict", "run is already executing");
+    return false;
   }
 
   // Pinned capability: the run's OWN runner/workdir/session — nothing from the
@@ -1877,27 +2023,8 @@ export async function continueExecution(
       throw new ServerResultError("conflict", "run left running");
     }
 
-    const at = now();
-    const to = transition("needs_input", "provide_input");
-    const ticketStarted = await database
-      .collection<TicketDoc>("tickets")
-      .updateOne(
-        {
-          _id: new ObjectId(run.ticketId),
-          status: "needs_input",
-          activeRunId: runId,
-        },
-        {
-          $set: { status: to, updatedAt: at },
-          $push: pushActivity("run", "continued execution", at),
-        },
-      );
-    if (ticketStarted.matchedCount === 0) {
-      throw new ServerResultError(
-        "conflict",
-        "ticket is no longer awaiting input",
-      );
-    }
+    await afterRunStarted?.();
+
     // Pushed LAST, for the same reason as resumeRun's resume turn: a row written
     // before a throw is a turn nothing will ever close. Carries the lease id so a
     // turn that lost its claim can still never write.
@@ -1929,8 +2056,150 @@ export async function continueExecution(
       child.kill("SIGKILL");
       await runningChild?.exited.catch(() => undefined);
     }
+    throw new ServerResultError("spawn_failed", "run could not be continued");
+  }
+  return true;
+}
+
+export async function continueExecution(
+  runId: string,
+  message: string,
+): Promise<void> {
+  const database = await db();
+  const runs = database.collection<RunDoc>("runs");
+  const run = await runs.findOne({ _id: new ObjectId(runId) });
+  if (!run || run.status !== "awaiting_input") {
+    throw new ServerResultError("conflict", "run is not awaiting input");
+  }
+  if (!run.executionSessionId) {
+    throw new ServerResultError(
+      "conflict",
+      "run has no captured session to continue",
+    );
+  }
+
+  const rawBoard = await database.collection<BoardDoc>("boards").findOne({
+    _id: new ObjectId(run.boardId),
+  });
+  if (!rawBoard) {
+    throw new ServerResultError("not_found", `board not found: ${run.boardId}`);
+  }
+  const board = BoardSchema.parse(rawBoard);
+  const rawTicket = await database.collection<TicketDoc>("tickets").findOne({
+    _id: new ObjectId(run.ticketId),
+  });
+  if (!rawTicket) {
+    throw new ServerResultError(
+      "not_found",
+      `ticket not found: ${run.ticketId}`,
+    );
+  }
+  const ticket = TicketSchema.parse(rawTicket);
+  if (ticket.status !== "needs_input" || ticket.activeRunId !== runId) {
+    throw new ServerResultError(
+      "conflict",
+      "ticket is not parked on this run",
+    );
+  }
+
+  // The message must ride the claiming update, exactly as resumeRun carries its
+  // answer: a second write could fail after status flips to running, losing the
+  // human's text with no safe retry. Pin the exact row — see resumeRun for why
+  // `{$type:"null"}` and the `at` identity term are both required.
+  const priorExchanges = run.exchanges ?? [];
+  let openIndex = -1;
+  priorExchanges.forEach((exchange, index) => {
+    if (exchange.answer === null) openIndex = index;
+  });
+  const openRow = openIndex >= 0 ? priorExchanges[openIndex] : null;
+  const claimFilter: Record<string, unknown> = {
+    _id: new ObjectId(runId),
+    status: "awaiting_input",
+  };
+  if (openIndex >= 0 && openRow) {
+    claimFilter[`exchanges.${openIndex}.answer`] = { $type: "null" };
+    claimFilter[`exchanges.${openIndex}.at`] = openRow.at;
+  } else {
+    // No open row in our snapshot. Pin both that absence and the parked question,
+    // exactly as resumeRun does, so a concurrent park cannot slip an open row in
+    // between our read and this claim — which would leave two open rows.
+    claimFilter.exchanges = { $not: { $elemMatch: { answer: null } } };
+    claimFilter.awaitingQuestion = run.awaitingQuestion ?? null;
+  }
+  const answerAt = now();
+  const claimSet: Record<string, unknown> = {
+    ...(openIndex >= 0
+      ? {
+          [`exchanges.${openIndex}.answer`]: message,
+          [`exchanges.${openIndex}.answeredAt`]: answerAt,
+        }
+      : {}),
+  };
+  const claimPush: PushOperator<RunDoc> | undefined =
+    openIndex === -1
+      ? {
+          exchanges: {
+            $each: [
+              {
+                v: 1 as const,
+                at: answerAt,
+                question: questionOrFallback(
+                  run.awaitingQuestion,
+                  "(continued execution)",
+                ),
+                handoff: null,
+                answer: message,
+                answeredAt: answerAt,
+              },
+            ],
+            $slice: -EXCHANGE_CAP,
+          },
+        }
+      : undefined;
+
+  const leaseId = new ObjectId().toString();
+  let sent: boolean;
+  try {
+    sent = await sendContinueTurn({
+      database,
+      run,
+      board,
+      ticket,
+      runId,
+      message,
+      leaseId,
+      claimFilter: claimFilter as Filter<RunDoc>,
+      claimSet,
+      claimPush,
+      afterRunStarted: async () => {
+        const at = now();
+        const to = transition("needs_input", "provide_input");
+        const ticketStarted = await database
+          .collection<TicketDoc>("tickets")
+          .updateOne(
+            {
+              _id: new ObjectId(run.ticketId),
+              status: "needs_input",
+              activeRunId: runId,
+            },
+            {
+              $set: { status: to, updatedAt: at },
+              $push: pushActivity("run", "continued execution", at),
+            },
+          );
+        if (ticketStarted.matchedCount === 0) {
+          throw new ServerResultError(
+            "conflict",
+            "ticket is no longer awaiting input",
+          );
+        }
+      },
+    });
+  } catch {
+    // Only a spawn failure (or a mid-send throw) lands here — a lost claim
+    // returns false instead. Release the lease and re-park via the existing
+    // resume compensation.
     try {
-      // Release the lease and re-park via the existing resume compensation.
       await runs.updateOne(
         { _id: new ObjectId(runId), executionLeaseId: leaseId },
         { $set: { executionLeaseId: null, executionLeaseExpiresAt: null } },
@@ -1943,6 +2212,13 @@ export async function continueExecution(
       );
     }
     throw new ServerResultError("spawn_failed", "run could not be continued");
+  }
+  // The claim missed: the run was terminalized or a newer turn owns the lease
+  // between our snapshot and this claim. Nothing was claimed and nothing was
+  // written, so no compensation runs — report the lost race as a conflict, the
+  // same code the old inline claim threw.
+  if (!sent) {
+    throw new ServerResultError("conflict", "run is already executing");
   }
 }
 
@@ -2051,6 +2327,8 @@ export async function dispatchRun(
     baseSha: null,
     verdict: null,
     failureKind: null,
+    fixAttempts: 0,
+    lastFixSignature: null,
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,

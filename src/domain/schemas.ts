@@ -278,6 +278,13 @@ export const RunSchema = z.object({
     ])
     .nullable()
     .default(null),
+  // How many times failing acceptance checks have been handed back to the
+  // agent on this run. Bounded by MAX_FIX_ATTEMPTS.
+  fixAttempts: z.number().int().min(0).default(0),
+  // Signature of the failure last delivered to the agent. A repeat means the
+  // agent saw this exact failure and did not fix it; delivering it again buys
+  // nothing. null until the first delivery.
+  lastFixSignature: z.string().nullable().default(null),
   // Provider conversation id captured from the runner's structured output, so
   // a later turn can resume the SAME session. null for legacy/uncaptured runs.
   executionSessionId: z.string().nullable().default(null),
