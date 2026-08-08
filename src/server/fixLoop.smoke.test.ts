@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { accessSync, constants as fsConstants } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -121,6 +121,35 @@ async function seedRun(over: Record<string, unknown>): Promise<string> {
 }
 
 let binDirectory: string;
+
+// The tail test that must reach a REAL successful spawn (sent === true) installs
+// a `claude` stub in its OWN temp dir and points PATH at it for the duration of
+// the test — the shared bin dir stays empty so the ENOENT test above still sees
+// a spawn failure. The stub writes a valid outcome.json and exits 0, so the
+// send succeeds against THIS stub — the only `claude` on the stubbed PATH — and
+// never the real billable binary at /home/radan/.local/bin/claude.
+async function installRunnerStub(dir: string): Promise<void> {
+  const stub = join(dir, "claude");
+  await writeFile(
+    stub,
+    [
+      "#!/usr/bin/env bash",
+      // A continue turn writes the outcome the supervisor reads back as the
+      // turn's result. The only required shape is a valid RunOutcome; the
+      // supervisor resolves it against the runDir captured in T4D_OUTCOME_PATH,
+      // which lives under <repo>/.tosin4dev/runs/<runId> and may not exist yet.
+      "if [ -n \"$T4D_OUTCOME_PATH\" ]; then",
+      "  mkdir -p \"$(dirname \"$T4D_OUTCOME_PATH\")\"",
+      "  echo '{\"outcome\":\"completed\"}' > \"$T4D_OUTCOME_PATH\"",
+      "fi",
+      // stdout is drained to the turn's stdout file; parseSessionId reads it for
+      // a session id. A `completed` continue rotates the session id on re-park —
+      // omitting it leaves the existing session untouched, which is fine here.
+      "exit 0",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+}
 
 beforeAll(async () => {
   binDirectory = await mkdtemp(join(tmpdir(), "t4d-fixbin-"));
@@ -494,7 +523,11 @@ describe("fix-loop verification tail", () => {
     // writes the prompt ONLY after the lease claim wins; a lost claim (the 4a
     // tail test's fixture) returns false before any write, and a suppressed
     // decision never reaches the send at all. The stubbed PATH then makes the
-    // actual spawn fail with ENOENT.
+    // actual spawn fail with ENOENT. If the head-SHA guard ever regressed to
+    // suppressing before the send, the prompt would not exist and the read below
+    // would reject on ENOENT — assert it first so this test fails on its own
+    // expect, not an unhandled rejection.
+    expect(existsSync(promptFile)).toBe(true);
     const prompt = await readFile(promptFile, "utf8");
     expect(prompt).toContain("acceptance checks");
     // The failed send landed in the blocked tail: the run failed visibly rather
@@ -506,5 +539,50 @@ describe("fix-loop verification tail", () => {
     // signature stay exactly as they were and re-fire cleanly next time.
     expect(run?.fixAttempts).toBe(0);
     expect(run?.lastFixSignature).toBeNull();
+  });
+
+  it("records a delivery when the fix send succeeds and pins the counter and signature", async () => {
+    const { runId, ticketId } = await seedRetryFixture();
+    // A real successful spawn needs a `claude` on PATH that is OUR stub and not
+    // the billable binary. Install the stub in a fresh dir and point PATH at it
+    // for this test only, so the shared ENOENT fixture above is unaffected.
+    const stubDir = await mkdtemp(join(tmpdir(), "t4d-fixstub-"));
+    await installRunnerStub(stubDir);
+    process.env.PATH = stubPath(stubDir);
+    let outcome: string;
+    try {
+      outcome = await applyRunCompletion(
+        runId,
+        ticketId,
+        "execute",
+        0,
+        "out\n",
+        logFile,
+        null,
+        board,
+        runDir,
+        new ObjectId().toString(),
+      );
+    } finally {
+      await rm(stubDir, { recursive: true, force: true });
+      process.env.PATH = stubPath(binDirectory);
+    }
+    expect(outcome).toBe("completed");
+    const database = await db();
+    const run = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
+    // A delivery that actually landed: the budget advanced and the signature is
+    // pinned. The record is the parse of what was decided on — a stale/NaN write
+    // would fail here (toBe, not a truthiness check), which is exactly the
+    // legacy-document bug FIX 1 kills.
+    expect(run?.fixAttempts).toBe(1);
+    expect(run?.lastFixSignature).toBe(
+      fixSignature([
+        {
+          key: "bad",
+          exitCode: 1,
+          output: await readFile(join(runDir, "checks/bad.log"), "utf8"),
+        },
+      ]),
+    );
   });
 });
