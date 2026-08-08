@@ -28,6 +28,7 @@ import {
   RunSchema,
   TicketSchema,
   type Board,
+  type Evidence,
   type HandoffBrief,
   type Run,
   type RunTurn,
@@ -881,6 +882,11 @@ export async function applyRunCompletion(
     // change to fold the outcome into — finishRun's backstop closes the row.
     if (claimed.matchedCount === 0) return "completed";
     const run = await runs.findOne({ _id: new ObjectId(runId) });
+    // The claim matched, so the row existed a moment ago; if it is gone now the
+    // run was deleted underneath us. Touching nothing (as the matchedCount === 0
+    // path does) is the correct fail-closed reaction, and the early return
+    // narrows `run` to non-null so the fix-loop tail below never needs a `!`.
+    if (!run) return "completed";
     const result = await verifyRun({
       repoPath: board.repoPath,
       workDir: run?.workDir ?? board.repoPath,
@@ -890,6 +896,7 @@ export async function applyRunCompletion(
       checks: board.checks,
       at: verifyAt,
     });
+    const doneAt = now();
     const evidence = EvidenceSchema.parse({
       runId,
       ticketId,
@@ -897,9 +904,9 @@ export async function applyRunCompletion(
       commitRef: result.commitRef,
       checks: result.checks,
       verdict: result.verdict,
+      createdAt: doneAt,
     });
-    const doneAt = now();
-    await database.collection("evidence").insertOne({ ...evidence, createdAt: doneAt });
+    await database.collection("evidence").insertOne(evidence);
     if (result.verdict === "passed") {
       const stamp = turnStamp(turnId, "completed");
       await runs.updateOne(
@@ -943,7 +950,7 @@ export async function applyRunCompletion(
       try {
         sent = await sendContinueTurn({
           database,
-          run: run!,
+          run,
           board,
           ticket: retryTicket,
           runId,
@@ -989,7 +996,7 @@ export async function applyRunCompletion(
       // write; a competing path that already incremented the counter makes this
       // update no-op, so two concurrent deliveries cannot both count.
       if (sent) {
-        await recordFixDelivery(runId, signature, run!.fixAttempts, doneAt);
+        await recordFixDelivery(runId, signature, run.fixAttempts);
         return "completed";
       }
       // The claim was lost (the lease expired or a competing path claimed the
@@ -1833,16 +1840,23 @@ export async function deliverFixFeedback(
   if (!decision.retry) return { decision, signature };
 
   // The branch tip moved while checks were running, so these failures describe a
-  // commit that no longer exists. Delivering them would be a lie. Re-verify.
-  const evidence = await database
-    .collection("evidence")
+  // commit that no longer exists. Delivering them would be a lie: the agent
+  // would be asked to fix a commit that is not there. The latest evidence row
+  // for this run records the commit that was verified; no row means verification
+  // never produced a commit to guard. When a row exists, the git read below
+  // decides. An unreadable tip (workdir gone, transient error) is NOT evidence
+  // the commit is still there — the whole point of the guard is to never hand
+  // the agent failures from a commit that no longer exists — so it fails CLOSED
+  // and the feedback is suppressed. The verification outcome is not lost: the
+  // run still fails visibly through the blocked path with reason `suppressed`.
+  const latestEvidence = await database
+    .collection<Evidence>("evidence")
     .findOne({ runId }, { sort: { createdAt: -1 } });
-  // The latest evidence row for this run records the commit that was verified.
-  // No row yet means verification never produced one — treat the tip as stable.
-  // Only when a row exists is the git read worth doing; an unreadable tip (workdir
-  // gone, transient error) must not lose the whole verification outcome, so it
-  // fails OPEN and the feedback is delivered rather than the run suppressed.
-  if (evidence && run.branch !== null) {
+  if (latestEvidence && run.branch !== null) {
+    // Parse the row at the boundary: this read gates the guard below, and an
+    // untyped `any` commitSha would silently compare `undefined !== tipNow`,
+    // suppressing every retry forever, if the field were ever renamed.
+    const evidence = EvidenceSchema.pick({ commitSha: true }).parse(latestEvidence);
     let tipNow: string | null = null;
     try {
       tipNow = (
@@ -1853,7 +1867,7 @@ export async function deliverFixFeedback(
     } catch {
       tipNow = null;
     }
-    if (tipNow !== null && tipNow !== evidence.commitSha) {
+    if (tipNow !== evidence.commitSha) {
       return { decision: { retry: false, reason: "suppressed" }, signature };
     }
   }
@@ -1871,12 +1885,13 @@ async function recordFixDelivery(
   runId: string,
   signature: string,
   fixAttempts: number,
-  at: string,
 ): Promise<void> {
   const database = await db();
+  // RunSchema has no `updatedAt` field; a previous write set it here and it was
+  // stripped on every parse. Drop it so the write only touches typed fields.
   await database.collection<RunDoc>("runs").updateOne(
     { _id: new ObjectId(runId), fixAttempts },
-    { $set: { fixAttempts: fixAttempts + 1, lastFixSignature: signature, updatedAt: at } },
+    { $set: { fixAttempts: fixAttempts + 1, lastFixSignature: signature } },
   );
 }
 

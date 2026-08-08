@@ -334,6 +334,10 @@ export const EvidenceSchema = z.object({
   commitRef: z.string().min(1),
   checks: z.array(EvidenceCheck).default([]),
   verdict: EvidenceVerdict,
+  // When this commit was verified. The head-SHA guard sorts the latest evidence
+  // row by this, so it must be typed — an untyped sort key would be checked
+  // only by the database, never by the schema.
+  createdAt: z.string().datetime(),
 });
 export type Evidence = z.infer<typeof EvidenceSchema>;
 
