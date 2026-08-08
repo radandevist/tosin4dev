@@ -480,13 +480,14 @@ async function transitionTicketSucceeded(
   ticketId: string,
   runId: string,
   at: string,
+  prUrl: string | null = null,
 ): Promise<void> {
   const tickets = database.collection<TicketDoc>("tickets");
   const nextStatus = transition("running", "run_succeeded");
   const upd = await tickets.updateOne(
     { _id: new ObjectId(ticketId), activeRunId: runId, status: "running" },
     {
-      $set: { activeRunId: null, status: nextStatus, updatedAt: at },
+      $set: { activeRunId: null, status: nextStatus, updatedAt: at, prUrl },
       $push: pushActivity("run", "run succeeded (verified)", at),
     },
   );
@@ -1001,7 +1002,7 @@ export async function applyRunCompletion(
         },
         stamp.options,
       );
-      await transitionTicketSucceeded(database, ticketId, runId, doneAt);
+      await transitionTicketSucceeded(database, ticketId, runId, doneAt, prUrl);
       await notifyReviewReady(database, ticketId, `${outSummary ?? ""}\n${prUrl}`);
       return "completed";
     }
@@ -2087,18 +2088,41 @@ function formatCheckFailures(
   ].join("\n\n");
 }
 
+// Neutralize GitHub control tokens in text that lands in a public PR body.
+// An `@someone` in a spec would mass-notify that user or team, and a
+// `Closes #123` would attach auto-close semantics to an unrelated issue when
+// the PR merges — both are plausible in a human-written ticket describing an
+// issue. Both resolve inside blockquotes, so the tokens themselves are broken:
+// a zero-width space between the marker and its target stops GitHub from
+// resolving them while the text stays human-readable. Backtick-wrapping would
+// work too but fails on text that already contains backticks (a broken code
+// span leaks the rest as formatting), so the zero-width form is the robust one.
+export function neutralizePrTokens(text: string): string {
+  return text
+    .replace(/@([A-Za-z0-9][A-Za-z0-9._-]*)/g, "@​$1")
+    .replace(
+      /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi,
+      "$1 #​$2",
+    );
+}
+
 // Assembled from what already exists: the locked spec, the run summary, and the
-// evidence row. No new state.
-function prBody(ticket: Ticket, evidence: Evidence, summary: string | null): string {
+// evidence row. No new state. Exported as a pure seam so the token
+// neutralization is testable without a publish.
+export function prBody(
+  ticket: Ticket,
+  evidence: Evidence,
+  summary: string | null,
+): string {
   const checks = evidence.checks
     .map((c) => `- \`${c.key}\` — exit ${c.exitCode}`)
     .join("\n");
   return [
-    `### Intent\n${ticket.spec.intent}`,
+    `### Intent\n${neutralizePrTokens(ticket.spec.intent)}`,
     ticket.spec.acceptance.length
-      ? `### Acceptance\n${ticket.spec.acceptance.map((a) => `- ${a}`).join("\n")}`
+      ? `### Acceptance\n${ticket.spec.acceptance.map((a) => `- ${neutralizePrTokens(a)}`).join("\n")}`
       : null,
-    summary ? `### Summary\n${summary}` : null,
+    summary ? `### Summary\n${neutralizePrTokens(summary)}` : null,
     `### Verification\nCommit \`${evidence.commitSha}\`\n\n${checks || "_no checks recorded_"}`,
     `_Opened by Tosin4dev. Draft — merging is the owner's action._`,
   ]

@@ -22,17 +22,27 @@ export function addOriginRemote(repo: string, prefix: string): string {
 }
 
 // Install a `gh` shim into `binDirectory` (which every smoke test puts FIRST
-// on the stubbed PATH). auth status passes, pr list finds no open PR, pr
-// create returns a synthetic URL — enough for the publish path to run end to
-// end without a real GitHub account or any network call.
+// on the stubbed PATH). auth status passes, pr list finds no open PR by
+// default, pr create returns a synthetic URL — enough for the publish path to
+// run end to end without a real GitHub account or any network call.
+// T4D_SHIM_PR_LIST lets a test report an already-open PR (default `[]`, so
+// every current fixture behaves exactly as before); the create path refuses a
+// `pr create` without `--draft`, because that is the one irreversible flag.
 export async function writeGhShim(binDirectory: string): Promise<void> {
   await writeFile(
     join(binDirectory, "gh"),
     [
       "#!/bin/sh",
       'if [ "$1" = "auth" ]; then echo "shim: logged in"; exit 0; fi',
-      'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi',
+      'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then',
+      '  echo "${T4D_SHIM_PR_LIST:-[]}"',
+      "  exit 0",
+      "fi",
       'if [ "$1" = "pr" ] && [ "$2" = "create" ]; then',
+      // `--draft` is the one irreversible flag: dropping it opens a
+      // ready-for-review PR on a real repo. Refuse any create that lacks it so
+      // the whole smoke suite fails if draftPrArgs ever loses the literal.
+      '  case "$*" in *--draft*) ;; *) echo "shim: pr create without --draft" >&2; exit 1;; esac',
       '  echo "https://github.com/tosin4dev/publyapp/pull/1"',
       "  exit 0",
       "fi",
