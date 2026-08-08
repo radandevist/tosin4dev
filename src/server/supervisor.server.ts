@@ -930,10 +930,14 @@ export async function applyRunCompletion(
     const failing = result.checks.filter((c) => c.exitCode !== 0);
     const { loaded: failingWithOutput, anyUnreadable } =
       await failingChecksWithOutput(failing);
-    const { decision, signature } =
+    const { decision, signature, attempts } =
       result.failureKind === "verification_failed"
         ? await deliverFixFeedback(runId, failingWithOutput, anyUnreadable)
-        : ({ decision: { retry: false, reason: "not_retryable" } as const, signature: "" });
+        : ({
+            decision: { retry: false, reason: "not_retryable" } as const,
+            signature: "",
+            attempts: 0,
+          });
 
     if (decision.retry) {
       // Back to the agent on the existing leased session. The ticket stays
@@ -992,11 +996,15 @@ export async function applyRunCompletion(
         );
       }
       // The send happened. Only now is the attempt recorded — budget consumed
-      // and signature pinned for the next comparison. Recording is the CAS'd
-      // write; a competing path that already incremented the counter makes this
-      // update no-op, so two concurrent deliveries cannot both count.
+      // and signature pinned for the next comparison. The CAS key is the parsed
+      // `attempts` value deliverFixFeedback decided on, NOT the raw document
+      // fetched before verifyRun (which predates the minutes of checks and was
+      // never parsed): a legacy doc lacking the field would serialize to null,
+      // match, and write NaN. Recording is the CAS'd write; a competing path
+      // that already incremented the counter makes this update no-op, so two
+      // concurrent deliveries cannot both count.
       if (sent) {
-        await recordFixDelivery(runId, signature, run.fixAttempts);
+        await recordFixDelivery(runId, signature, attempts);
         return "completed";
       }
       // The claim was lost (the lease expired or a competing path claimed the
@@ -1800,30 +1808,55 @@ async function finishContinueTurn(
 // signature) is the caller's job, done AFTER the send actually delivered
 // feedback — the send has three ways to deliver nothing, and a decision that
 // delivered nothing must not look like a delivery or the next call misjudges on
-// stale state.
+// stale state. Alongside the decision it returns the parsed `attempts` value it
+// decided on, so the caller's delivery CAS keys on the exact snapshot that was
+// read — not a second, unparsed read taken before verifyRun.
 export async function deliverFixFeedback(
   runId: string,
   failing: { key: string; exitCode: number; output: string }[],
   anyUnreadable = false,
-): Promise<{ decision: FixDecision; signature: string }> {
+): Promise<{
+  decision: FixDecision;
+  signature: string;
+  // The parsed `fixAttempts` the decision was made FROM. The verification tail
+  // keys its delivery CAS on this value so the write matches only the document
+  // the decision actually read — a legacy doc that lacks the field (its schema
+  // default never ran because the doc was never re-parsed) would otherwise
+  // serialize `undefined` to `null` and match anyway, then write `NaN`.
+  attempts: number;
+}> {
   const database = await db();
   const runs = database.collection<RunDoc>("runs");
   const raw = await runs.findOne({ _id: new ObjectId(runId) });
-  if (!raw) return { decision: { retry: false, reason: "not_retryable" }, signature: "" };
+  if (!raw) {
+    return {
+      decision: { retry: false, reason: "not_retryable" },
+      signature: "",
+      attempts: 0,
+    };
+  }
   const run = RunSchema.parse(raw);
 
   // Suppressed, not sent. A parked run cannot receive a turn, and marking this
   // delivered would leave the agent waiting on advice it never got. Fail closed:
   // no budget consumed, no signature recorded, so it re-fires on resume.
   if (run.status === "awaiting_input") {
-    return { decision: { retry: false, reason: "suppressed" }, signature: "" };
+    return {
+      decision: { retry: false, reason: "suppressed" },
+      signature: "",
+      attempts: run.fixAttempts,
+    };
   }
 
   // A retry resumes the SAME provider session. Without a captured session id
   // there is nothing to resume, so the failure is not fixable by a retry — fail
   // closed rather than let the send machinery throw after the budget was spent.
   if (!run.executionSessionId) {
-    return { decision: { retry: false, reason: "not_retryable" }, signature: "" };
+    return {
+      decision: { retry: false, reason: "not_retryable" },
+      signature: "",
+      attempts: run.fixAttempts,
+    };
   }
 
   const signature = fixSignature(failing);
@@ -1837,7 +1870,7 @@ export async function deliverFixFeedback(
     signature,
     lastSignature: anyUnreadable ? null : run.lastFixSignature,
   });
-  if (!decision.retry) return { decision, signature };
+  if (!decision.retry) return { decision, signature, attempts: run.fixAttempts };
 
   // The branch tip moved while checks were running, so these failures describe a
   // commit that no longer exists. Delivering them would be a lie: the agent
@@ -1868,19 +1901,24 @@ export async function deliverFixFeedback(
       tipNow = null;
     }
     if (tipNow !== evidence.commitSha) {
-      return { decision: { retry: false, reason: "suppressed" }, signature };
+      return {
+        decision: { retry: false, reason: "suppressed" },
+        signature,
+        attempts: run.fixAttempts,
+      };
     }
   }
 
   // The decision alone — the attempt is recorded by recordFixDelivery only after
   // the send actually delivered the feedback, never before.
-  return { decision, signature };
+  return { decision, signature, attempts: run.fixAttempts };
 }
 
 // Record a fix delivery that actually happened. Called by the verification tail
 // ONLY after sendContinueTurn returns true. The CAS on fixAttempts keeps two
 // concurrent paths from both incrementing: the write matches only the value the
-// decision read, so the loser's update no-ops.
+// decision was parsed from (deliverFixFeedback's `attempts`), so the loser's
+// update no-ops.
 async function recordFixDelivery(
   runId: string,
   signature: string,
@@ -1889,10 +1927,19 @@ async function recordFixDelivery(
   const database = await db();
   // RunSchema has no `updatedAt` field; a previous write set it here and it was
   // stripped on every parse. Drop it so the write only touches typed fields.
-  await database.collection<RunDoc>("runs").updateOne(
+  // The value comes from deliverFixFeedback's RunSchema.parse, which rejects
+  // NaN, so a stale key — the write matching no current document — is now
+  // genuinely unexpected. Log it rather than silently undercounting.
+  const matched = await database.collection<RunDoc>("runs").updateOne(
     { _id: new ObjectId(runId), fixAttempts },
     { $set: { fixAttempts: fixAttempts + 1, lastFixSignature: signature } },
   );
+  if (matched.matchedCount === 0) {
+    console.error(
+      `recordFixDelivery matched no run for ${runId} at fixAttempts ${fixAttempts}; ` +
+        "the delivery will go uncounted",
+    );
+  }
 }
 
 // The pure fix-loop module needs each failing check's CONTENT, but verifyRun
