@@ -108,11 +108,24 @@ export function parsePrListOutput(stdout: string): string | null {
 // The created PR's URL. `.url()` alone accepts javascript:/mailto:, so the
 // protocol is pinned too, and whatever gh actually printed is named in the
 // failure so the operator can act on it rather than on a bare schema error.
-// Exported as a pure seam so the parse is testable without invoking `gh`.
+// WHATWG's `new URL()` strips newlines rather than rejecting them, so a
+// multi-line stdout must never reach the schema: a notice that lands on the
+// same stream as the URL would weld itself onto the link and still parse.
+// gh prints the URL as its one line of stdout on success, and a notice that
+// leaks onto stdout (e.g. a release banner) is appended after that line, so
+// the FIRST non-empty line is the URL in both the clean and the noisy case. A
+// candidate that still fails validation is a diagnosed failure, not a silent
+// garbage write. Exported as a pure seam so the parse is testable without
+// invoking `gh`.
 export function parseCreatedPrUrl(stdout: string): string {
-  const parsed = HttpUrlString.safeParse(stdout.trim());
+  const firstLine =
+    stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? "";
+  const parsed = HttpUrlString.safeParse(firstLine);
   if (!parsed.success) {
-    const shown = stdout.trim().slice(0, 300) || "<empty>";
+    const shown = firstLine.slice(0, 300) || "<empty>";
     throw new ServerResultError(
       "unparseable_pr_url",
       `gh pr create printed no usable URL (got: ${JSON.stringify(shown)})`,

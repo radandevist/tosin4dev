@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -70,6 +70,12 @@ describe("pushBranch", () => {
 
     it("reuses an existing PR for the head and does not call pr create", async () => {
       process.env.T4D_SHIM_PR_LIST = '[{"url":"https://github.com/tosin4dev/publyapp/pull/7"}]';
+      // The shim logs every invocation to T4D_SHIM_LOG, so this test can prove
+      // pr create never ran — the URL alone cannot see an extra call (an
+      // implementation that creates AND returns the existing URL would still
+      // pass), and a duplicate PR is exactly what the reuse path exists to stop.
+      const shimLog = join(clone, "gh-argv.log");
+      process.env.T4D_SHIM_LOG = shimLog;
       try {
         const result = await publishRun({
           board: BOARD,
@@ -79,8 +85,12 @@ describe("pushBranch", () => {
           bodyFile: join(clone, "body.md"),
         });
         expect(result.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/7");
+        const argv = await readFile(shimLog, "utf8");
+        expect(argv).not.toContain("pr create");
+        expect(argv).toContain("pr list");
       } finally {
         delete process.env.T4D_SHIM_PR_LIST;
+        delete process.env.T4D_SHIM_LOG;
       }
       // The branch still reached origin — the reuse path pushes before it looks.
       const { stdout } = await exec("git", ["-C", origin, "branch", "--list", "tosin4dev/run/abc"]);
@@ -88,6 +98,10 @@ describe("pushBranch", () => {
     });
 
     it("creates a PR when the shim reports no existing PR", async () => {
+      // Production writes the body file before gh pr create runs; the shim now
+      // refuses a create whose --body-file is missing or empty, so the test
+      // has to mirror the real ordering.
+      await writeFile(join(clone, "body.md"), "# PR body\n");
       const result = await publishRun({
         board: BOARD,
         title: "#1 confetti",
@@ -106,8 +120,9 @@ describe("pushBranch", () => {
       await expect(exec(ghPath, ["pr", "create", "--base", "main"])).rejects.toMatchObject({
         code: 1,
       });
+      await writeFile(join(clone, "body.md"), "# PR body\n");
       await expect(
-        exec(ghPath, ["pr", "create", "--draft", "--base", "main"]),
+        exec(ghPath, ["pr", "create", "--draft", "--base", "main", "--body-file", join(clone, "body.md")]),
       ).resolves.toMatchObject({ stdout: expect.stringContaining("pull/1") });
     });
   });

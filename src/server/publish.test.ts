@@ -79,6 +79,17 @@ describe("parseCreatedPrUrl", () => {
       /no usable URL/,
     );
   });
+
+  it("keeps only the url line when gh prints a trailing notice", () => {
+    // new URL() strips newlines instead of rejecting them, so handing the raw
+    // stdout to the schema would weld a banner onto the link and still pass.
+    // The first non-empty line is the URL in both the clean and noisy case.
+    expect(
+      parseCreatedPrUrl(
+        "https://github.com/o/r/pull/1\nWARNING: gh update available",
+      ),
+    ).toBe("https://github.com/o/r/pull/1");
+  });
 });
 
 describe("parsePrListOutput", () => {
