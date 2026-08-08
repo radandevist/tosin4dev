@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { accessSync, constants as fsConstants } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ObjectId } from "mongodb";
@@ -9,6 +10,35 @@ import type { Board } from "../domain/schemas";
 
 const TEST_DB = `tosin4dev-test-fix-loop-${process.pid}-${Date.now()}`;
 process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
+
+// A real, billable `claude` sits on PATH in this environment, and the retry
+// test deliberately reaches a spawn. Stub PATH so the spawn fails with ENOENT
+// and never launches the real agent. The stub PREPENDS an empty bin dir to a
+// copy of PATH that has had every directory holding an executable `claude`
+// filtered out — replacing PATH outright would also hide `git` and `node`,
+// which the head-SHA guard and the repo fixture shell out to. Prepending alone
+// is NOT sufficient: Node resolves the spawned command against the whole PATH,
+// so an empty first entry still falls through to the real binary.
+const ORIGINAL_PATH = process.env.PATH;
+
+function isExecutable(file: string): boolean {
+  try {
+    accessSync(file, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// A filtered copy of the original PATH, minus any directory that could resolve
+// `claude`. The retry test's spawn must see ENOENT; `git` and `node` keep their
+// real homes.
+function stubPath(binDirectory: string): string {
+  const filtered = (ORIGINAL_PATH ?? "")
+    .split(":")
+    .filter((dir) => dir && !isExecutable(`${dir}/claude`));
+  return [binDirectory, ...filtered].join(":");
+}
 
 const { db, closeDb } = await import("./db");
 const {
@@ -90,9 +120,21 @@ async function seedRun(over: Record<string, unknown>): Promise<string> {
   return id.toString();
 }
 
+let binDirectory: string;
+
+beforeAll(async () => {
+  binDirectory = await mkdtemp(join(tmpdir(), "t4d-fixbin-"));
+});
+
+beforeEach(async () => {
+  process.env.PATH = stubPath(binDirectory);
+});
+
 afterAll(async () => {
   await (await db()).dropDatabase();
   await closeDb();
+  process.env.PATH = ORIGINAL_PATH;
+  await rm(binDirectory, { recursive: true, force: true });
 });
 
 describe("deliverFixFeedback", () => {
@@ -139,6 +181,19 @@ describe("deliverFixFeedback", () => {
     const database = await db();
     const run = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
     // The decision is not a delivery: nothing is recorded until the send lands.
+    expect(run?.fixAttempts).toBe(0);
+    expect(run?.lastFixSignature).toBeNull();
+  });
+
+  it("does not retry a run with no captured provider session", async () => {
+    // A retry resumes the SAME provider session. Without a captured id there is
+    // nothing to resume, so the failure is not fixable by a retry — fail closed
+    // BEFORE the budget is spent or any send is attempted.
+    const runId = await seedRun({ executionSessionId: null });
+    const { decision } = await deliverFixFeedback(runId, FAILING);
+    expect(decision).toEqual({ retry: false, reason: "not_retryable" });
+    const database = await db();
+    const run = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
     expect(run?.fixAttempts).toBe(0);
     expect(run?.lastFixSignature).toBeNull();
   });
@@ -291,6 +346,59 @@ describe("fix-loop verification tail", () => {
     ]);
   });
 
+  async function seedRetryFixture(): Promise<{
+    runId: string;
+    ticketId: string;
+    promptFile: string;
+  }> {
+    const database = await db();
+    const at = new Date().toISOString();
+    const ticketId = new ObjectId();
+    const promptFile = join(runDir, "retry-prompt.txt");
+    const runId = await seedRun({
+      status: "running",
+      branch,
+      baseSha,
+      workDir: repo,
+      // A retry resumes the SAME provider session; give the run one so the
+      // decision is `retry: true` and the send path is reached.
+      executionSessionId: "sess-retry",
+      // The lease is FREE: the claim must win so the send is actually attempted.
+      executionLeaseId: null,
+      executionLeaseExpiresAt: null,
+      // A unique prompt path proves the send got past the lease claim (which
+      // returns before any write) and into the spawn prep, where the prompt is
+      // written. The 4a tail test's foreign lease never reaches this write.
+      promptFile,
+    });
+    await database.collection("tickets").insertOne({
+      _id: ticketId,
+      boardId: new ObjectId().toString(),
+      seq: 1,
+      title: "fix loop retry",
+      type: "implement",
+      status: "running",
+      runner: "claude",
+      spec: {
+        intent: "verify the retry",
+        scope: "",
+        nonGoals: "",
+        acceptance: [],
+        links: [],
+        risk: "low",
+        approvedAt: at,
+        approvedBy: "radan",
+      },
+      activeRunId: runId,
+      prUrl: null,
+      activity: [],
+      dependsOn: [],
+      createdAt: at,
+      updatedAt: at,
+    });
+    return { runId, ticketId: ticketId.toString(), promptFile };
+  }
+
   async function seedBlockedPathFixture(): Promise<{
     runId: string;
     ticketId: string;
@@ -363,5 +471,40 @@ describe("fix-loop verification tail", () => {
     expect(run?.status).toBe("failed");
     const ticket = await database.collection("tickets").findOne({ _id: new ObjectId(ticketId) });
     expect(ticket?.status).toBe("blocked");
+  });
+
+  it("drives the retry branch to an attempted send that lands blocked on spawn failure", async () => {
+    const { runId, ticketId, promptFile } = await seedRetryFixture();
+    const outcome = await applyRunCompletion(
+      runId,
+      ticketId,
+      "execute",
+      0,
+      "out\n",
+      logFile,
+      null,
+      board,
+      runDir,
+      new ObjectId().toString(),
+    );
+    expect(outcome).toBe("completed");
+    const database = await db();
+    const run = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
+    // THE SEND WAS REACHED, not short-circuited at a guard. sendContinueTurn
+    // writes the prompt ONLY after the lease claim wins; a lost claim (the 4a
+    // tail test's fixture) returns false before any write, and a suppressed
+    // decision never reaches the send at all. The stubbed PATH then makes the
+    // actual spawn fail with ENOENT.
+    const prompt = await readFile(promptFile, "utf8");
+    expect(prompt).toContain("acceptance checks");
+    // The failed send landed in the blocked tail: the run failed visibly rather
+    // than lingering in `verifying`, and the ticket is blocked.
+    expect(run?.status).toBe("failed");
+    const ticket = await database.collection("tickets").findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.status).toBe("blocked");
+    // Nothing was recorded: the send never delivered, so the budget and the
+    // signature stay exactly as they were and re-fire cleanly next time.
+    expect(run?.fixAttempts).toBe(0);
+    expect(run?.lastFixSignature).toBeNull();
   });
 });
