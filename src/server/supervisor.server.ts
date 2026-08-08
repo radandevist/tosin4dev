@@ -1937,14 +1937,14 @@ async function recordFixDelivery(
   // and every failed verification would retry forever. `$in` widens only the
   // zero case; every non-zero key stays exact so two concurrent paths cannot
   // both increment. One delivery repairs the document permanently.
-  //
-  // `Filter<RunDoc>` types fixAttempts as number, which would reject null in
-  // `$in`, so widen the object the same way the claim filters do elsewhere in
-  // this file.
-  const filter = {
+  const filter: Filter<RunDoc> = {
     _id: new ObjectId(runId),
-    fixAttempts: fixAttempts === 0 ? { $in: [0, null] } : fixAttempts,
-  } as unknown as Filter<RunDoc>;
+    // `Filter<RunDoc>` types fixAttempts as number, which would reject null in
+    // `$in`, so widen only the value. `_id` and the field name stay type-checked:
+    // if fixAttempts were renamed in RunDoc, this filter would fail to compile
+    // instead of silently matching nothing.
+    fixAttempts: (fixAttempts === 0 ? { $in: [0, null] } : fixAttempts) as unknown as number,
+  };
   const matched = await database.collection<RunDoc>("runs").updateOne(
     filter,
     { $set: { fixAttempts: fixAttempts + 1, lastFixSignature: signature } },
