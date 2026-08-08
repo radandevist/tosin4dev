@@ -475,12 +475,15 @@ async function ticketLabel(database: Db, ticketId: string): Promise<string> {
   return `${boardDoc?.slug ?? "?"} #${ticketDoc?.seq ?? "?"} ${ticketDoc?.title ?? "ticket"}`;
 }
 
+// `prUrl` is required (not defaulted) because the `$set` writes it
+// unconditionally: a default would let a future success path silently erase
+// the ticket's PR link with no type error to catch it.
 async function transitionTicketSucceeded(
   database: Db,
   ticketId: string,
   runId: string,
   at: string,
-  prUrl: string | null = null,
+  prUrl: string | null,
 ): Promise<void> {
   const tickets = database.collection<TicketDoc>("tickets");
   const nextStatus = transition("running", "run_succeeded");
@@ -2097,13 +2100,53 @@ function formatCheckFailures(
 // resolving them while the text stays human-readable. Backtick-wrapping would
 // work too but fails on text that already contains backticks (a broken code
 // span leaks the rest as formatting), so the zero-width form is the robust one.
-export function neutralizePrTokens(text: string): string {
-  return text
-    .replace(/@([A-Za-z0-9][A-Za-z0-9._-]*)/g, "@​$1")
+//
+// Closing forms neutralized: any keyword GitHub honours (close/closes/closed,
+// fix/fixes/fixed, resolve/resolves/resolved, any case) followed by `:` or
+// whitespace, then one of `#N`, `GH-N`, `owner/repo#N`, or an issue URL. The
+// cross-repo `owner/repo#N` form matters most: "Closes publyapp/api#412"
+// would close an issue in a DIFFERENT repository when the PR merges. Not
+// handled: a bare keyword with no reference (nothing to break) and a bare
+// `#N` with no keyword (auto-close needs the keyword, and breaking every
+// `#N` would corrupt ordinary issue references in prose).
+//
+// The @-guard only fires where GitHub would actually resolve a mention: an @
+// at a token start (start-of-string or after whitespace), so `t@example.com`
+// is left alone, and not on a handle that ends in a dotted TLD (`@gmail.com`
+// reads as an email). Code spans and fenced blocks are extracted first and
+// skipped whole, so `npm i @types/node` stays copy-pasteable and GitHub does
+// not resolve mentions or close issues from inside a code block. This is
+// deliberately not a full markdown parse — that is out of scope and out of
+// proportion. The residual case is an unbalanced backtick (a stray ` with no
+// closer): the splitter treats the rest as prose and its @ tokens still get
+// a ZWSP.
+function neutralizeProse(prose: string): string {
+  return prose
     .replace(
-      /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi,
-      "$1 #​$2",
+      /(?:^|(?<=\s))@([A-Za-z0-9][A-Za-z0-9._-]*)/gm,
+      (whole, handle) =>
+        /\.[A-Za-z]{2,}$/.test(handle) ? whole : `@\u200b${handle}`,
+    )
+    .replace(
+      /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?:[ \t]*:[ \t]*|[ \t]+)(?:#\d+|GH-\d+|[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#\d+|https?:\/\/\S+\/issues\/\d+)\b/gi,
+      (whole) => whole.replace(/(\d+)$/, "\u200b$1"),
     );
+}
+
+export function neutralizePrTokens(text: string): string {
+  // The spans are stashed and re-inserted after neutralizing so the
+  // surrounding prose keeps its original character positions: an @ that
+  // directly follows a closing backtick is not a token start and is left
+  // alone, and a closing keyword cannot reach across a code span.
+  const code: string[] = [];
+  const prose = text.replace(/(```[\s\S]*?```|`[^`\n]*`)/g, (span) => {
+    code.push(span);
+    return `\u0000${code.length - 1}\u0000`;
+  });
+  return neutralizeProse(prose).replace(
+    /\u0000(\d+)\u0000/g,
+    (placeholder, i) => code[Number(i)] ?? placeholder,
+  );
 }
 
 // Assembled from what already exists: the locked spec, the run summary, and the
