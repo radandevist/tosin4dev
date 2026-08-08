@@ -81,7 +81,7 @@ export async function pushBranch(workDir: string, branch: string): Promise<void>
 // url` prints an array of { url } objects — or a non-JSON error/notice prefix
 // when something is off. The listing's URL fields are HttpUrlString too: a
 // reuse URL that is not a real http(s) URL must NOT be returned, or it would be
-// persisted as the run's prUrl and FIX the run's own schema parse later.
+// persisted as the run's prUrl and break the run's own schema parse later.
 // Whatever the cause, a miss on this schema must mean "no existing PR" (so the
 // create still runs), not a hard failure that blocks publishing. A bad create
 // URL is a diagnosis; a bad listing is just no reuse candidate.

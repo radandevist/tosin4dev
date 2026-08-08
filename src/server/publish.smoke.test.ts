@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { pushBranch } from "./publish.server";
+import { writeGhShim } from "./publish.fixture";
+import { publishRun, pushBranch } from "./publish.server";
 
 const exec = promisify(execFile);
 
 let origin: string;
 let clone: string;
+let binDirectory: string;
+const ORIGINAL_PATH = process.env.PATH;
 
 describe("pushBranch", () => {
   beforeEach(async () => {
@@ -25,10 +28,15 @@ describe("pushBranch", () => {
     await writeFile(join(clone, "f.txt"), "x");
     await exec("git", ["-C", clone, "add", "."]);
     await exec("git", ["-C", clone, "commit", "-m", "work"]);
+    binDirectory = await mkdtemp(join(tmpdir(), "t4d-pbin-"));
+    await writeGhShim(binDirectory);
+    process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
   });
   afterEach(async () => {
+    process.env.PATH = ORIGINAL_PATH;
     await rm(origin, { recursive: true, force: true });
     await rm(clone, { recursive: true, force: true });
+    await rm(binDirectory, { recursive: true, force: true });
   });
 
   it("pushes the run branch to origin", async () => {
@@ -45,5 +53,62 @@ describe("pushBranch", () => {
     expect(stdout.trim()).toContain("tosin4dev/run/abc");
     const { stdout: log } = await exec("git", ["-C", clone, "log", "-1", "--format=%s"]);
     expect(log.trim()).toBe("work");
+  });
+
+  describe("publishRun", () => {
+    const BOARD = {
+      slug: "publyapp",
+      name: "PublyApp",
+      repoPath: "/unused",
+      defaultBaseBranch: "develop",
+      checks: [],
+    };
+
+    beforeEach(async () => {
+      await exec("git", ["-C", clone, "remote", "set-url", "origin", origin]);
+    });
+
+    it("reuses an existing PR for the head and does not call pr create", async () => {
+      process.env.T4D_SHIM_PR_LIST = '[{"url":"https://github.com/tosin4dev/publyapp/pull/7"}]';
+      try {
+        const result = await publishRun({
+          board: BOARD,
+          title: "#1 confetti",
+          workDir: clone,
+          branch: "tosin4dev/run/abc",
+          bodyFile: join(clone, "body.md"),
+        });
+        expect(result.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/7");
+      } finally {
+        delete process.env.T4D_SHIM_PR_LIST;
+      }
+      // The branch still reached origin — the reuse path pushes before it looks.
+      const { stdout } = await exec("git", ["-C", origin, "branch", "--list", "tosin4dev/run/abc"]);
+      expect(stdout.trim()).toContain("tosin4dev/run/abc");
+    });
+
+    it("creates a PR when the shim reports no existing PR", async () => {
+      const result = await publishRun({
+        board: BOARD,
+        title: "#1 confetti",
+        workDir: clone,
+        branch: "tosin4dev/run/abc",
+        bodyFile: join(clone, "body.md"),
+      });
+      expect(result.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/1");
+    });
+
+    it("fails closed when the gh shim sees a pr create without --draft", async () => {
+      // The shim is what protects production: if draftPrArgs ever drops the
+      // literal, every smoke publish would run through a create that the shim
+      // refuses instead of silently opening a ready-for-review PR.
+      const ghPath = join(binDirectory, "gh");
+      await expect(exec(ghPath, ["pr", "create", "--base", "main"])).rejects.toMatchObject({
+        code: 1,
+      });
+      await expect(
+        exec(ghPath, ["pr", "create", "--draft", "--base", "main"]),
+      ).resolves.toMatchObject({ stdout: expect.stringContaining("pull/1") });
+    });
   });
 });

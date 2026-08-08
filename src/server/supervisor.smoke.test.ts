@@ -217,6 +217,17 @@ describe("supervisor smoke", () => {
     expect(run.finishedAt).toMatch(/Z$/);
     expect(run.exitCode).toBe(0);
     expect(run.summary).toBe("smoke ok");
+    // The publish path opened a draft PR: the run records its url and the
+    // ticket carries it so the card and detail page can surface it.
+    expect(run.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/1");
+    expect(ticket?.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/1");
+    // The verified branch actually reached the bare origin, not just the local
+    // worktree.
+    const branchList = execFileSync(
+      "git", ["-C", origin, "branch", "--list", run.branch ?? ""],
+      { encoding: "utf8" },
+    ) as string;
+    expect(branchList.trim()).toContain(run.branch);
     await expect(stat(run.workDir)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
     await expect(readFile(run.promptFile, "utf8")).resolves.toContain("isolated git worktree");
     await expect(readFile(run.logFile, "utf8")).resolves.toContain("runner output");

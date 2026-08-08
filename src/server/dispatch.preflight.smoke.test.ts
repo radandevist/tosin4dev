@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ObjectId } from "mongodb";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -111,5 +111,70 @@ describe("dispatchRun acceptance-check preflight", () => {
     // for THIS reason: a fresh board has no checks, and drafting a spec is how
     // a user gets any.
     expect((error as { code?: string }).code).not.toBe("no_acceptance_checks");
+  });
+
+  it("refuses an execute run with no_remote before anything is claimed", async () => {
+    // The Task 1 checks guard runs first, so the board needs checks for the
+    // publish preflight to be reached at all. The repo path is a temp dir with
+    // no `origin`, so preflightPublish fails with no_remote.
+    const dir = await mkdtemp(join(tmpdir(), "t4d-no-origin-"));
+    // `gh auth status` runs before the git remote check, so the stubbed PATH
+    // needs a gh shim that passes auth for the git check to be reached.
+    await writeFile(
+      join(binDirectory, "gh"),
+      '#!/bin/sh\necho "shim: logged in"\nexit 0\n',
+      { mode: 0o755 },
+    );
+    const database = await db();
+    const boardId = new ObjectId();
+    const at = "2026-08-07T00:00:00.000Z";
+    await database.collection("boards").insertOne({
+      _id: boardId,
+      slug: `no-origin-${process.pid}-${Date.now()}`,
+      name: "No Origin",
+      repoPath: dir,
+      defaultBaseBranch: "develop",
+      checks: [{ key: "ok", label: "ok", command: ["true"], timeoutMs: 10_000 }],
+      createdAt: at,
+      updatedAt: at,
+    });
+    const ticketId = new ObjectId();
+    await database.collection("tickets").insertOne({
+      _id: ticketId,
+      boardId: boardId.toString(),
+      seq: 2,
+      title: "t",
+      type: "implement",
+      status: "approved",
+      runner: "claude",
+      activeRunId: null,
+      dependsOn: [],
+      activity: [],
+      spec: {
+        intent: "do the thing",
+        scope: "",
+        nonGoals: "",
+        acceptance: ["it works"],
+        links: [],
+        risk: "low",
+        approvedAt: at,
+        approvedBy: "radan",
+      },
+      createdAt: at,
+      updatedAt: at,
+    });
+
+    await expect(dispatchRun(ticketId.toString(), "execute")).rejects.toMatchObject({
+      code: "no_remote",
+    });
+
+    // The preflight refuses before anything is claimed or a run is created.
+    const ticket = await database
+      .collection("tickets")
+      .findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.activeRunId).toBeNull();
+    expect(ticket?.status).toBe("approved");
+    expect(await database.collection("runs").countDocuments()).toBe(0);
+    await rm(dir, { recursive: true, force: true });
   });
 });
