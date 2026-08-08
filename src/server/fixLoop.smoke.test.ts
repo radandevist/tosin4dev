@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { ObjectId } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { MAX_FIX_ATTEMPTS, fixSignature } from "../domain/fix-loop";
-import type { Board, Run } from "../domain/schemas";
+import type { Board, Run, Ticket } from "../domain/schemas";
 
 const TEST_DB = `tosin4dev-test-fix-loop-${process.pid}-${Date.now()}`;
 process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
@@ -445,6 +445,10 @@ describe("fix-loop verification tail", () => {
       branch,
       baseSha,
       workDir: repo,
+      // The run points at the seeded ticket: the chain's ticket writes
+      // (transitionTicketFailed in applyRunCompletion) target run.ticketId, and
+      // the settle poll watches that same row for activeRunId to clear.
+      ticketId: ticketId.toString(),
       // A retry resumes the SAME provider session; give the run one so the
       // decision is `retry: true` and the send path is reached.
       executionSessionId: "sess-retry",
@@ -496,6 +500,10 @@ describe("fix-loop verification tail", () => {
       branch,
       baseSha,
       workDir: repo,
+      // The run points at the seeded ticket: the chain's ticket writes
+      // (transitionTicketFailed in applyRunCompletion) target run.ticketId, and
+      // the settle poll watches that same row for activeRunId to clear.
+      ticketId: ticketId.toString(),
       // A live lease owned by someone else: the retry claim cannot take it, so
       // sendContinueTurn returns false BEFORE any spawn, and the send never
       // happens. This is the spawn-free way to exercise the missed-claim path.
@@ -546,6 +554,10 @@ describe("fix-loop verification tail", () => {
       branch,
       baseSha,
       workDir: repo,
+      // The run points at the seeded ticket: the chain's ticket writes
+      // (transitionTicketFailed in applyRunCompletion) target run.ticketId, and
+      // the settle poll watches that same row for activeRunId to clear.
+      ticketId: ticketId.toString(),
       // A retry resumes the SAME provider session; give the run one so the
       // decision is `retry: true` and the send path is reached.
       executionSessionId: "sess-retry",
@@ -589,11 +601,23 @@ describe("fix-loop verification tail", () => {
   // <repo>/.tosin4dev/runs/<runId>/turns/ and then re-enters applyRunCompletion
   // to terminalize. Asserting before that chain settles lets the describe-level
   // afterAll rm -rf the repo and runDir while those streams are still open
-  // (ENOTEMPTY) and leaves a database write racing the file-level closeDb. The
-  // continue turn's outcome is the LAST write in the chain (recordTurnOutcome in
-  // finishRun), so a non-null outcome proves every stream drain and status/ticket
-  // write has completed. Needed after FIX 2: the stub's `failed` outcome makes
-  // the follow-on turn terminate early, but the chain still runs.
+  // (ENOTEMPTY) and leaves a database write racing the file-level closeDb —
+  // db() would reconnect, recreate the test database and leak a MongoClient.
+  //
+  // What the poll waits on is the TICKET, not the continue turn. The turn's
+  // outcome is stamped into the RUN document by failVerifiedRun, but three
+  // database operations still follow that stamp in the terminal chain:
+  // transitionTicketFailed's tickets.updateOne (one or two writes, which clears
+  // activeRunId and flips the status away from "running"), ticketLabel's
+  // unconditional findOne inside notifyBlocked (evaluated as the notify
+  // argument even when notify no-ops without DISCORD_WEBHOOK_URL), and
+  // finishRun's backstop recordTurnOutcome (a no-op here, but still a round
+  // trip). Any of them can land after the file-level afterAll has dropped and
+  // closed the database. transitionTicketFailed is the last WRITE, so observing
+  // activeRunId === null on the ticket proves every write in the chain has
+  // completed; only the notifyBlocked label read can still trail. Needed after
+  // FIX 2: the stub's `failed` outcome makes the follow-on turn terminate early,
+  // but the chain still runs.
   async function pollSettledContinue(runId: string, timeoutMs = 5_000): Promise<void> {
     const database = await db();
     const deadline = Date.now() + timeoutMs;
@@ -601,9 +625,47 @@ describe("fix-loop verification tail", () => {
       const run = await database
         .collection<Run>("runs")
         .findOne({ _id: new ObjectId(runId) });
-      if (run?.turns?.some((turn) => turn.outcome !== null)) return;
+      // The chain terminalizes through finishRun → applyRunCompletion, whose
+      // ticket writes target run.ticketId — so the ticket this poll watches is
+      // the one the RUN points at, not a caller-chosen id.
+      const ticket = run
+        ? await database
+            .collection<Ticket>("tickets")
+            .findOne({ _id: new ObjectId(run.ticketId) })
+        : null;
+      // The continue turn is the LAST element of the turns array — it is pushed
+      // after the run's original dispatch/resume turns. A bare `.some(...)` is
+      // not enough: it would return as soon as ANY turn has a non-null outcome,
+      // and both fixtures happen to seed `turns: []` with a continue turnId the
+      // outer applyRunCompletion does not have in the array. The moment a fixture
+      // seeds a resolved turn, or a second continue turn appears, `.some` would
+      // observe a stale outcome and this poll would return before the chain's
+      // last write. So the continue turn must be terminal AND the ticket write
+      // that ends the chain must have landed — activeRunId cleared by
+      // transitionTicketFailed is the last write, so it is the authoritative
+      // settle signal; the turn condition is the "the chain actually ran" guard.
+      const lastTurn = run?.turns?.at(-1);
+      if (
+        run &&
+        lastTurn &&
+        lastTurn.kind === "continue" &&
+        lastTurn.outcome !== null &&
+        ticket &&
+        ticket.activeRunId === null
+      ) {
+        return;
+      }
       if (Date.now() > deadline) {
-        throw new Error(`continue turn for run ${runId} never settled`);
+        const status = run?.status ?? "missing";
+        const outcomes = JSON.stringify(
+          (run?.turns ?? []).map((turn) => ({ id: turn.id, kind: turn.kind, outcome: turn.outcome })),
+        );
+        const ticketStatus = ticket ? String(ticket.status) : "missing";
+        const ticketActiveRunId = ticket ? String(ticket.activeRunId) : "missing";
+        throw new Error(
+          `continue turn for run ${runId} never settled; run status ${status}, turns ${outcomes}, ` +
+            `ticket status ${ticketStatus}, ticket activeRunId ${ticketActiveRunId}`,
+        );
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
