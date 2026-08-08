@@ -286,7 +286,10 @@ export const RunSchema = z.object({
   // nothing. null until the first delivery.
   lastFixSignature: z.string().nullable().default(null),
   // Draft PR opened for this run's verified branch. null until published.
-  prUrl: z.string().url().nullable().default(null),
+  // HttpUrlString, not `.url()`: the file documents above that `.url()` alone
+  // accepts javascript:/mailto:, and a run's prUrl is persisted from gh's
+  // stdout, so it is exactly the untrusted-shape boundary it exists for.
+  prUrl: HttpUrlString.nullable().default(null),
   // Provider conversation id captured from the runner's structured output, so
   // a later turn can resume the SAME session. null for legacy/uncaptured runs.
   executionSessionId: z.string().nullable().default(null),

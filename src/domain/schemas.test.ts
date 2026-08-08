@@ -129,6 +129,13 @@ describe("RunSchema verification fields", () => {
     });
     expect(run.failureKind).toBe("verification_failed");
   });
+  it("rejects a non-http prUrl scheme", () => {
+    expect(() => RunSchema.parse({ ...base, prUrl: "javascript:alert(1)" })).toThrow();
+  });
+  it("accepts an https prUrl", () => {
+    const run = RunSchema.parse({ ...base, prUrl: "https://github.com/o/r/pull/1" });
+    expect(run.prUrl).toBe("https://github.com/o/r/pull/1");
+  });
 });
 
 describe("EvidenceSchema", () => {
