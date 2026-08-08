@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ObjectId } from "mongodb";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_FIX_ATTEMPTS, fixSignature } from "../domain/fix-loop";
 import type { Board, Run, Ticket } from "../domain/schemas";
 
@@ -670,6 +670,47 @@ describe("fix-loop verification tail", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
+
+  it("carries the attempt count in the blocked notification", async () => {
+    const { runId, ticketId } = await seedRetryFixture();
+    // Burn the budget so the decision is terminal (budget_exhausted) and the
+    // tail reports "after 2 attempts", not just the stop reason. A fetch spy
+    // captures the notify payload.
+    const database = await db();
+    await database.collection("runs").updateOne(
+      { _id: new ObjectId(runId) },
+      { $set: { fixAttempts: MAX_FIX_ATTEMPTS } },
+    );
+    const bodies: string[] = [];
+    process.env.DISCORD_WEBHOOK_URL = "https://discord.invalid/webhook";
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (_input, init) => {
+        bodies.push(String((init as RequestInit | undefined)?.body ?? ""));
+        return new Response("", { status: 204 });
+      });
+    try {
+      const outcome = await applyRunCompletion(
+        runId,
+        ticketId,
+        "execute",
+        0,
+        "out\n",
+        logFile,
+        null,
+        board,
+        runDir,
+        new ObjectId().toString(),
+      );
+      expect(outcome).toBe("completed");
+    } finally {
+      fetchSpy.mockRestore();
+      process.env.DISCORD_WEBHOOK_URL = "";
+    }
+    // The count distinguishes "gave up after 2 attempts" from "stopped without
+    // trying" — the distinction the spec asks notifyBlocked to carry.
+    expect(bodies.some((body) => body.includes("after 2 attempts"))).toBe(true);
+  });
 
   it("leaves a run whose fix feedback was never sent unrecorded and blocked", async () => {
     const { runId, ticketId } = await seedBlockedPathFixture();
