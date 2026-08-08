@@ -19,6 +19,40 @@ const {
 
 const FAILING = [{ key: "lint", exitCode: 1, output: "error: unused var" }];
 
+async function seedEvidence(
+  runId: string,
+  commitSha: string,
+  over: Record<string, unknown> = {},
+): Promise<void> {
+  const database = await db();
+  await database.collection("evidence").insertOne({
+    runId,
+    ticketId: new ObjectId().toString(),
+    commitSha,
+    commitRef: "tosin4dev/run/x",
+    checks: [],
+    verdict: "failed",
+    createdAt: "2026-08-07T00:00:00.000Z",
+    ...over,
+  });
+}
+
+// A real temp repo whose HEAD is a reachable commit, so the guard's git read
+// exercises the actual `rev-parse` rather than a stub.
+async function initFixRepo(): Promise<{ repo: string; sha: string }> {
+  const repo = await mkdtemp(join(tmpdir(), "t4d-fixrepo-"));
+  execFileSync("git", ["init", "-b", "main", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "t@t"]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "t"]);
+  await writeFile(join(repo, "README.md"), "x\n");
+  execFileSync("git", ["-C", repo, "add", "README.md"]);
+  execFileSync("git", ["-C", repo, "commit", "-m", "root"]);
+  const sha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  return { repo, sha };
+}
+
 async function seedRun(over: Record<string, unknown>): Promise<string> {
   const database = await db();
   await database.collection("runs").deleteMany({});
@@ -65,6 +99,7 @@ describe("deliverFixFeedback", () => {
   beforeEach(async () => {
     const database = await db();
     await database.collection("runs").deleteMany({});
+    await database.collection("evidence").deleteMany({});
   });
 
   it("stops when the attempt budget is exhausted", async () => {
@@ -106,6 +141,52 @@ describe("deliverFixFeedback", () => {
     // The decision is not a delivery: nothing is recorded until the send lands.
     expect(run?.fixAttempts).toBe(0);
     expect(run?.lastFixSignature).toBeNull();
+  });
+
+  it("still retries when the branch tip matches the verified commit", async () => {
+    const { repo, sha } = await initFixRepo();
+    try {
+      const runId = await seedRun({ workDir: repo });
+      await seedEvidence(runId, sha);
+      const { decision } = await deliverFixFeedback(runId, FAILING);
+      // The tip the checks ran against is still HEAD, so the failures describe
+      // a live commit: hand them back to the agent.
+      expect(decision).toEqual({ retry: true });
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("suppresses when the branch tip has moved past the verified commit", async () => {
+    const { repo, sha } = await initFixRepo();
+    try {
+      // A second commit moves HEAD: the failures describe a commit that no
+      // longer exists, and the guard must not hand them to the agent.
+      await writeFile(join(repo, "later.txt"), "y\n");
+      execFileSync("git", ["-C", repo, "add", "later.txt"]);
+      execFileSync("git", ["-C", repo, "commit", "-m", "moved"]);
+      const runId = await seedRun({ workDir: repo });
+      await seedEvidence(runId, sha);
+      const { decision } = await deliverFixFeedback(runId, FAILING);
+      expect(decision).toEqual({ retry: false, reason: "suppressed" });
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("suppresses when the tip cannot be read", async () => {
+    // An evidence row exists but workDir is not a git repository, so the git
+    // read fails. An unknown tip is not evidence the commit is still there, so
+    // the guard fails CLOSED: suppress rather than deliver.
+    const notARepo = await mkdtemp(join(tmpdir(), "t4d-notrepo-"));
+    try {
+      const runId = await seedRun({ workDir: notARepo });
+      await seedEvidence(runId, "0".repeat(40));
+      const { decision } = await deliverFixFeedback(runId, FAILING);
+      expect(decision).toEqual({ retry: false, reason: "suppressed" });
+    } finally {
+      await rm(notARepo, { recursive: true, force: true });
+    }
   });
 
   it("does not report repeated_failure when two failures have unreadable logs", async () => {
