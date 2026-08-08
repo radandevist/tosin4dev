@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { Evidence, Ticket } from "../domain/schemas";
 import { neutralizePrTokens, prBody } from "./supervisor.server";
 
-const ZWSP = "​";
+// The zero-width space is written as an escape (not a raw byte) so the file
+// stays readable and a trailing-whitespace cleanup cannot strip it silently.
+const ZWSP = "\u200b";
 
 const TICKET: Ticket = {
   boardId: "0123456789abcdef01234567",
@@ -48,12 +50,80 @@ describe("neutralizePrTokens", () => {
     expect(out).toContain(`@${ZWSP}radan`);
   });
 
-  it("breaks closing keywords so a merge cannot auto-close an unrelated issue", () => {
-    const out = neutralizePrTokens("Closes #123 and fixes #45 on merge");
-    expect(out).not.toMatch(/closes\s+#123/i);
-    expect(out).not.toMatch(/fixes\s+#45/i);
-    expect(out).toContain(`#${ZWSP}123`);
-    expect(out).toContain(`#${ZWSP}45`);
+  it("leaves an email address alone — GitHub never resolves it as a mention", () => {
+    expect(neutralizePrTokens("reach me at t@example.com")).toBe(
+      "reach me at t@example.com",
+    );
+    expect(neutralizePrTokens("both a@b and t@example.com stay")).toBe(
+      "both a@b and t@example.com stay",
+    );
+  });
+
+  it("leaves an @ handle that ends in a dotted TLD alone — it reads as an email", () => {
+    expect(neutralizePrTokens("write to @gmail.com")).toBe("write to @gmail.com");
+  });
+
+  it("keeps @scope-style npm shorthand copy-pasteable — only a ZWSP is inserted", () => {
+    const out = neutralizePrTokens("install npm i @types/node --save");
+    // The @ is a genuine token start so it gets a ZWSP, but the scope reads
+    // identically on the page and a copy of the command still works.
+    expect(out).toBe(`install npm i @${ZWSP}types/node --save`);
+  });
+
+  it("leaves inline backtick spans and fenced code blocks untouched", () => {
+    const span = "run `npm i @types/node` then Closes #12";
+    const out = neutralizePrTokens(span);
+    // The backtick span is untouched — the package scope stays copy-pasteable.
+    expect(out).toContain("`npm i @types/node`");
+    // The prose around it is still neutralized.
+    expect(out).toContain(`Closes #${ZWSP}12`);
+
+    const fence = [
+      "```sh",
+      "npm i @types/node",
+      "# not a closing keyword inside code",
+      "```",
+      "after the fence ping @tosin4dev",
+    ].join("\n");
+    const fenceOut = neutralizePrTokens(fence);
+    // The code itself is byte-identical — not even the leading # survived.
+    expect(fenceOut).toContain("npm i @types/node");
+    expect(fenceOut).toContain("# not a closing keyword inside code");
+    expect(fenceOut).not.toContain("#\u200b not");
+    // Prose after the fence is still neutralized.
+    expect(fenceOut).toContain(`after the fence ping @${ZWSP}tosin4dev`);
+  });
+
+  it("breaks every closing form GitHub honours", () => {
+    const cases: Array<[string, string]> = [
+      // keyword + #N — the ZWSP sits between the # and the number
+      ["Closes #123", `#${ZWSP}`],
+      // colon form
+      ["Closes: #12", `#${ZWSP}`],
+      // all the keyword variants
+      ["closes #123 and closes: #4", `#${ZWSP}`],
+      ["Closed #123", `#${ZWSP}`],
+      ["close #123", `#${ZWSP}`],
+      ["Fix #456", `#${ZWSP}`],
+      ["Fixes #78 and fixed #90", `#${ZWSP}`],
+      ["Resolve #1", `#${ZWSP}`],
+      ["Resolves #2", `#${ZWSP}`],
+      ["Resolved #3", `#${ZWSP}`],
+      // case-insensitive keyword
+      ["FIXES #78", `#${ZWSP}`],
+      ["CLOSED #5", `#${ZWSP}`],
+      // shorthand GH-N — ZWSP goes after the dash
+      ["Closes GH-123", `-${ZWSP}`],
+      // cross-repo owner/repo#N — ZWSP goes between the # and the number
+      ["Closes owner/repo#412", `#${ZWSP}`],
+      // full issue URL — ZWSP goes after the last slash
+      ["Closes https://github.com/owner/repo/issues/12", `/issues/${ZWSP}`],
+    ];
+    for (const [input, marker] of cases) {
+      const out = neutralizePrTokens(input);
+      expect(out, input).toContain(marker);
+      expect(out).not.toBe(input);
+    }
   });
 
   it("leaves already-neutralized text untouched", () => {
