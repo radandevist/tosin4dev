@@ -1,8 +1,9 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { ObjectId } from "mongodb";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ObjectId } from "mongodb";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 // Point the lazy db() singleton at a throwaway database *before* anything
 // triggers a connection. Unique per run so parallel suites never collide.
@@ -13,7 +14,6 @@ const { db, closeDb } = await import("./db");
 const { dispatchRun } = await import("./supervisor.server");
 
 let binDirectory: string;
-const ORIGINAL_PATH = process.env.PATH;
 
 async function seed(
   checks: unknown[],
@@ -62,12 +62,49 @@ async function seed(
   return ticketId.toString();
 }
 
+// A real, billable `claude` sits on PATH in this environment (with live auth
+// tokens) and a real authenticated `gh` is there too. The runner spawn and the
+// publish preflight shell out to those names, so PATH is stubbed per test.
+// `git` is the only binary the suite needs from the real world (the fixture
+// shells out to it), and /usr/bin (where it lives) also holds the real `gh` —
+// so the suite symlinks git into a directory it OWNS and points PATH there,
+// keeping every real claude/gh directory out of the stubbed PATH entirely.
+// symlink() creates the link atomically, so a failure leaves no partial file.
+const ORIGINAL_PATH = process.env.PATH;
+
+let gitDir: string;
+
+async function setupGitDir(): Promise<void> {
+  gitDir = await mkdtemp(join(tmpdir(), "dispatch-git-"));
+  try {
+    const gitPath = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    await symlink(gitPath, join(gitDir, "git"));
+  } catch (err) {
+    await rm(gitDir, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+// The stubbed PATH is exactly `extra:gitDir` — the gh shim dir and the git
+// symlink, and nothing else. The preflight's subprocesses are `gh` (the shim),
+// `git` (the symlink), and the acceptance check `true` (shell builtin); the
+// runner spawn looks for `claude`, which is absent, so it fails with ENOENT
+// and dispatch rejects with spawn_failed instead of launching a real agent. A
+// real `claude` or `gh` cannot resolve because their directories are never in
+// the list.
+function stubPath(extra: string): string {
+  return [extra, gitDir].filter(Boolean).join(":");
+}
+
 describe("dispatchRun acceptance-check preflight", () => {
   beforeAll(async () => {
-    // spec_draft bypasses the guard and reaches the spawn, so point PATH at an
-    // empty bin dir: the runner lookup fails with ENOENT and dispatch rejects
-    // with spawn_failed instead of launching a real `claude` on PATH.
+    // Empty by design: this suite's only subprocess needs are `git` (via the
+    // gitDir symlink) and the gh shim the no_remote test drops into its own
+    // directory. Nothing writes into binDirectory, so a test that ASSUMES it is
+    // empty (e.g. "the runner lookup fails with ENOENT") never silently
+    // resolves a leftover executable.
     binDirectory = await mkdtemp(join(tmpdir(), "dispatch-preflight-"));
+    await setupGitDir();
   });
 
   afterAll(async () => {
@@ -75,10 +112,11 @@ describe("dispatchRun acceptance-check preflight", () => {
     await closeDb();
     process.env.PATH = ORIGINAL_PATH;
     await rm(binDirectory, { recursive: true, force: true });
+    await rm(gitDir, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
-    process.env.PATH = binDirectory;
+    process.env.PATH = stubPath(binDirectory);
     const database = await db();
     await database.collection("runs").deleteMany({});
   });
@@ -118,13 +156,25 @@ describe("dispatchRun acceptance-check preflight", () => {
     // publish preflight to be reached at all. The repo path is a temp dir with
     // no `origin`, so preflightPublish fails with no_remote.
     const dir = await mkdtemp(join(tmpdir(), "t4d-no-origin-"));
-    // `gh auth status` runs before the git remote check, so the stubbed PATH
-    // needs a gh shim that passes auth for the git check to be reached.
-    await writeFile(
-      join(binDirectory, "gh"),
-      '#!/bin/sh\necho "shim: logged in"\nexit 0\n',
-      { mode: 0o755 },
-    );
+    // `gh auth status` runs before the git remote check, so PATH needs a gh
+    // shim that passes auth for the git check to be reached. The shim lives in
+    // its OWN directory — binDirectory stays empty (its beforeAll invariant) —
+    // and that directory is prepended to the gitDir symlink. `git` resolves
+    // from gitDir, so the remote check below genuinely fails because the repo
+    // HAS no origin, not because git is missing (the bug this test used to
+    // mask).
+    const ghDir = await mkdtemp(join(tmpdir(), "t4d-gh-"));
+    try {
+      await writeFile(
+        join(ghDir, "gh"),
+        '#!/bin/sh\necho "shim: logged in"\nexit 0\n',
+        { mode: 0o755 },
+      );
+    } catch (err) {
+      await rm(ghDir, { recursive: true, force: true });
+      throw err;
+    }
+    process.env.PATH = stubPath(ghDir);
     const database = await db();
     const boardId = new ObjectId();
     const at = "2026-08-07T00:00:00.000Z";
@@ -176,5 +226,7 @@ describe("dispatchRun acceptance-check preflight", () => {
     expect(ticket?.status).toBe("approved");
     expect(await database.collection("runs").countDocuments()).toBe(0);
     await rm(dir, { recursive: true, force: true });
+    await rm(ghDir, { recursive: true, force: true });
+    process.env.PATH = ORIGINAL_PATH;
   });
 });
