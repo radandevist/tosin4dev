@@ -23,9 +23,12 @@ export function fixSignature(
 ): string {
   const hash = createHash("sha256");
   for (const check of [...checks].sort((a, b) => a.key.localeCompare(b.key))) {
-    hash.update(check.key);
-    hash.update(String(check.exitCode));
+    // NUL separators: a check key can't contain "\0", so {key:"a1",exit:1}
+    // and {key:"a",exit:11} no longer feed the same "a11" bytes, and the
+    // trailing separator keeps adjacent checks from running together.
+    hash.update(`${check.key}\0${check.exitCode}\0`);
     hash.update(check.output.slice(-FIX_SIGNATURE_TAIL_BYTES));
+    hash.update("\0");
   }
   return hash.digest("hex");
 }
