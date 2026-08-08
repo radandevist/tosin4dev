@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Collection, Db } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Board, Run, Ticket } from "../domain/schemas";
+import { addOriginRemote, writeGhShim } from "./publish.fixture";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
 type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
@@ -32,6 +33,7 @@ let runs: Collection<RunDoc>;
 let repo: string;
 let binDirectory: string;
 let boardId: string;
+let origin: string;
 
 const timestamp = () => new Date().toISOString();
 type BootGlobal = typeof globalThis & { __tosin4devRecovered?: Promise<void> };
@@ -67,6 +69,7 @@ async function seedOrphan(
     failureKind: null,
     fixAttempts: 0,
     lastFixSignature: null,
+    prUrl: null,
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
@@ -155,6 +158,10 @@ describe("supervisor smoke", () => {
     await writeFile(join(repo, "README.md"), "smoke\n");
     execFileSync("git", ["-C", repo, "add", "README.md"]);
     execFileSync("git", ["-C", repo, "commit", "-m", "initial"]);
+    // The dispatch preflight checks for an `origin` remote and the publish path
+    // shells out to `gh`; give the fixture both without touching the network.
+    origin = addOriginRemote(repo, "t4d-sorigin-");
+    await writeGhShim(binDirectory);
     await writeRunner(["runner output", "## SUMMARY", "smoke ok"]);
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
 
@@ -191,6 +198,7 @@ describe("supervisor smoke", () => {
     await Promise.all([
       rm(repo, { recursive: true, force: true }),
       rm(binDirectory, { recursive: true, force: true }),
+      rm(origin, { recursive: true, force: true }),
     ]);
   });
 
@@ -314,6 +322,7 @@ describe("supervisor smoke", () => {
       failureKind: null,
       fixAttempts: 0,
       lastFixSignature: null,
+      prUrl: null,
       executionSessionId: null,
       executionLeaseId: null,
       executionLeaseExpiresAt: null,
@@ -356,6 +365,7 @@ describe("supervisor smoke", () => {
       failureKind: null,
       fixAttempts: 0,
       lastFixSignature: null,
+      prUrl: null,
       executionSessionId: null,
       executionLeaseId: null,
       executionLeaseExpiresAt: null,
