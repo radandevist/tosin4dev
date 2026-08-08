@@ -10,7 +10,11 @@ const failing = [{ key: "lint", exitCode: 1, output: "error: unused var x" }];
 
 describe("fixSignature", () => {
   it("is stable for identical failures", () => {
-    expect(fixSignature(failing)).toBe(fixSignature([...failing]));
+    // A distinct object literal, not a shallow copy: this pins value-based
+    // stability — the property that matters across two separate runs.
+    expect(fixSignature(failing)).toBe(
+      fixSignature([{ key: "lint", exitCode: 1, output: "error: unused var x" }]),
+    );
   });
 
   it("differs when a different check fails", () => {
@@ -25,6 +29,12 @@ describe("fixSignature", () => {
     );
   });
 
+  it("differs when only the output differs", () => {
+    expect(fixSignature([{ key: "lint", exitCode: 1, output: "error A" }])).not.toBe(
+      fixSignature([{ key: "lint", exitCode: 1, output: "error B" }]),
+    );
+  });
+
   it("ignores a varying prefix beyond the tail window", () => {
     const tail = "the actual error";
     // A shared suffix longer than the window, so the entire variation lives in
@@ -35,6 +45,50 @@ describe("fixSignature", () => {
     const b = "B".repeat(8) + shared;
     expect(fixSignature([{ key: "lint", exitCode: 1, output: a }])).toBe(
       fixSignature([{ key: "lint", exitCode: 1, output: b }]),
+    );
+  });
+
+  it("distinguishes a digit-ending key from a longer exit code", () => {
+    // Without a delimiter {key:"a1",exitCode:1} and {key:"a",exitCode:11}
+    // both feed "a11"; keys may contain digits, so this is reachable.
+    expect(
+      fixSignature([{ key: "a1", exitCode: 1, output: "x" }]),
+    ).not.toBe(
+      fixSignature([{ key: "a", exitCode: 11, output: "x" }]),
+    );
+  });
+
+  it("distinguishes two adjacent checks from one longer check", () => {
+    // Without a trailing separator, [{key:"a",exitCode:1,output:"b"},
+    // {key:"c",exitCode:1,output:"d"}] and [{key:"a",exitCode:1,
+    // output:"bc1d"}] both feed "a1bc1d".
+    expect(
+      fixSignature([
+        { key: "a", exitCode: 1, output: "b" },
+        { key: "c", exitCode: 1, output: "d" },
+      ]),
+    ).not.toBe(
+      fixSignature([{ key: "a", exitCode: 1, output: "bc1d" }]),
+    );
+  });
+
+  it("drops a differing byte just before the tail window and keeps one at its edge", () => {
+    // N = FIX_SIGNATURE_TAIL_BYTES. The slice keeps the last N chars of an
+    // output of length L, i.e. indices L-N..L-1. With L = N+2 those are
+    // indices 2..N+1, so a differing char at index 1 (= L-N-1) is DROPPED
+    // and one at index 2 (= L-N) is the first KEPT char. An off-by-one in
+    // the slice lands on one of these two and fails one assertion.
+    const ignored = (c: string) => `x${c}${"x".repeat(FIX_SIGNATURE_TAIL_BYTES)}`;
+    const kept = (c: string) => `xx${c}${"x".repeat(FIX_SIGNATURE_TAIL_BYTES - 1)}`;
+    expect(
+      fixSignature([{ key: "lint", exitCode: 1, output: ignored("A") }]),
+    ).toBe(
+      fixSignature([{ key: "lint", exitCode: 1, output: ignored("B") }]),
+    );
+    expect(
+      fixSignature([{ key: "lint", exitCode: 1, output: kept("A") }]),
+    ).not.toBe(
+      fixSignature([{ key: "lint", exitCode: 1, output: kept("B") }]),
     );
   });
 
