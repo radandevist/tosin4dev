@@ -13,6 +13,7 @@ import { join } from "node:path";
 import type { Collection, Db, WithId } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Board, Run, RunTurn, Ticket } from "../domain/schemas";
+import { addOriginRemote, writeGhShim } from "./publish.fixture";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
 type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
@@ -44,6 +45,7 @@ let runs: Collection<RunDoc>;
 let repo: string;
 let binDirectory: string;
 let boardId: string;
+let origin: string;
 
 const timestamp = () => new Date().toISOString();
 
@@ -208,6 +210,7 @@ async function insertTurnRun(params: {
     failureKind: null,
     fixAttempts: 0,
     lastFixSignature: null,
+    prUrl: null,
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
@@ -237,6 +240,10 @@ describe("per-turn logs and cursor polling", () => {
     await writeFile(join(repo, "README.md"), "x\n");
     execFileSync("git", ["-C", repo, "add", "README.md"]);
     execFileSync("git", ["-C", repo, "commit", "-m", "init"]);
+    // The dispatch preflight checks for an `origin` remote; give the fixture a
+    // local bare one so execute dispatches reach the runner.
+    origin = addOriginRemote(repo, "t4d-torigin-");
+    await writeGhShim(binDirectory);
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
     await writeRunner();
 
@@ -282,6 +289,7 @@ describe("per-turn logs and cursor polling", () => {
     await Promise.all([
       rm(repo, { recursive: true, force: true }),
       rm(binDirectory, { recursive: true, force: true }),
+      rm(origin, { recursive: true, force: true }),
     ]);
   });
 

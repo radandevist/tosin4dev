@@ -13,6 +13,7 @@ import {
   vi,
 } from "vitest";
 import type { Board, Run, Ticket } from "../domain/schemas";
+import { addOriginRemote, writeGhShim } from "./publish.fixture";
 import { ContinueExecutionInputSchema } from "./runs";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
@@ -47,6 +48,7 @@ let runs: Collection<RunDoc>;
 let repo: string;
 let binDirectory: string;
 let boardId: string;
+let origin: string;
 
 const timestamp = () => new Date().toISOString();
 
@@ -288,6 +290,7 @@ const seedRunDoc = async (
     failureKind: null,
     fixAttempts: 0,
     lastFixSignature: null,
+    prUrl: null,
     executionSessionId: "s-smoke",
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
@@ -317,6 +320,10 @@ describe("continueExecution", () => {
     await writeFile(join(repo, "README.md"), "x\n");
     execFileSync("git", ["-C", repo, "add", "README.md"]);
     execFileSync("git", ["-C", repo, "commit", "-m", "init"]);
+    // The dispatch preflight checks for an `origin` remote and the publish path
+    // shells out to `gh`; give the fixture both without touching the network.
+    origin = addOriginRemote(repo, "t4d-eorigin-");
+    await writeGhShim(binDirectory);
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
     await writeRunner();
     database = await db();
@@ -384,6 +391,7 @@ describe("continueExecution", () => {
     await Promise.all([
       rm(repo, { recursive: true, force: true }),
       rm(binDirectory, { recursive: true, force: true }),
+      rm(origin, { recursive: true, force: true }),
     ]);
   });
 

@@ -43,6 +43,7 @@ import { db, ObjectId } from "./db";
 import { readDraftedSpec } from "./draftedSpec.server";
 import { notify } from "./notify.server";
 import { parseSessionId, readOutcome } from "./outcome.server";
+import { preflightPublish, publishRun } from "./publish.server";
 import { ServerResultError } from "./result";
 import { verifyRun } from "./verify.server";
 
@@ -909,6 +910,76 @@ export async function applyRunCompletion(
     await database.collection("evidence").insertOne(evidence);
     if (result.verdict === "passed") {
       const stamp = turnStamp(turnId, "completed");
+      // The PR body carries the evidence — checks run, exit codes, commit sha —
+      // so the verification contract is visible to anyone reading the PR rather
+      // than living only in MongoDB.
+      const rawTicket = await database
+        .collection<TicketDoc>("tickets")
+        .findOne({ _id: new ObjectId(ticketId) });
+      if (!rawTicket) {
+        throw new ServerResultError("not_found", `ticket not found: ${ticketId}`);
+      }
+      const ticket = TicketSchema.parse(rawTicket);
+      const bodyFile = `${runDir}/pr-body.md`;
+      await writeFile(bodyFile, prBody(ticket, evidence, outSummary), "utf8");
+      let prUrl: string | null = null;
+      try {
+        // A passed verdict on a branchless run cannot arise through the normal
+        // flow (verifyRun needs a branch to check commits), but the schema
+        // allows it. Refuse loudly rather than push an empty branch.
+        if (run.branch === null) {
+          throw new ServerResultError(
+            "not_publishable",
+            `run ${runId} reached a passed verdict with no branch to publish`,
+          );
+        }
+        const published = await publishRun({
+          board,
+          title: `#${ticket.seq} ${ticket.title}`,
+          workDir: run.workDir,
+          branch: run.branch,
+          bodyFile,
+        });
+        prUrl = published.prUrl;
+      } catch (error) {
+        // The verified commit exists only on a local branch, and the cleanup
+        // path calls `git branch -D`. Do NOT clean up here: destroying verified
+        // work because a network call failed is the worst outcome available.
+        // The run is still `succeeded` — it WAS verified — so the failure
+        // lives on the ticket, not the run.
+        await runs.updateOne(
+          { _id: new ObjectId(runId), status: "verifying" },
+          {
+            $set: {
+              status: "succeeded",
+              exitCode,
+              summary: outSummary,
+              verdict: "passed",
+              finishedAt: doneAt,
+              ...stamp.set,
+            },
+          },
+          stamp.options,
+        );
+        await transitionTicketFailed(
+          database, ticketId, runId, doneAt, "publish failed",
+        );
+        const handPush = run.branch
+          ? ` Push by hand: git -C ${run.workDir} push -u origin ${run.branch}`
+          : "";
+        await notifyBlocked(
+          database,
+          ticketId,
+          `verified but not published: ${error instanceof Error ? error.message : "unknown"}.${handPush}`,
+          logFile,
+          stderrFile,
+        );
+        return "completed";
+      }
+      // Published while still `verifying`, so a run observed `succeeded`
+      // already carries its prUrl and the ticket is one quick write away from
+      // `review_ready` — no window where a succeeded run leaves the ticket
+      // stranded in `running`.
       await runs.updateOne(
         { _id: new ObjectId(runId), status: "verifying" },
         {
@@ -917,6 +988,7 @@ export async function applyRunCompletion(
             exitCode,
             summary: outSummary,
             verdict: "passed",
+            prUrl,
             finishedAt: doneAt,
             ...stamp.set,
           },
@@ -924,7 +996,7 @@ export async function applyRunCompletion(
         stamp.options,
       );
       await transitionTicketSucceeded(database, ticketId, runId, doneAt);
-      await notifyReviewReady(database, ticketId, outSummary);
+      await notifyReviewReady(database, ticketId, `${outSummary ?? ""}\n${prUrl}`);
       return "completed";
     }
     const failing = result.checks.filter((c) => c.exitCode !== 0);
@@ -2009,6 +2081,25 @@ function formatCheckFailures(
   ].join("\n\n");
 }
 
+// Assembled from what already exists: the locked spec, the run summary, and the
+// evidence row. No new state.
+function prBody(ticket: Ticket, evidence: Evidence, summary: string | null): string {
+  const checks = evidence.checks
+    .map((c) => `- \`${c.key}\` — exit ${c.exitCode}`)
+    .join("\n");
+  return [
+    `### Intent\n${ticket.spec.intent}`,
+    ticket.spec.acceptance.length
+      ? `### Acceptance\n${ticket.spec.acceptance.map((a) => `- ${a}`).join("\n")}`
+      : null,
+    summary ? `### Summary\n${summary}` : null,
+    `### Verification\nCommit \`${evidence.commitSha}\`\n\n${checks || "_no checks recorded_"}`,
+    `_Opened by Tosin4dev. Draft — merging is the owner's action._`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 async function monitorContinue(
   child: RunningChild,
   runId: string,
@@ -2456,6 +2547,12 @@ export async function dispatchRun(
       `board "${board.slug}" has no acceptance checks — add at least one before dispatching`,
     );
   }
+  // Publishing is the last step of an execute run, so its prerequisites are
+  // checked first. A broken token discovered after twenty minutes of agent work
+  // is the worst available ordering.
+  if (phase === "execute") {
+    await preflightPublish(board.repoPath);
+  }
   const runId = new ObjectId().toString();
   const paths = runPaths(board, runId, phase);
   // Turn 0: the dispatch turn. Id is an ObjectId so it is unique within the
@@ -2515,6 +2612,7 @@ export async function dispatchRun(
     failureKind: null,
     fixAttempts: 0,
     lastFixSignature: null,
+    prUrl: null,
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,

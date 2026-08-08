@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Collection, Db } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Board, Run, Ticket } from "../domain/schemas";
+import { addOriginRemote, writeGhShim } from "./publish.fixture";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
 type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
@@ -29,6 +30,7 @@ let evidence: Collection<EvidenceDoc>;
 let repo: string;
 let binDirectory: string;
 let boardId: string;
+let origin: string;
 
 const timestamp = () => new Date().toISOString();
 
@@ -83,6 +85,10 @@ describe("verification gate", () => {
     await writeFile(join(repo, "README.md"), "x\n");
     execFileSync("git", ["-C", repo, "add", "README.md"]);
     execFileSync("git", ["-C", repo, "commit", "-m", "init"]);
+    // The dispatch preflight checks for an `origin` remote; give the fixture a
+    // local bare one so execute dispatches reach the runner.
+    origin = addOriginRemote(repo, "t4d-vorigin-");
+    await writeGhShim(binDirectory);
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
     database = await db();
     boards = database.collection<BoardDoc>("boards");
@@ -103,7 +109,7 @@ describe("verification gate", () => {
     process.env.PATH = ORIGINAL_PATH;
     process.env.MONGODB_URI = ORIGINAL_MONGODB_URI;
     process.env.DISCORD_WEBHOOK_URL = ORIGINAL_WEBHOOK;
-    await Promise.all([rm(repo, { recursive: true, force: true }), rm(binDirectory, { recursive: true, force: true })]);
+    await Promise.all([rm(repo, { recursive: true, force: true }), rm(binDirectory, { recursive: true, force: true }), rm(origin, { recursive: true, force: true })]);
   });
 
   it("passes to review_ready with Evidence when the runner commits and checks pass", async () => {

@@ -18,6 +18,7 @@ import {
   type Run,
   type Ticket,
 } from "../domain/schemas";
+import { addOriginRemote, writeGhShim } from "./publish.fixture";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
 type TicketDoc = Ticket & { createdAt: string; updatedAt: string };
@@ -48,6 +49,7 @@ let runs: Collection<RunDoc>;
 let repo: string;
 let binDirectory: string;
 let boardId: string;
+let origin: string;
 
 const timestamp = () => new Date().toISOString();
 
@@ -191,6 +193,10 @@ describe("runner outcomes", () => {
     await writeFile(join(repo, "README.md"), "x\n");
     execFileSync("git", ["-C", repo, "add", "README.md"]);
     execFileSync("git", ["-C", repo, "commit", "-m", "init"]);
+    // The dispatch preflight checks for an `origin` remote and the publish path
+    // shells out to `gh`; give the fixture both without touching the network.
+    origin = addOriginRemote(repo, "t4d-norigin-");
+    await writeGhShim(binDirectory);
     process.env.PATH = `${binDirectory}:${ORIGINAL_PATH ?? ""}`;
     await writeRunner();
     database = await db();
@@ -235,6 +241,7 @@ describe("runner outcomes", () => {
     await Promise.all([
       rm(repo, { recursive: true, force: true }),
       rm(binDirectory, { recursive: true, force: true }),
+      rm(origin, { recursive: true, force: true }),
     ]);
   });
 
