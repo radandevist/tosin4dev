@@ -674,6 +674,43 @@ async function failVerifiedRun(
   );
 }
 
+// Terminalize a run whose fix feedback was suppressed: the send never happened
+// (lost lease claim, or the send threw). Nothing was recorded — fixAttempts and
+// lastFixSignature stay as they were so the failure re-fires cleanly next time —
+// but the run must NOT linger in `verifying` invisible to the operator. Same
+// terminal tail as a non-retryable decision, with the reason pinned to
+// `suppressed` (the spec's lease-expired suppression trigger).
+async function failSuppressedTail(
+  database: Db,
+  runId: string,
+  ticketId: string,
+  exitCode: number,
+  outSummary: string | null,
+  doneAt: string,
+  turnId: string,
+  logFile: string,
+  stderrFile: string | null,
+): Promise<"completed"> {
+  await failVerifiedRun(
+    database,
+    runId,
+    "verification_failed",
+    exitCode,
+    outSummary,
+    doneAt,
+    turnStamp(turnId, "completed"),
+  );
+  await transitionTicketFailed(database, ticketId, runId, doneAt, "verification verification_failed");
+  await notifyBlocked(
+    database,
+    ticketId,
+    "verification failed (verification_failed); fix loop stopped: suppressed",
+    logFile,
+    stderrFile,
+  );
+  return "completed";
+}
+
 // Apply everything a finished process implies (run status, verification, ticket
 // transitions, notifications) and RETURN what that turn produced. The non-null
 // return type is the mechanism: TypeScript refuses to compile a terminal branch
@@ -683,7 +720,7 @@ async function failVerifiedRun(
 // The returned value describes THE TURN, not the run: a turn that declared
 // `completed` returns "completed" even when Tosin4dev's own verification then
 // fails the run. The run's status carries that verdict.
-async function applyRunCompletion(
+export async function applyRunCompletion(
   runId: string,
   ticketId: string,
   phase: Phase,
@@ -884,11 +921,12 @@ async function applyRunCompletion(
       return "completed";
     }
     const failing = result.checks.filter((c) => c.exitCode !== 0);
-    const failingWithOutput = await failingChecksWithOutput(failing);
-    const decision =
+    const { loaded: failingWithOutput, anyUnreadable } =
+      await failingChecksWithOutput(failing);
+    const { decision, signature } =
       result.failureKind === "verification_failed"
-        ? await deliverFixFeedback(runId, failingWithOutput, doneAt)
-        : ({ retry: false, reason: "not_retryable" } as const);
+        ? await deliverFixFeedback(runId, failingWithOutput, anyUnreadable)
+        : ({ decision: { retry: false, reason: "not_retryable" } as const, signature: "" });
 
     if (decision.retry) {
       // Back to the agent on the existing leased session. The ticket stays
@@ -918,8 +956,11 @@ async function applyRunCompletion(
           claimSet: {},
         });
       } catch {
-        // Spawn failed. Release the lease and let the verification catch below
-        // terminalize the run — a retry that could not start is a failed check.
+        // The send threw — nothing was delivered, so nothing is recorded. Release
+        // the lease and fall through to the suppressed tail: the run fails
+        // visibly with reason `suppressed` rather than vanishing into
+        // `verifying`. The outer catch would label it a verification error; the
+        // real diagnosis is a fix that could not be delivered.
         await database
           .collection<RunDoc>("runs")
           .updateOne(
@@ -931,17 +972,48 @@ async function applyRunCompletion(
               },
             },
           );
-        throw new ServerResultError("spawn_failed", "run could not be continued");
+        return failSuppressedTail(
+          database,
+          runId,
+          ticketId,
+          exitCode,
+          outSummary,
+          doneAt,
+          turnId,
+          logFile,
+          stderrFile,
+        );
       }
-      // The run was terminalized between verification and this claim (orphan
-      // recovery or a competing path). Nothing was claimed, so there is no turn
-      // to close and no state to unwind — the retry is simply moot.
-      if (!sent) {
+      // The send happened. Only now is the attempt recorded — budget consumed
+      // and signature pinned for the next comparison. Recording is the CAS'd
+      // write; a competing path that already incremented the counter makes this
+      // update no-op, so two concurrent deliveries cannot both count.
+      if (sent) {
+        await recordFixDelivery(runId, signature, run!.fixAttempts, doneAt);
         return "completed";
       }
-      return "completed";
+      // The claim was lost (the lease expired or a competing path claimed the
+      // run between verification and this send). Nothing was delivered, so
+      // nothing is recorded — fixAttempts and lastFixSignature stay as they
+      // were, and the run re-fires cleanly next time. This is the spec's
+      // lease-expired suppression: fall through to the blocked path so the
+      // operator sees the run stop rather than it vanishing into `verifying`.
+      return failSuppressedTail(
+        database,
+        runId,
+        ticketId,
+        exitCode,
+        outSummary,
+        doneAt,
+        turnId,
+        logFile,
+        stderrFile,
+      );
     }
 
+    // A retry:false decision — budget exhausted, a repeated failure, a
+    // non-retryable failure, or feedback suppressed before it was sent — is
+    // terminal. The fix loop stops and the run fails visibly.
     await failVerifiedRun(
       database,
       runId,
@@ -1716,39 +1788,49 @@ async function finishContinueTurn(
 // The message that rides the resume slot is what buildPrompt interpolates into
 // the "human answered" section. The fix loop reuses the same slot with the
 // acceptance-check failure text, so the agent reads it as the operator's reply.
+//
+// This function only DECIDES. Recording the attempt (budget increment +
+// signature) is the caller's job, done AFTER the send actually delivered
+// feedback — the send has three ways to deliver nothing, and a decision that
+// delivered nothing must not look like a delivery or the next call misjudges on
+// stale state.
 export async function deliverFixFeedback(
   runId: string,
   failing: { key: string; exitCode: number; output: string }[],
-  at: string,
-): Promise<FixDecision> {
+  anyUnreadable = false,
+): Promise<{ decision: FixDecision; signature: string }> {
   const database = await db();
   const runs = database.collection<RunDoc>("runs");
   const raw = await runs.findOne({ _id: new ObjectId(runId) });
-  if (!raw) return { retry: false, reason: "not_retryable" };
+  if (!raw) return { decision: { retry: false, reason: "not_retryable" }, signature: "" };
   const run = RunSchema.parse(raw);
 
   // Suppressed, not sent. A parked run cannot receive a turn, and marking this
   // delivered would leave the agent waiting on advice it never got. Fail closed:
   // no budget consumed, no signature recorded, so it re-fires on resume.
   if (run.status === "awaiting_input") {
-    return { retry: false, reason: "suppressed" };
+    return { decision: { retry: false, reason: "suppressed" }, signature: "" };
   }
 
   // A retry resumes the SAME provider session. Without a captured session id
   // there is nothing to resume, so the failure is not fixable by a retry — fail
   // closed rather than let the send machinery throw after the budget was spent.
   if (!run.executionSessionId) {
-    return { retry: false, reason: "not_retryable" };
+    return { decision: { retry: false, reason: "not_retryable" }, signature: "" };
   }
 
   const signature = fixSignature(failing);
+  // An unreadable log means the signature was computed over content we could not
+  // read — not evidence the agent saw this exact failure before. Stop only on the
+  // budget guard in that case; never on a comparison against a previous
+  // signature, which would convert a logging failure into a wrong verdict.
   const decision = decideFix({
     failureKind: "verification_failed",
     attempts: run.fixAttempts,
     signature,
-    lastSignature: run.lastFixSignature,
+    lastSignature: anyUnreadable ? null : run.lastFixSignature,
   });
-  if (!decision.retry) return decision;
+  if (!decision.retry) return { decision, signature };
 
   // The branch tip moved while checks were running, so these failures describe a
   // commit that no longer exists. Delivering them would be a lie. Re-verify.
@@ -1772,39 +1854,66 @@ export async function deliverFixFeedback(
       tipNow = null;
     }
     if (tipNow !== null && tipNow !== evidence.commitSha) {
-      return { retry: false, reason: "suppressed" };
+      return { decision: { retry: false, reason: "suppressed" }, signature };
     }
   }
 
-  await runs.updateOne(
-    { _id: new ObjectId(runId), fixAttempts: run.fixAttempts },
-    { $set: { fixAttempts: run.fixAttempts + 1, lastFixSignature: signature, updatedAt: at } },
+  // The decision alone — the attempt is recorded by recordFixDelivery only after
+  // the send actually delivered the feedback, never before.
+  return { decision, signature };
+}
+
+// Record a fix delivery that actually happened. Called by the verification tail
+// ONLY after sendContinueTurn returns true. The CAS on fixAttempts keeps two
+// concurrent paths from both incrementing: the write matches only the value the
+// decision read, so the loser's update no-ops.
+async function recordFixDelivery(
+  runId: string,
+  signature: string,
+  fixAttempts: number,
+  at: string,
+): Promise<void> {
+  const database = await db();
+  await database.collection<RunDoc>("runs").updateOne(
+    { _id: new ObjectId(runId), fixAttempts },
+    { $set: { fixAttempts: fixAttempts + 1, lastFixSignature: signature, updatedAt: at } },
   );
-  return decision;
 }
 
 // The pure fix-loop module needs each failing check's CONTENT, but verifyRun
 // persists check output to `<runDir>/checks/<key>.log` and returns only the
 // path. Read those logs back at the boundary. A log that cannot be read (missing
-// after a crash, cleaned up, permission denied) contributes an empty string: the
-// signature then fingerprints the check identity + exit code, so a repeated
-// failure still dedupes, and the agent still sees the check key even without
-// its output. Losing the whole verification outcome because a log vanished is
-// the worse failure.
-async function failingChecksWithOutput(
+// after a crash, cleaned up, permission denied) contributes an empty string so
+// the agent still sees the check key and exit code even without its output —
+// losing the whole verification outcome because a log vanished is the worse
+// failure.
+//
+// An unreadable log MUST also make the whole load "incomplete". Two different
+// failures whose logs are both unreadable would otherwise contribute identical
+// empty strings, hash to the same signature, and stop the loop with a wrong
+// repeated_failure verdict for a failure the agent has never seen. A signature
+// computed over content we could not read is not evidence the agent saw the
+// same failure twice, so the caller skips the dedup comparison whenever any log
+// was unreadable and falls back to the budget guard alone.
+export async function failingChecksWithOutput(
   checks: { key: string; exitCode: number; outputRef: string }[],
-): Promise<{ key: string; exitCode: number; output: string }[]> {
+): Promise<{
+  loaded: { key: string; exitCode: number; output: string }[];
+  anyUnreadable: boolean;
+}> {
   const loaded: { key: string; exitCode: number; output: string }[] = [];
+  let anyUnreadable = false;
   for (const check of checks) {
     let output = "";
     try {
       output = await readFile(check.outputRef, "utf8");
     } catch {
       output = "";
+      anyUnreadable = true;
     }
     loaded.push({ key: check.key, exitCode: check.exitCode, output });
   }
-  return loaded;
+  return { loaded, anyUnreadable };
 }
 
 // What the agent actually receives. Only failing checks, each with its command
