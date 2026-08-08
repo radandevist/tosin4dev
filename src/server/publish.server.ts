@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { z } from "zod";
 import type { Board } from "../domain/schemas";
+import { HttpUrlString } from "../domain/schemas";
 import { ServerResultError } from "./result";
 
 const execFileAsync = promisify(execFile);
@@ -71,6 +73,54 @@ export async function pushBranch(workDir: string, branch: string): Promise<void>
   });
 }
 
+// A shape from a subprocess is never trusted. `gh pr create` prints a bare URL
+// line when it succeeds — but also prints notices/banners on other channels and
+// can be re-versioned to print more than one line. HttpUrlString is the only
+// thing allowed to turn that stdout into a URL; anything else is a diagnosed
+// failure, not a silent garbage write into the database. `gh pr list --json
+// url` prints an array of { url } objects — or a non-JSON error/notice prefix
+// when something is off. The listing's URL fields are HttpUrlString too: a
+// reuse URL that is not a real http(s) URL must NOT be returned, or it would be
+// persisted as the run's prUrl and FIX the run's own schema parse later.
+// Whatever the cause, a miss on this schema must mean "no existing PR" (so the
+// create still runs), not a hard failure that blocks publishing. A bad create
+// URL is a diagnosis; a bad listing is just no reuse candidate.
+const PrListOutputSchema = z.array(z.object({ url: HttpUrlString }));
+
+// Subprocess stdout is untrusted at this boundary: `gh pr list` can prefix its
+// JSON with notices or emit an error string, and a SyntaxError there must not
+// block the publish — the branch is already pushed, and a reuse miss just means
+// the create runs. Any shape that fails the schema reads as "no existing PR".
+// Exported as a pure seam so the parse is testable without invoking `gh`.
+export function parsePrListOutput(stdout: string): string | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(stdout || "[]");
+  } catch {
+    // Not JSON at all — no existing PR to reuse, let the create run.
+    return null;
+  }
+  const parsed = PrListOutputSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.length === 0) return null;
+  return parsed.data[0].url;
+}
+
+// The created PR's URL. `.url()` alone accepts javascript:/mailto:, so the
+// protocol is pinned too, and whatever gh actually printed is named in the
+// failure so the operator can act on it rather than on a bare schema error.
+// Exported as a pure seam so the parse is testable without invoking `gh`.
+export function parseCreatedPrUrl(stdout: string): string {
+  const parsed = HttpUrlString.safeParse(stdout.trim());
+  if (!parsed.success) {
+    const shown = stdout.trim().slice(0, 300) || "<empty>";
+    throw new ServerResultError(
+      "unparseable_pr_url",
+      `gh pr create printed no usable URL (got: ${JSON.stringify(shown)})`,
+    );
+  }
+  return parsed.data;
+}
+
 // Reuse an existing PR for this head rather than opening a second one — the fix
 // loop can reach a passing verdict on a branch that was already published.
 async function existingPrUrl(workDir: string, branch: string): Promise<string | null> {
@@ -79,10 +129,7 @@ async function existingPrUrl(workDir: string, branch: string): Promise<string | 
     ["pr", "list", "--head", branch, "--state", "open", "--json", "url", "--limit", "1"],
     { cwd: workDir, encoding: "utf8" },
   );
-  const parsed: unknown = JSON.parse(stdout || "[]");
-  if (!Array.isArray(parsed) || parsed.length === 0) return null;
-  const url = (parsed[0] as { url?: unknown }).url;
-  return typeof url === "string" ? url : null;
+  return parsePrListOutput(stdout);
 }
 
 export async function publishRun(input: {
@@ -106,5 +153,5 @@ export async function publishRun(input: {
     }),
     { cwd: input.workDir, encoding: "utf8" },
   );
-  return { prUrl: stdout.trim() };
+  return { prUrl: parseCreatedPrUrl(stdout) };
 }

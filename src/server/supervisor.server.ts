@@ -910,20 +910,26 @@ export async function applyRunCompletion(
     await database.collection("evidence").insertOne(evidence);
     if (result.verdict === "passed") {
       const stamp = turnStamp(turnId, "completed");
-      // The PR body carries the evidence — checks run, exit codes, commit sha —
-      // so the verification contract is visible to anyone reading the PR rather
-      // than living only in MongoDB.
-      const rawTicket = await database
-        .collection<TicketDoc>("tickets")
-        .findOne({ _id: new ObjectId(ticketId) });
-      if (!rawTicket) {
-        throw new ServerResultError("not_found", `ticket not found: ${ticketId}`);
-      }
-      const ticket = TicketSchema.parse(rawTicket);
-      const bodyFile = `${runDir}/pr-body.md`;
-      await writeFile(bodyFile, prBody(ticket, evidence, outSummary), "utf8");
       let prUrl: string | null = null;
       try {
+        // The PR body carries the evidence — checks run, exit codes, commit sha —
+        // so the verification contract is visible to anyone reading the PR rather
+        // than living only in MongoDB. The ticket lookup, its parse and the body
+        // write are INSIDE this try: a legacy ticket document or a full disk here
+        // is the "verified but not published" state, and the catch below is the
+        // path that already reports it that way. Outside, a throw here would have
+        // reached the outer verification catch and reported a verified run as
+        // verification_failed — with no hand-push hint and no mention of
+        // publishing.
+        const rawTicket = await database
+          .collection<TicketDoc>("tickets")
+          .findOne({ _id: new ObjectId(ticketId) });
+        if (!rawTicket) {
+          throw new ServerResultError("not_found", `ticket not found: ${ticketId}`);
+        }
+        const ticket = TicketSchema.parse(rawTicket);
+        const bodyFile = `${runDir}/pr-body.md`;
+        await writeFile(bodyFile, prBody(ticket, evidence, outSummary), "utf8");
         // A passed verdict on a branchless run cannot arise through the normal
         // flow (verifyRun needs a branch to check commits), but the schema
         // allows it. Refuse loudly rather than push an empty branch.
