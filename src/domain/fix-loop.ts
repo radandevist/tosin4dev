@@ -13,7 +13,7 @@ export type FixDecision =
   | { retry: true }
   | {
       retry: false;
-      reason: "budget_exhausted" | "repeated_failure" | "not_retryable";
+      reason: "budget_exhausted" | "repeated_failure" | "not_retryable" | "suppressed";
     };
 
 // A stable fingerprint of "which checks failed and how". Sorted by key so two

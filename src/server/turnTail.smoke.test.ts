@@ -206,6 +206,8 @@ async function insertTurnRun(params: {
     baseSha: null,
     verdict: null,
     failureKind: null,
+    fixAttempts: 0,
+    lastFixSignature: null,
     executionSessionId: null,
     executionLeaseId: null,
     executionLeaseExpiresAt: null,
