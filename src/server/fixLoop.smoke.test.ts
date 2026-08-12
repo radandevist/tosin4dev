@@ -712,7 +712,7 @@ describe("fix-loop verification tail", () => {
     expect(bodies.some((body) => body.includes("after 2 attempts"))).toBe(true);
   });
 
-  it("leaves a run whose fix feedback was never sent unrecorded and blocked", async () => {
+  it("leaves a run whose fix feedback was never sent parked and unrecorded", async () => {
     const { runId, ticketId } = await seedBlockedPathFixture();
     const outcome = await applyRunCompletion(
       runId,
@@ -733,14 +733,114 @@ describe("fix-loop verification tail", () => {
     // signature stay exactly as they were and re-fire cleanly next time.
     expect(run?.fixAttempts).toBe(0);
     expect(run?.lastFixSignature).toBeNull();
-    // And the run reached the blocked path rather than lingering in `verifying`
-    // invisible to the operator.
-    expect(run?.status).toBe("failed");
+    // The run is parked for a resumable execution instead of being terminally
+    // blocked while the feedback is still waiting to be sent.
+    expect(run?.status).toBe("awaiting_input");
+    expect(run?.pendingFixFeedback?.message).toContain("acceptance checks");
     const ticket = await database.collection("tickets").findOne({ _id: new ObjectId(ticketId) });
-    expect(ticket?.status).toBe("blocked");
+    expect(ticket?.status).toBe("needs_input");
   });
 
-  it("drives the retry branch to an attempted send that lands blocked on spawn failure", async () => {
+  it("re-verifies after evidence becomes stale before preparing fix feedback", async () => {
+    const { runId, ticketId } = await seedRetryFixture();
+    const marker = join(repo, "stale-tip-marker.txt");
+    const movingBoard: Board = {
+      ...board,
+      checks: [
+        {
+          key: "bad",
+          label: "bad",
+          command: [
+            "sh",
+            "-c",
+            `if [ ! -f '${marker}' ]; then printf '%s\\n' moved > '${marker}'; git add '${marker}'; git commit -m moved >/dev/null; fi; exit 1`,
+          ],
+          timeoutMs: 10_000,
+        },
+      ],
+    };
+    try {
+      await applyRunCompletion(
+        runId,
+        ticketId,
+        "execute",
+        0,
+        "out\n",
+        logFile,
+        null,
+        movingBoard,
+        runDir,
+        new ObjectId().toString(),
+      );
+      const database = await db();
+      const evidence = await database
+        .collection("evidence")
+        .find({ runId })
+        .sort({ createdAt: 1 })
+        .toArray();
+      const currentTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      // The first evidence row is stale because the check committed while it
+      // ran. The second pass proves the feedback path verified the new tip.
+      expect(evidence).toHaveLength(2);
+      expect(evidence.at(-1)?.commitSha).toBe(currentTip);
+    } finally {
+      await rm(marker, { force: true });
+    }
+  });
+
+  it("parks suppressed fix feedback and delivers it once after resumption", async () => {
+    const { runId, ticketId } = await seedBlockedPathFixture();
+    await applyRunCompletion(
+      runId,
+      ticketId,
+      "execute",
+      0,
+      "out\n",
+      logFile,
+      null,
+      board,
+      runDir,
+      new ObjectId().toString(),
+    );
+
+    const database = await db();
+    const parked = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
+    expect(parked?.status).toBe("awaiting_input");
+    expect(parked?.pendingFixFeedback?.message).toContain("acceptance checks");
+    expect(parked?.fixAttempts).toBe(0);
+    expect(parked?.lastFixSignature).toBeNull();
+    await database.collection("boards").insertOne({
+      _id: new ObjectId(parked?.boardId),
+      ...board,
+      slug: `${board.slug}-resume`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const stubDir = await mkdtemp(join(tmpdir(), "t4d-fixresume-"));
+    await installRunnerStub(stubDir);
+    process.env.PATH = stubPath(stubDir);
+    try {
+      const { continueExecution } = await import("./supervisor.server");
+      await continueExecution(runId, "resume the execution");
+    } finally {
+      await rm(stubDir, { recursive: true, force: true });
+      process.env.PATH = stubPath(binDirectory);
+    }
+
+    await pollSettledContinue(runId);
+    const resumed = await database.collection("runs").findOne({ _id: new ObjectId(runId) });
+    const prompt = await readFile(resumed?.promptFile ?? "", "utf8");
+    expect(prompt).toContain("resume the execution");
+    expect(prompt).toContain("acceptance checks");
+    expect(resumed?.pendingFixFeedback).toBeNull();
+    expect(resumed?.fixAttempts).toBe(1);
+    expect(resumed?.lastFixSignature).toBeTruthy();
+  });
+
+  it("parks the retry branch when an attempted send fails to spawn", async () => {
     const { runId, ticketId, promptFile } = await seedRetryFixture();
     const outcome = await applyRunCompletion(
       runId,
@@ -768,15 +868,16 @@ describe("fix-loop verification tail", () => {
     expect(existsSync(promptFile)).toBe(true);
     const prompt = await readFile(promptFile, "utf8");
     expect(prompt).toContain("acceptance checks");
-    // The failed send landed in the blocked tail: the run failed visibly rather
-    // than lingering in `verifying`, and the ticket is blocked.
-    expect(run?.status).toBe("failed");
+    // The failed send is parked with durable feedback rather than losing the
+    // resumable execution session.
+    expect(run?.status).toBe("awaiting_input");
     const ticket = await database.collection("tickets").findOne({ _id: new ObjectId(ticketId) });
-    expect(ticket?.status).toBe("blocked");
+    expect(ticket?.status).toBe("needs_input");
     // Nothing was recorded: the send never delivered, so the budget and the
     // signature stay exactly as they were and re-fire cleanly next time.
     expect(run?.fixAttempts).toBe(0);
     expect(run?.lastFixSignature).toBeNull();
+    expect(run?.pendingFixFeedback?.message).toContain("acceptance checks");
   });
 
   it("records a delivery when the fix send succeeds and pins the counter and signature", async () => {

@@ -246,6 +246,20 @@ export const RunTurnSchema = z
   .strict();
 export type RunTurn = z.infer<typeof RunTurnSchema>;
 
+// A verification failure that could not be delivered because the execution
+// lease was unavailable or the send failed. It stays on the run until a later
+// resumed turn actually accepts the feedback; only then does the fix-loop
+// counter advance. Keeping the rendered message (rather than only its
+// signature) makes the retry independent of ephemeral check-log files.
+export const PendingFixFeedbackSchema = z
+  .object({
+    message: z.string().min(1),
+    signature: z.string().min(1),
+    attempts: z.number().int().min(0),
+  })
+  .strict();
+export type PendingFixFeedback = z.infer<typeof PendingFixFeedbackSchema>;
+
 export const RunSchema = z.object({
   ticketId: ObjectIdString,
   boardId: ObjectIdString,
@@ -285,6 +299,10 @@ export const RunSchema = z.object({
   // agent saw this exact failure and did not fix it; delivering it again buys
   // nothing. null until the first delivery.
   lastFixSignature: z.string().nullable().default(null),
+  // Feedback that was prepared but not sent because the execution session was
+  // parked, leased by another turn, or failed to spawn. Cleared only after a
+  // resumed send succeeds.
+  pendingFixFeedback: PendingFixFeedbackSchema.nullable().default(null),
   // Draft PR opened for this run's verified branch. null until published.
   // HttpUrlString, not `.url()`: the file documents above that `.url()` alone
   // accepts javascript:/mailto:, and a run's prUrl is persisted from gh's

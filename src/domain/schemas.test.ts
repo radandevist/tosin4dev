@@ -119,6 +119,7 @@ describe("RunSchema verification fields", () => {
     expect(run.baseSha).toBeNull();
     expect(run.verdict).toBeNull();
     expect(run.failureKind).toBeNull();
+    expect(run.pendingFixFeedback).toBeNull();
   });
   it("accepts a verifying status and a verification failureKind", () => {
     expect(RunStatus.parse("verifying")).toBe("verifying");
