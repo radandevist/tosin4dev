@@ -36,6 +36,9 @@ async function connect(): Promise<Db> {
     await database
       .collection("tickets")
       .createIndex({ boardId: 1, seq: 1 }, { unique: true });
+    await database
+      .collection("authSessions")
+      .createIndex({ tokenHash: 1 }, { unique: true });
 
     // Unique partial index on activeRunId. Mongo partial filters reject $ne, so
     // we match "activeRunId is a string" ($type) instead of "activeRunId !=
