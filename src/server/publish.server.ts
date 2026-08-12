@@ -62,6 +62,23 @@ export async function preflightPublish(repoPath: string): Promise<void> {
       `repo at ${repoPath} has no "origin" remote to push to`,
     );
   }
+  // `git remote get-url` reads local config only; it cannot see a dead network
+  // or an unreachable host. `git ls-remote` actually talks to origin, so it is
+  // the check that turns "an origin is configured" into "the push at the end
+  // of the run can happen". HEAD may not exist yet on an empty remote — that
+  // still exits 0, because the probe is about reachability, not refs.
+  try {
+    await execFileAsync(
+      "git",
+      ["-C", repoPath, "ls-remote", "origin", "HEAD"],
+      { encoding: "utf8" },
+    );
+  } catch {
+    throw new ServerResultError(
+      "remote_unreachable",
+      `origin for ${repoPath} is not reachable — the publish push would fail`,
+    );
+  }
 }
 
 // Plain push. Never --force, never --force-with-lease: a rejected push is
@@ -89,9 +106,9 @@ const PrListOutputSchema = z.array(z.object({ url: HttpUrlString }));
 
 // Subprocess stdout is untrusted at this boundary: `gh pr list` can prefix its
 // JSON with notices or emit an error string, and a SyntaxError there must not
-// block the publish — the branch is already pushed, and a reuse miss just means
-// the create runs. Any shape that fails the schema reads as "no existing PR".
-// Exported as a pure seam so the parse is testable without invoking `gh`.
+// block the publish — a reuse miss just means the create runs. Any shape that
+// fails the schema reads as "no existing PR". Exported as a pure seam so the
+// parse is testable without invoking `gh`.
 export function parsePrListOutput(stdout: string): string | null {
   let raw: unknown;
   try {
@@ -135,7 +152,9 @@ export function parseCreatedPrUrl(stdout: string): string {
 }
 
 // Reuse an existing PR for this head rather than opening a second one — the fix
-// loop can reach a passing verdict on a branch that was already published.
+// loop can reach a passing verdict on a branch that was already published. The
+// lookup runs BEFORE the push: a head with an open PR is already on the remote,
+// so a repeat publish must neither push it again nor create a duplicate.
 async function existingPrUrl(workDir: string, branch: string): Promise<string | null> {
   const { stdout } = await execFileAsync(
     "gh",
@@ -153,9 +172,9 @@ export async function publishRun(input: {
   bodyFile: string;
 }): Promise<{ prUrl: string }> {
   assertPublishable(input.board, input.branch);
-  await pushBranch(input.workDir, input.branch);
   const existing = await existingPrUrl(input.workDir, input.branch);
   if (existing !== null) return { prUrl: existing };
+  await pushBranch(input.workDir, input.branch);
   const { stdout } = await execFileAsync(
     "gh",
     draftPrArgs({
