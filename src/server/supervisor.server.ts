@@ -40,7 +40,7 @@ import { claudeAdapter } from "../runners/claude";
 import { codexAdapter } from "../runners/codex";
 import type { RunnerAdapter, RunnerBrief } from "../runners/types";
 import { db, ObjectId } from "./db";
-import { readDraftedSpec } from "./draftedSpec.server";
+import { captureDraftedSpec, readDraftedSpec } from "./draftedSpec.server";
 import { notify } from "./notify.server";
 import { parseSessionId, readOutcome } from "./outcome.server";
 import { preflightPublish, publishRun } from "./publish.server";
@@ -750,8 +750,10 @@ export async function applyRunCompletion(
   const runs = database.collection<RunDoc>("runs");
   const tickets = database.collection<TicketDoc>("tickets");
 
-  // spec_draft: read-only, no verification. A successful draft writes itself
-  // into the ticket; a failed one leaves it alone.
+  // spec_draft: read-only, no verification. The runner prints a bounded
+  // structured spec block on stdout; Tosin-owned code writes spec.json from
+  // it and a successful draft writes itself into the ticket. A failed one
+  // leaves it alone.
   if (phase === "spec_draft") {
     const stamp = turnStamp(turnId, succeeded ? "completed" : "failed");
     await runs.updateOne(
@@ -785,6 +787,7 @@ export async function applyRunCompletion(
       );
     }
     if (succeeded) {
+      await captureDraftedSpec(stdout, runDir);
       await applyDraftedSpec(ticketId, runDir, at);
     }
     return succeeded ? "completed" : "failed";
@@ -2757,7 +2760,6 @@ export async function dispatchRun(
       board,
       workDir: paths.workDir,
       phase,
-      specPath: phase === "spec_draft" ? `${paths.runDir}/spec.json` : undefined,
     };
     await writeFile(paths.promptFile, buildPrompt(brief));
     await writeFile(paths.logFile, "");

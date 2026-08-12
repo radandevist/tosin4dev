@@ -14,12 +14,12 @@ export function buildPrompt(brief: RunnerBrief): string {
       `You are drafting the executable spec for ticket #${ticket.seq}: ${ticket.title}.`,
       `Repo: ${board.repoPath} (base branch: ${board.defaultBaseBranch}).`,
       `Intent: ${ticket.spec.intent}`,
-      "Investigate the repo READ-ONLY and produce: a concrete plan, affected files, verification commands, and risks. Do not modify any file in the repository — the single exception is the spec JSON named below, which you must write.",
+      "Investigate the repo READ-ONLY and produce: a concrete plan, affected files, verification commands, and risks. Do not modify any file in the repository — the sandbox is read-only.",
       `Acceptance criteria:\n${acceptance || "none provided"}`,
-      `When you finish, write this JSON to ${brief.specPath ?? "<runDir>/spec.json"} and nothing else to it:`,
+      "Tosin-owned code writes the spec artifact from your stdout, so print the JSON below between a line containing exactly SPEC_JSON_START and a line containing exactly SPEC_JSON_END:",
       `{"intent":"<one sentence>","scope":"<files/areas to touch>","nonGoals":"<what must NOT change>","acceptance":["<checkable criterion>"],"links":["<url>"],"risk":"low|medium|high"}`,
       "Every acceptance criterion must be checkable by a command or an observation, not a feeling. Do not include approval fields; approval is the owner's.",
-      "End your output with a section titled SUMMARY containing at most 10 lines.",
+      "Print the JSON block before the final SUMMARY section, then end your output with a section titled SUMMARY containing at most 10 lines.",
     ].join("\n\n");
   }
 

@@ -90,12 +90,13 @@ async function writeRunner(
   lines: readonly string[],
   exitCode = 0,
   commit = false,
+  runner = "claude",
 ): Promise<void> {
   const body = lines.map((line) => `printf '%s\\n' '${line}'`).join("\n");
   const commitBody = commit
     ? `echo "artifact $$" > verify-artifact.txt\ngit add -A\ngit commit -m "runner work" >/dev/null 2>&1\n`
     : "";
-  const executable = join(binDirectory, "claude");
+  const executable = join(binDirectory, runner);
   await writeFile(
     executable,
     `#!/bin/sh\n${body}\n${commitBody}printf '%s' '{"outcome":"completed","summary":"smoke ok"}' > "$T4D_OUTCOME_PATH"\nexit ${exitCode}\n`,
@@ -107,6 +108,7 @@ async function insertTicket(
   status: Ticket["status"],
   seq: number,
   activeRunId: string | null = null,
+  runner: Ticket["runner"] = "claude",
 ): Promise<string> {
   const at = timestamp();
   const result = await tickets.insertOne({
@@ -115,7 +117,7 @@ async function insertTicket(
     title: `smoke ${seq}`,
     type: "implement",
     status,
-    runner: "claude",
+    runner,
     spec: {
       intent: "exercise the supervisor",
       scope: "README.md",
@@ -259,6 +261,39 @@ describe("supervisor smoke", () => {
     expect(ticket?.status).toBe("inbox");
     expect(ticket?.activeRunId).toBeNull();
     await expect(readFile(run.promptFile, "utf8")).resolves.toContain("READ-ONLY");
+  });
+
+  it("captures a Codex spec draft from bounded stdout into the ticket", async () => {
+    // Issue #27: codex spec_draft keeps `--sandbox read-only`, so the fake
+    // codex runner prints the spec between markers on stdout and the
+    // supervisor writes the artifact applyDraftedSpec consumes.
+    await writeRunner(
+      [
+        "runner output",
+        "## SUMMARY",
+        "draft plan",
+        "SPEC_JSON_START",
+        '{"intent":"confetti from codex","acceptance":["fires once"]}',
+        "SPEC_JSON_END",
+      ],
+      0,
+      false,
+      "codex",
+    );
+    const ticketId = await insertTicket("inbox", 11, null, "codex");
+    const { runId } = await dispatchRun(ticketId, "spec_draft");
+    const run = await waitForRun(runId, "succeeded");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.workDir).toBe(repo);
+    await expect(readFile(run.promptFile, "utf8")).resolves.toContain(
+      "SPEC_JSON_START",
+    );
+    expect(ticket?.status).toBe("spec_review");
+    expect(ticket?.spec.intent).toBe("confetti from codex");
+    expect(ticket?.spec.acceptance).toEqual(["fires once"]);
+    expect(ticket?.spec.approvedAt).toBeNull();
   });
 
   it("keeps an inbox ticket unchanged when spec drafting fails", async () => {

@@ -9,6 +9,7 @@ process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 
 const { db } = await import("./db");
 const { applyDraftedSpec } = await import("./supervisor.server");
+const { captureDraftedSpec } = await import("./draftedSpec.server");
 
 let runDir: string;
 let ticketId: string;
@@ -74,6 +75,34 @@ describe("applyDraftedSpec", () => {
     // The runner may not approve its own draft.
     expect(t?.spec.approvedAt).toBeNull();
     expect(t?.spec.approvedBy).toBeNull();
+  });
+
+  it("applies a Codex spec draft captured from bounded structured stdout", async () => {
+    // Issue #27: codex spec_draft runs with `--sandbox read-only`, so the
+    // runner cannot write spec.json itself. It prints the draft between
+    // markers on stdout and Tosin-owned captureDraftedSpec writes the
+    // artifact applyDraftedSpec consumes.
+    const stdout = [
+      "investigation notes",
+      "SPEC_JSON_START",
+      JSON.stringify({
+        intent: "confetti from codex stdout",
+        acceptance: ["fires once per browser"],
+      }),
+      "SPEC_JSON_END",
+      "## SUMMARY",
+      "done",
+    ].join("\n");
+    await captureDraftedSpec(stdout, runDir);
+    await applyDraftedSpec(ticketId, runDir, "2026-08-07T01:00:00.000Z");
+    const database = await db();
+    const t = await database
+      .collection("tickets")
+      .findOne({ _id: new ObjectId(ticketId) });
+    expect(t?.status).toBe("spec_review");
+    expect(t?.spec.intent).toBe("confetti from codex stdout");
+    expect(t?.spec.acceptance).toEqual(["fires once per browser"]);
+    expect(t?.spec.approvedAt).toBeNull();
   });
 
   it("leaves the ticket in inbox when the draft is invalid", async () => {
