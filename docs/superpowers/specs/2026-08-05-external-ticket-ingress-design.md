@@ -86,7 +86,7 @@ Rules:
 
 ## 6. Auth (depends on #15)
 
-This endpoint must not ship before #15 is settled. The app currently has no authentication anywhere and `.env` sets `DEV_HOST=0.0.0.0`, so every server function is already reachable by any host on the LAN — including `dispatchRun`. Adding a documented write API on top of that turns an implicit exposure into a supported one.
+This endpoint must not ship before #15 is settled. The development server now binds to loopback by default, which removes the prior LAN exposure, but the app still has no authentication: any local process able to reach the console has full control, including `dispatchRun`. Adding a documented write API before the console has an authentication boundary would extend that control to another mutation surface.
 
 Once #15 lands, ingress should reuse whatever it establishes rather than inventing a parallel scheme. The expected shape is a shared secret in `.env` compared in constant time. If #15 puts the check inside the server-fn `boundary` helper, ingress gets it by construction.
 
