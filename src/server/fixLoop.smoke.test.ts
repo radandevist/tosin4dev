@@ -3,7 +3,7 @@ import { accessSync, constants as fsConstants, existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ObjectId } from "mongodb";
+import { Collection, ObjectId } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_FIX_ATTEMPTS, fixSignature } from "../domain/fix-loop";
 import type { Board, Run, Ticket } from "../domain/schemas";
@@ -790,6 +790,67 @@ describe("fix-loop verification tail", () => {
     }
   });
 
+  it("fails closed when the branch moves on every bounded re-verification pass", async () => {
+    const { runId, ticketId } = await seedRetryFixture();
+    const marker = join(repo, "always-moving-tip-marker.txt");
+    const movingBoard: Board = {
+      ...board,
+      checks: [
+        {
+          key: "moves",
+          label: "moves",
+          command: [
+            "sh",
+            "-c",
+            `printf '%s\\n' "$(date +%s%N)" > '${marker}'; git add '${marker}'; git commit -m moving >/dev/null; exit 0`,
+          ],
+          timeoutMs: 10_000,
+        },
+      ],
+    };
+    try {
+      await applyRunCompletion(
+        runId,
+        ticketId,
+        "execute",
+        0,
+        "out\\n",
+        logFile,
+        null,
+        movingBoard,
+        runDir,
+        new ObjectId().toString(),
+      );
+
+      const database = await db();
+      const run = await database
+        .collection("runs")
+        .findOne({ _id: new ObjectId(runId) });
+      const ticket = await database
+        .collection("tickets")
+        .findOne({ _id: new ObjectId(ticketId) });
+      const evidence = await database
+        .collection("evidence")
+        .find({ runId })
+        .sort({ createdAt: 1 })
+        .toArray();
+      const currentTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      expect(run?.status).toBe("failed");
+      expect(run?.verdict).toBe("failed");
+      expect(run?.prUrl ?? null).toBeNull();
+      expect(run?.pendingFixFeedback ?? null).toBeNull();
+      expect(ticket?.status).toBe("blocked");
+      expect(ticket?.prUrl).toBeNull();
+      expect(evidence).toHaveLength(3);
+      expect(evidence.at(-1)?.commitSha).not.toBe(currentTip);
+    } finally {
+      await rm(marker, { force: true });
+    }
+  });
+
   it("parks suppressed fix feedback and delivers it once after resumption", async () => {
     const { runId, ticketId } = await seedBlockedPathFixture();
     await applyRunCompletion(
@@ -838,6 +899,132 @@ describe("fix-loop verification tail", () => {
     expect(resumed?.pendingFixFeedback).toBeNull();
     expect(resumed?.fixAttempts).toBe(1);
     expect(resumed?.lastFixSignature).toBeTruthy();
+  });
+
+  it("rejects resumed feedback when the atomic turn delivery CAS misses", async () => {
+    const { runId, ticketId } = await seedBlockedPathFixture();
+    await applyRunCompletion(
+      runId,
+      ticketId,
+      "execute",
+      0,
+      "out\\n",
+      logFile,
+      null,
+      board,
+      runDir,
+      new ObjectId().toString(),
+    );
+
+    const database = await db();
+    const parked = await database
+      .collection("runs")
+      .findOne({ _id: new ObjectId(runId) });
+    expect(parked?.pendingFixFeedback).toBeTruthy();
+    await database.collection("boards").insertOne({
+      _id: new ObjectId(parked?.boardId),
+      ...board,
+      slug: `${board.slug}-cas-miss`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const stubDir = await mkdtemp(join(tmpdir(), "t4d-fixcas-"));
+    await installRunnerStub(stubDir);
+    process.env.PATH = stubPath(stubDir);
+    const originalUpdateOne = Collection.prototype.updateOne;
+    let sabotaged = false;
+    const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+      async function (this: Collection, filter, update, options) {
+        const push = (update as { $push?: Record<string, unknown> }).$push;
+        const isTurnWrite =
+          !sabotaged &&
+          this.collectionName === "runs" &&
+          String((filter as Record<string, unknown>)?._id) === runId &&
+          !!push?.turns;
+        if (isTurnWrite) {
+          sabotaged = true;
+          // Change the CAS key between the child send and the durable turn
+          // claim. The delivery must be rejected without clearing feedback.
+          await originalUpdateOne.call(
+            this,
+            { _id: new ObjectId(runId) },
+            { $set: { fixAttempts: 99 } },
+            undefined,
+          );
+        }
+        return originalUpdateOne.call(this, filter, update, options);
+      },
+    );
+    try {
+      const { continueExecution } = await import("./supervisor.server");
+      await expect(
+        continueExecution(runId, "resume the execution"),
+      ).rejects.toMatchObject({ code: "spawn_failed" });
+    } finally {
+      spy.mockRestore();
+      await rm(stubDir, { recursive: true, force: true });
+      process.env.PATH = stubPath(binDirectory);
+    }
+
+    const after = await database
+      .collection("runs")
+      .findOne({ _id: new ObjectId(runId) });
+    expect(sabotaged).toBe(true);
+    expect(after?.status).toBe("awaiting_input");
+    expect(after?.pendingFixFeedback).toBeTruthy();
+    expect(after?.pendingFixFeedback?.signature).toBe(
+      parked?.pendingFixFeedback?.signature,
+    );
+    expect(after?.turns).toHaveLength(0);
+  });
+
+  it("keeps pending feedback when the resumed send fails before its turn claim", async () => {
+    const { runId, ticketId } = await seedBlockedPathFixture();
+    await applyRunCompletion(
+      runId,
+      ticketId,
+      "execute",
+      0,
+      "out\\n",
+      logFile,
+      null,
+      board,
+      runDir,
+      new ObjectId().toString(),
+    );
+
+    const database = await db();
+    const parked = await database
+      .collection("runs")
+      .findOne({ _id: new ObjectId(runId) });
+    await database.collection("boards").insertOne({
+      _id: new ObjectId(parked?.boardId),
+      ...board,
+      slug: `${board.slug}-send-fails`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    process.env.PATH = stubPath(binDirectory);
+    try {
+      const { continueExecution } = await import("./supervisor.server");
+      await expect(
+        continueExecution(runId, "resume the execution"),
+      ).rejects.toMatchObject({ code: "spawn_failed" });
+    } finally {
+      process.env.PATH = stubPath(binDirectory);
+    }
+
+    const after = await database
+      .collection("runs")
+      .findOne({ _id: new ObjectId(runId) });
+    expect(after?.status).toBe("awaiting_input");
+    expect(after?.pendingFixFeedback?.signature).toBe(
+      parked?.pendingFixFeedback?.signature,
+    );
+    expect(after?.fixAttempts).toBe(0);
+    expect(after?.turns).toHaveLength(0);
   });
 
   it("parks the retry branch when an attempted send fails to spawn", async () => {

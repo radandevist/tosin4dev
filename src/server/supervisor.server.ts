@@ -11,6 +11,7 @@ import type {
   Db,
   Filter,
   PushOperator,
+  UpdateFilter,
   UpdateOptions,
 } from "mongodb";
 import { unmetDependencies } from "../domain/dependencies";
@@ -1019,14 +1020,18 @@ export async function applyRunCompletion(
 
     // Evidence is written before this guard so every verification pass remains
     // inspectable. A runner may commit while the checks are running, making the
-    // just-written row stale by the time feedback is prepared. Discard only the
-    // stale feedback and verify the current tip again, with a hard bound for a
-    // branch that keeps moving. If the tip cannot be read, leave the final
-    // suppression decision to deliverFixFeedback, which parks the feedback
-    // instead of sending evidence tied to an unknown commit.
-    for (let attempt = 0; attempt < MAX_STALE_REVERIFY_ATTEMPTS; attempt++) {
+    // just-written row stale by the time feedback is prepared. Reverify the
+    // current tip with a hard bound for a branch that keeps moving. The tip is
+    // checked after EVERY pass, including the final allowed pass: a passed
+    // result is never publishable unless its commit is still HEAD.
+    let staleTip = false;
+    for (let attempt = 0; ; attempt++) {
       const tipNow = await readBranchTip(run.workDir);
-      if (tipNow === null || tipNow === result.commitSha) break;
+      if (tipNow === result.commitSha) break;
+      if (tipNow === null || attempt >= MAX_STALE_REVERIFY_ATTEMPTS) {
+        staleTip = true;
+        break;
+      }
       result = await verifyRun(verifyParams);
       evidenceCreatedAt = new Date(
         Math.max(Date.parse(evidenceCreatedAt) + 1, Date.now()),
@@ -1041,6 +1046,37 @@ export async function applyRunCompletion(
         createdAt: evidenceCreatedAt,
       });
       await database.collection("evidence").insertOne(evidence);
+    }
+    if (staleTip) {
+      // No verdict from a stale pass may publish, and its failures must not be
+      // handed back to the runner: they describe a commit that is no longer the
+      // branch tip. Fail visibly and release the ticket instead of accepting an
+      // older passed result after the retry bound is exhausted.
+      const staleAt = now();
+      await failVerifiedRun(
+        database,
+        runId,
+        "verification_failed",
+        exitCode,
+        outSummary,
+        staleAt,
+        turnStamp(turnId, "completed"),
+      );
+      await transitionTicketFailed(
+        database,
+        ticketId,
+        runId,
+        staleAt,
+        "verification tip moved during checks",
+      );
+      await notifyBlocked(
+        database,
+        ticketId,
+        "verification tip kept moving; no stale feedback was delivered",
+        logFile,
+        stderrFile,
+      );
+      return "completed";
     }
     if (result.verdict === "passed") {
       const stamp = turnStamp(turnId, "completed");
@@ -1540,6 +1576,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
   let runningChild: RunningChild | undefined;
   const answeredAt = now();
   const exchanges = run.exchanges ?? [];
+  const deliveryCas = pendingFeedbackDeliveryCas(pendingFeedback);
   let openIndex = -1;
   exchanges.forEach((exchange, index) => {
     if (exchange.answer === null) openIndex = index;
@@ -1550,6 +1587,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
   const claimFilter: Filter<RunDoc> = {
     _id: new ObjectId(runId),
     status: "awaiting_input",
+    ...deliveryCas.filter,
   };
   if (openIndex >= 0 && openRow) {
     // Real row-level CAS. `{$type:"null"}` NOT `null`: plain equality-to-null
@@ -1719,19 +1757,18 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
     // and flip every later turn's eof true → false → true. A turn row exists
     // only once a monitor is guaranteed to close it.
     const turnRecorded = await runs.updateOne(
-      { _id: new ObjectId(runId), status: "running" },
-      { $push: { turns: { $each: [resumeTurn], $slice: -TURN_CAP } } },
+      {
+        _id: new ObjectId(runId),
+        status: "running",
+        ...deliveryCas.filter,
+      } as Filter<RunDoc>,
+      {
+        $push: { turns: { $each: [resumeTurn], $slice: -TURN_CAP } },
+        ...(deliveryCas.set ? { $set: deliveryCas.set } : {}),
+      } as UpdateFilter<RunDoc>,
     );
     if (turnRecorded.matchedCount === 0) {
       throw new ServerResultError("conflict", "run left running");
-    }
-    if (pendingFeedback) {
-      await recordFixDelivery(
-        runId,
-        pendingFeedback.signature,
-        pendingFeedback.attempts,
-        pendingFeedback.signature,
-      );
     }
 
     void monitorChild(
@@ -2147,11 +2184,38 @@ export async function deliverFixFeedback(
   return { decision, signature, attempts: run.fixAttempts };
 }
 
+// Build the CAS folded into a resumed turn's durable turn write. Pending
+// feedback is acknowledged exactly once with the turn row: either this update
+// matches both the pending signature/counter and appends the turn, or neither
+// happens. In particular, a zero-match cannot be logged as an accepted send.
+function pendingFeedbackDeliveryCas(
+  pending: PendingFixFeedback | null | undefined,
+): { filter: Record<string, unknown>; set?: Record<string, unknown> } {
+  if (!pending) return { filter: {} };
+  return {
+    filter: {
+      // A legacy run can omit fixAttempts; absent and zero are equivalent for
+      // the first delivery, while non-zero keys stay exact for concurrency.
+      fixAttempts:
+        pending.attempts === 0
+          ? { $in: [0, null] }
+          : pending.attempts,
+      "pendingFixFeedback.signature": pending.signature,
+    },
+    set: {
+      fixAttempts: pending.attempts + 1,
+      lastFixSignature: pending.signature,
+      pendingFixFeedback: null,
+    },
+  };
+}
+
 // Record a fix delivery that actually happened. Called by the verification tail
-// ONLY after sendContinueTurn returns true. The CAS on fixAttempts keeps two
-// concurrent paths from both incrementing: the write matches only the value the
-// decision was parsed from (deliverFixFeedback's `attempts`), so the loser's
-// update no-ops.
+// ONLY after sendContinueTurn returns true for a new retry (which has no
+// pending feedback to acknowledge). The CAS on fixAttempts keeps two concurrent
+// paths from both incrementing: the write matches only the value the decision
+// was parsed from (deliverFixFeedback's `attempts`), so the loser's update
+// no-ops.
 async function recordFixDelivery(
   runId: string,
   signature: string,
@@ -2397,6 +2461,7 @@ async function sendContinueTurn(opts: {
   claimFilter: Filter<RunDoc>;
   claimSet: Record<string, unknown>;
   claimPush?: PushOperator<RunDoc>;
+  pendingFeedback?: PendingFixFeedback | null;
   afterRunStarted?: () => Promise<void>;
 }): Promise<boolean> {
   const {
@@ -2410,6 +2475,7 @@ async function sendContinueTurn(opts: {
     claimFilter,
     claimSet,
     claimPush,
+    pendingFeedback,
     afterRunStarted,
   } = opts;
   const runs = database.collection<RunDoc>("runs");
@@ -2426,9 +2492,11 @@ async function sendContinueTurn(opts: {
   // pins its precondition; the `$or` here refuses a run with a live lease, so a
   // loser never overwrites a turn in flight.
   const claimAt = now();
+  const deliveryCas = pendingFeedbackDeliveryCas(pendingFeedback);
   const claimed = await runs.updateOne(
     {
       ...claimFilter,
+      ...deliveryCas.filter,
       $or: [
         { executionLeaseId: null },
         { executionLeaseExpiresAt: { $lt: claimAt } },
@@ -2544,8 +2612,12 @@ async function sendContinueTurn(opts: {
         _id: new ObjectId(runId),
         status: "running",
         executionLeaseId: leaseId,
-      },
-      { $push: { turns: { $each: [continueTurn], $slice: -TURN_CAP } } },
+        ...deliveryCas.filter,
+      } as Filter<RunDoc>,
+      {
+        $push: { turns: { $each: [continueTurn], $slice: -TURN_CAP } },
+        ...(deliveryCas.set ? { $set: deliveryCas.set } : {}),
+      } as UpdateFilter<RunDoc>,
     );
     if (turnRecorded.matchedCount === 0) {
       throw new ServerResultError("conflict", "run left running");
@@ -2686,6 +2758,7 @@ export async function continueExecution(
       claimFilter: claimFilter as Filter<RunDoc>,
       claimSet,
       claimPush,
+      pendingFeedback,
       afterRunStarted: async () => {
         const at = now();
         const to = transition("needs_input", "provide_input");
@@ -2734,14 +2807,6 @@ export async function continueExecution(
   // same code the old inline claim threw.
   if (!sent) {
     throw new ServerResultError("conflict", "run is already executing");
-  }
-  if (pendingFeedback) {
-    await recordFixDelivery(
-      runId,
-      pendingFeedback.signature,
-      pendingFeedback.attempts,
-      pendingFeedback.signature,
-    );
   }
 }
 
