@@ -66,6 +66,7 @@ function runDocument(
     failureKind: null,
     fixAttempts: 0,
     lastFixSignature: null,
+    pendingFixFeedback: null,
     prUrl: null,
     executionSessionId: null,
     executionLeaseId: null,

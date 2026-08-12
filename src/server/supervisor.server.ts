@@ -30,6 +30,7 @@ import {
   type Board,
   type Evidence,
   type HandoffBrief,
+  type PendingFixFeedback,
   type Run,
   type RunTurn,
   type Ticket,
@@ -78,6 +79,10 @@ const EXCHANGE_CAP = 50;
 // same bounded degradation applies: keep the newest turns rather than let a
 // long-lived run grow the document without limit.
 const TURN_CAP = 50;
+// A runner can commit while acceptance checks are still running. Re-run the
+// checks a bounded number of times when that makes the evidence stale; an
+// endlessly moving branch must not consume the owner's verification budget.
+const MAX_STALE_REVERIFY_ATTEMPTS = 2;
 // A `continue` turn holds an exclusive lease on the run for the duration of the
 // spawned process. If the lease expires (supervisor down / process lost) the
 // run is claimable again by a fresh turn.
@@ -212,6 +217,18 @@ export function turnPaths(runDir: string, turnId: string) {
 
 export function runBranchName(runId: string): string {
   return `tosin4dev/run/${runId}`;
+}
+
+async function readBranchTip(workDir: string): Promise<string | null> {
+  try {
+    return (
+      await execFileAsync("git", ["-C", workDir, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      })
+    ).stdout.trim();
+  } catch {
+    return null;
+  }
 }
 
 // Create the execution worktree on a fresh named branch off `baseBranch`, and
@@ -680,44 +697,121 @@ async function failVerifiedRun(
   );
 }
 
-// Terminalize a run whose fix feedback was suppressed: the send never happened
-// (lost lease claim, or the send threw). Nothing was recorded — fixAttempts and
-// lastFixSignature stay as they were so the failure re-fires cleanly next time —
-// but the run must NOT linger in `verifying` invisible to the operator. Same
-// terminal tail as a non-retryable decision, with the reason pinned to
-// `suppressed` (the spec's lease-expired suppression trigger).
-async function failSuppressedTail(
+async function parkSuppressedFeedback(
   database: Db,
-  run: RunDoc,
   runId: string,
   ticketId: string,
-  exitCode: number,
-  outSummary: string | null,
-  doneAt: string,
+  pending: PendingFixFeedback,
   turnId: string,
-  logFile: string,
-  stderrFile: string | null,
-): Promise<"completed"> {
-  // The count rides on the run document already in hand — no second read. The
-  // spec wants the attempt count alongside the stop reason, so "suppressed
-  // after two attempts" reads differently from "stopped without trying".
-  const attempts = run.fixAttempts ?? 0;
-  await failVerifiedRun(
-    database,
-    runId,
-    "verification_failed",
-    exitCode,
-    outSummary,
-    doneAt,
-    turnStamp(turnId, "completed"),
+): Promise<void> {
+  const runs = database.collection<RunDoc>("runs");
+  const currentRaw = await runs.findOne({ _id: new ObjectId(runId) });
+  if (!currentRaw) return;
+  const current = RunSchema.parse(currentRaw);
+  if (!["running", "verifying", "awaiting_input"].includes(current.status)) return;
+
+  const at = now();
+  const openExchange = current.exchanges.some((exchange) => exchange.answer === null);
+  const parkedBy = current.status === "awaiting_input" ? current.parkedBy : "continued";
+  const awaitingQuestion =
+    current.status === "awaiting_input"
+      ? current.awaitingQuestion
+      : "(verification feedback pending)";
+  const hasTurn = current.turns.some(
+    (turn) => turn.id === turnId && turn.outcome === null,
   );
-  await transitionTicketFailed(database, ticketId, runId, doneAt, "verification verification_failed");
-  await notifyBlocked(
-    database,
-    ticketId,
-    `verification failed (verification_failed); fix loop stopped: suppressed after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
-    logFile,
-    stderrFile,
+  const stamp = hasTurn ? turnStamp(turnId, "completed") : { set: {}, options: {} };
+  const filter: Filter<RunDoc> = {
+    _id: new ObjectId(runId),
+    status: { $in: ["running", "verifying", "awaiting_input"] },
+  };
+  if (!openExchange) {
+    filter.exchanges = { $not: { $elemMatch: { answer: null } } };
+  }
+
+  const parked = await runs.updateOne(
+    filter,
+    {
+      $set: {
+        status: "awaiting_input",
+        parkedBy,
+        awaitingQuestion,
+        pid: null,
+        executionLeaseId: null,
+        executionLeaseExpiresAt: null,
+        pendingFixFeedback: pending,
+        ...stamp.set,
+      },
+      ...(openExchange
+        ? {}
+        : {
+            $push: {
+              exchanges: {
+                $each: [
+                  {
+                    v: 1 as const,
+                    at,
+                    question: awaitingQuestion ?? "(verification feedback pending)",
+                    handoff: null,
+                    answer: null,
+                    answeredAt: null,
+                  },
+                ],
+                $slice: -EXCHANGE_CAP,
+              },
+            },
+          }),
+    },
+    stamp.options,
+  );
+  if (parked.matchedCount === 0 && !openExchange) {
+    // A concurrent park may have created the open row after our snapshot. Keep
+    // the pending feedback and state, but never manufacture a second question.
+    await runs.updateOne(
+      {
+        _id: new ObjectId(runId),
+        status: { $in: ["running", "verifying", "awaiting_input"] },
+      },
+      {
+        $set: {
+          status: "awaiting_input",
+          parkedBy,
+          awaitingQuestion,
+          pid: null,
+          executionLeaseId: null,
+          executionLeaseExpiresAt: null,
+          pendingFixFeedback: pending,
+          ...stamp.set,
+        },
+      },
+      stamp.options,
+    );
+  }
+
+  await database.collection<TicketDoc>("tickets").updateOne(
+    { _id: new ObjectId(ticketId), activeRunId: runId, status: "running" },
+    {
+      $set: { status: "needs_input", updatedAt: at },
+      $push: pushActivity("run", "verification feedback pending", at),
+    },
+  );
+}
+
+// Park feedback whose send was suppressed (lost lease claim, a parked run, or a
+// send error). Nothing is recorded as delivered: the pending message is durable
+// and the counter/signature stay unchanged until a resumed turn actually sends
+// it. A run with a captured session has a safe continuation path, so it must not
+// be terminalized merely because this particular send did not happen.
+async function failSuppressedTail(
+  database: Db,
+  runId: string,
+  ticketId: string,
+  turnId: string,
+  pending: PendingFixFeedback,
+): Promise<"completed"> {
+  await parkSuppressedFeedback(database, runId, ticketId, pending, turnId);
+  await notify(
+    `⏸️ verification feedback pending: ${await ticketLabel(database, ticketId)} — resume the execution session to deliver it`,
   );
   return "completed";
 }
@@ -900,7 +994,7 @@ export async function applyRunCompletion(
     // path does) is the correct fail-closed reaction, and the early return
     // narrows `run` to non-null so the fix-loop tail below never needs a `!`.
     if (!run) return "completed";
-    const result = await verifyRun({
+    const verifyParams = {
       repoPath: board.repoPath,
       workDir: run?.workDir ?? board.repoPath,
       runDir,
@@ -908,18 +1002,46 @@ export async function applyRunCompletion(
       baseSha: run?.baseSha ?? "",
       checks: board.checks,
       at: verifyAt,
-    });
+    };
+    let result = await verifyRun(verifyParams);
     const doneAt = now();
-    const evidence = EvidenceSchema.parse({
+    let evidenceCreatedAt = doneAt;
+    let evidence = EvidenceSchema.parse({
       runId,
       ticketId,
       commitSha: result.commitSha,
       commitRef: result.commitRef,
       checks: result.checks,
       verdict: result.verdict,
-      createdAt: doneAt,
+      createdAt: evidenceCreatedAt,
     });
     await database.collection("evidence").insertOne(evidence);
+
+    // Evidence is written before this guard so every verification pass remains
+    // inspectable. A runner may commit while the checks are running, making the
+    // just-written row stale by the time feedback is prepared. Discard only the
+    // stale feedback and verify the current tip again, with a hard bound for a
+    // branch that keeps moving. If the tip cannot be read, leave the final
+    // suppression decision to deliverFixFeedback, which parks the feedback
+    // instead of sending evidence tied to an unknown commit.
+    for (let attempt = 0; attempt < MAX_STALE_REVERIFY_ATTEMPTS; attempt++) {
+      const tipNow = await readBranchTip(run.workDir);
+      if (tipNow === null || tipNow === result.commitSha) break;
+      result = await verifyRun(verifyParams);
+      evidenceCreatedAt = new Date(
+        Math.max(Date.parse(evidenceCreatedAt) + 1, Date.now()),
+      ).toISOString();
+      evidence = EvidenceSchema.parse({
+        runId,
+        ticketId,
+        commitSha: result.commitSha,
+        commitRef: result.commitRef,
+        checks: result.checks,
+        verdict: result.verdict,
+        createdAt: evidenceCreatedAt,
+      });
+      await database.collection("evidence").insertOne(evidence);
+    }
     if (result.verdict === "passed") {
       const stamp = turnStamp(turnId, "completed");
       let prUrl: string | null = null;
@@ -1028,6 +1150,11 @@ export async function applyRunCompletion(
             signature: "",
             attempts: 0,
           });
+    const pendingFeedback: PendingFixFeedback = {
+      message: formatCheckFailures(failingWithOutput),
+      signature: signature || fixSignature(failingWithOutput),
+      attempts,
+    };
 
     if (decision.retry) {
       // Back to the agent on the existing leased session. The ticket stays
@@ -1048,7 +1175,7 @@ export async function applyRunCompletion(
           board,
           ticket: retryTicket,
           runId,
-          message: formatCheckFailures(failingWithOutput),
+          message: pendingFeedback.message,
           leaseId,
           // A retry is not answering a human's question: the run is mid-verification,
           // not parked. Pin `verifying` so an unrelated claim can never be resumed
@@ -1075,15 +1202,10 @@ export async function applyRunCompletion(
           );
         return failSuppressedTail(
           database,
-          run,
           runId,
           ticketId,
-          exitCode,
-          outSummary,
-          doneAt,
           turnId,
-          logFile,
-          stderrFile,
+          pendingFeedback,
         );
       }
       // The send happened. Only now is the attempt recorded — budget consumed
@@ -1100,27 +1222,30 @@ export async function applyRunCompletion(
       }
       // The claim was lost (the lease expired or a competing path claimed the
       // run between verification and this send). Nothing was delivered, so
-      // nothing is recorded — fixAttempts and lastFixSignature stay as they
-      // were, and the run re-fires cleanly next time. This is the spec's
-      // lease-expired suppression: fall through to the blocked path so the
-      // operator sees the run stop rather than it vanishing into `verifying`.
+      // nothing is recorded. Park the exact message for a later resumed turn.
       return failSuppressedTail(
         database,
-        run,
         runId,
         ticketId,
-        exitCode,
-        outSummary,
-        doneAt,
         turnId,
-        logFile,
-        stderrFile,
+        pendingFeedback,
       );
     }
 
-    // A retry:false decision — budget exhausted, a repeated failure, a
-    // non-retryable failure, or feedback suppressed before it was sent — is
-    // terminal. The fix loop stops and the run fails visibly.
+    // A suppressed decision means the feedback could not be sent, not that the
+    // failure was delivered or understood. Preserve it for a resumable session.
+    if (decision.reason === "suppressed") {
+      return failSuppressedTail(
+        database,
+        runId,
+        ticketId,
+        turnId,
+        pendingFeedback,
+      );
+    }
+
+    // A retry:false decision for budget exhaustion, a repeated signature, or a
+    // non-retryable failure is terminal. The fix loop stops visibly.
     await failVerifiedRun(
       database,
       runId,
@@ -1398,13 +1523,17 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
 
   const runDir = `${board.repoPath}/.tosin4dev/runs/${runId}`;
   const outcomePath = `${runDir}/outcome.json`;
+  const pendingFeedback = run.pendingFixFeedback;
+  const resumeMessage = pendingFeedback
+    ? `${answer}\n\n${pendingFeedback.message}`
+    : answer;
   const brief: RunnerBrief = {
     ticket,
     board,
     workDir: run.workDir,
     phase: run.phase,
     outcomePath,
-    resume: { sessionId: run.executionSessionId, answer },
+    resume: { sessionId: run.executionSessionId, answer: resumeMessage },
   };
 
   let child: ChildProcess | undefined;
@@ -1595,6 +1724,14 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
     );
     if (turnRecorded.matchedCount === 0) {
       throw new ServerResultError("conflict", "run left running");
+    }
+    if (pendingFeedback) {
+      await recordFixDelivery(
+        runId,
+        pendingFeedback.signature,
+        pendingFeedback.attempts,
+        pendingFeedback.signature,
+      );
     }
 
     void monitorChild(
@@ -2019,6 +2156,7 @@ async function recordFixDelivery(
   runId: string,
   signature: string,
   fixAttempts: number,
+  pendingSignature?: string,
 ): Promise<void> {
   const database = await db();
   // RunSchema has no `updatedAt` field; a previous write set it here and it was
@@ -2041,9 +2179,18 @@ async function recordFixDelivery(
     // instead of silently matching nothing.
     fixAttempts: (fixAttempts === 0 ? { $in: [0, null] } : fixAttempts) as unknown as number,
   };
+  if (pendingSignature !== undefined) {
+    (filter as Record<string, unknown>)["pendingFixFeedback.signature"] = pendingSignature;
+  }
   const matched = await database.collection<RunDoc>("runs").updateOne(
     filter,
-    { $set: { fixAttempts: fixAttempts + 1, lastFixSignature: signature } },
+    {
+      $set: {
+        fixAttempts: fixAttempts + 1,
+        lastFixSignature: signature,
+        ...(pendingSignature !== undefined ? { pendingFixFeedback: null } : {}),
+      },
+    },
   );
   if (matched.matchedCount === 0) {
     console.error(
@@ -2465,6 +2612,10 @@ export async function continueExecution(
       "ticket is not parked on this run",
     );
   }
+  const pendingFeedback = run.pendingFixFeedback;
+  const resumedMessage = pendingFeedback
+    ? `${message}\n\n${pendingFeedback.message}`
+    : message;
 
   // The message must ride the claiming update, exactly as resumeRun carries its
   // answer: a second write could fail after status flips to running, losing the
@@ -2530,7 +2681,7 @@ export async function continueExecution(
       board,
       ticket,
       runId,
-      message,
+      message: resumedMessage,
       leaseId,
       claimFilter: claimFilter as Filter<RunDoc>,
       claimSet,
@@ -2583,6 +2734,14 @@ export async function continueExecution(
   // same code the old inline claim threw.
   if (!sent) {
     throw new ServerResultError("conflict", "run is already executing");
+  }
+  if (pendingFeedback) {
+    await recordFixDelivery(
+      runId,
+      pendingFeedback.signature,
+      pendingFeedback.attempts,
+      pendingFeedback.signature,
+    );
   }
 }
 
@@ -2702,6 +2861,7 @@ export async function dispatchRun(
     failureKind: null,
     fixAttempts: 0,
     lastFixSignature: null,
+    pendingFixFeedback: null,
     prUrl: null,
     executionSessionId: null,
     executionLeaseId: null,

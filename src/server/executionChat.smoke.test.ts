@@ -290,6 +290,7 @@ const seedRunDoc = async (
     failureKind: null,
     fixAttempts: 0,
     lastFixSignature: null,
+    pendingFixFeedback: null,
     prUrl: null,
     executionSessionId: "s-smoke",
     executionLeaseId: null,
