@@ -13,7 +13,8 @@ import {
   proposeBundleFromChatCore,
   sendChatMessageCore,
 } from "./chat.server";
-import { boundary, type ServerResult } from "./result";
+import { authenticatedBoundary } from "./authBoundary.server";
+import type { ServerResult } from "./result";
 
 const timestamp = z.string().datetime();
 
@@ -88,13 +89,13 @@ const passthrough = (data: unknown): unknown => data;
 export const createChatSession = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
-    boundary(CreateChatSessionInputSchema, data, createChatSessionCore),
+    authenticatedBoundary(CreateChatSessionInputSchema, data, createChatSessionCore),
   );
 
 export const createConsultationSession = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
-    boundary(
+    authenticatedBoundary(
       CreateConsultationSessionInputSchema,
       data,
       createConsultationSessionCore,
@@ -104,7 +105,7 @@ export const createConsultationSession = createServerFn({ method: "POST" })
 export const forkConsultationSession = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
-    boundary(
+    authenticatedBoundary(
       ForkConsultationSessionInputSchema,
       data,
       forkConsultationSessionCore,
@@ -114,17 +115,17 @@ export const forkConsultationSession = createServerFn({ method: "POST" })
 export const getChatSession = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<ChatSessionDTO>> =>
-    boundary(ChatSessionRefSchema, data, getChatSessionCore),
+    authenticatedBoundary(ChatSessionRefSchema, data, getChatSessionCore),
   );
 
 export const sendChatMessage = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
-    boundary(SendChatMessageInputSchema, data, sendChatMessageCore),
+    authenticatedBoundary(SendChatMessageInputSchema, data, sendChatMessageCore),
   );
 
 export const proposeBundleFromChat = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
-    boundary(ChatSessionRefSchema, data, proposeBundleFromChatCore),
+    authenticatedBoundary(ChatSessionRefSchema, data, proposeBundleFromChatCore),
   );

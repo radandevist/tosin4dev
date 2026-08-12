@@ -11,7 +11,8 @@ import {
   listBoardsCore,
   updateBoardChecksCore,
 } from "./boards.server";
-import { boundary, type ServerResult } from "./result";
+import { authenticatedBoundary } from "./authBoundary.server";
+import type { ServerResult } from "./result";
 
 type BoardDoc = Board & { createdAt: string; updatedAt: string };
 
@@ -22,19 +23,19 @@ const passthrough = (data: unknown): unknown => data;
 
 export const listBoards = createServerFn({ method: "GET" }).handler(
   (): Promise<ServerResult<BoardDTO[]>> =>
-    boundary(z.unknown(), undefined, () => listBoardsCore()),
+    authenticatedBoundary(z.unknown(), undefined, () => listBoardsCore()),
 );
 
 export const createBoard = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ id: string }>> =>
-    boundary(BoardSchema, data, createBoardCore),
+    authenticatedBoundary(BoardSchema, data, createBoardCore),
   );
 
 export const getBoard = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<BoardDTO>> =>
-    boundary(z.object({ slug: z.string().min(1) }).strict(), data, (input) =>
+    authenticatedBoundary(z.object({ slug: z.string().min(1) }).strict(), data, (input) =>
       getBoardCore(input.slug),
     ),
   );
@@ -42,5 +43,5 @@ export const getBoard = createServerFn({ method: "GET" })
 export const updateBoardChecks = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<BoardDTO>> =>
-    boundary(UpdateBoardChecksSchema, data, updateBoardChecksCore),
+    authenticatedBoundary(UpdateBoardChecksSchema, data, updateBoardChecksCore),
   );

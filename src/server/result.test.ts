@@ -1,11 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { boundary, ServerResultError, unwrapResult } from "./result";
+
+const auth = vi.hoisted(() => ({ requireSession: vi.fn() }));
+
+vi.mock("./auth.server", () => ({ requireSession: auth.requireSession }));
+
+import {
+  boundary,
+  ServerResultError,
+  unwrapResult,
+} from "./result";
+import { authenticatedBoundary } from "./authBoundary.server";
 
 const Input = z.object({ n: z.number() }).strict();
 
 afterEach(() => {
   vi.restoreAllMocks();
+  auth.requireSession.mockReset();
 });
 
 describe("boundary (server boundary helper)", () => {
@@ -66,6 +77,31 @@ describe("boundary (server boundary helper)", () => {
     }
     // Expected errors are intentional control flow, not incidents to log.
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("authenticatedBoundary", () => {
+  it("returns unauthorized without invoking the core operation", async () => {
+    auth.requireSession.mockRejectedValueOnce(
+      new ServerResultError("unauthorized", "Unlock Tosin4dev to continue"),
+    );
+    const run = vi.fn();
+
+    const result = await authenticatedBoundary(Input, { n: 1 }, run);
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: "unauthorized", message: "Unlock Tosin4dev to continue" },
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("invokes the core operation after a valid session check", async () => {
+    auth.requireSession.mockResolvedValueOnce(undefined);
+
+    await expect(
+      authenticatedBoundary(Input, { n: 2 }, (input) => input.n * 10),
+    ).resolves.toEqual({ ok: true, data: 20 });
   });
 });
 

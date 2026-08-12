@@ -15,7 +15,8 @@ import {
   turnTailCore,
 } from "./runs.server";
 import { continueExecution as continueExecutionCore } from "./supervisor.server";
-import { boundary, type ServerResult } from "./result";
+import { authenticatedBoundary } from "./authBoundary.server";
+import type { ServerResult } from "./result";
 
 const timestamp = z.string().datetime();
 
@@ -111,32 +112,32 @@ const passthrough = (data: unknown): unknown => data;
 export const listRuns = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<RunDTO[]>> =>
-    boundary(ListRunsInputSchema, data, listRunsCore),
+    authenticatedBoundary(ListRunsInputSchema, data, listRunsCore),
   );
 
 export const dispatch = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ runId: string }>> =>
-    boundary(DispatchRunInputSchema, data, dispatchRunCore),
+    authenticatedBoundary(DispatchRunInputSchema, data, dispatchRunCore),
   );
 
 export const logTail = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ text: string }>> =>
-    boundary(LogTailInputSchema, data, logTailCore),
+    authenticatedBoundary(LogTailInputSchema, data, logTailCore),
   );
 
 export const turnTail = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(
     ({ data }): Promise<ServerResult<TurnTailResult>> =>
-      boundary(TurnTailInputSchema, data, turnTailCore),
+      authenticatedBoundary(TurnTailInputSchema, data, turnTailCore),
   );
 
 export const continueExecution = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<void>> =>
-    boundary(ContinueExecutionInputSchema, data, (input) =>
+    authenticatedBoundary(ContinueExecutionInputSchema, data, (input) =>
       continueExecutionCore(input.runId, input.message),
     ),
   );

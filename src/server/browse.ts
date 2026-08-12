@@ -1,7 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { listDirectoriesCore, type DirListing } from "./browse.server";
-import { boundary, type ServerResult } from "./result";
+import { authenticatedBoundary } from "./authBoundary.server";
+import type { ServerResult } from "./result";
 
 // Browser-safe wire contract. A listing is plain {path,parent,entries} — no
 // Node types cross the RPC boundary.
@@ -17,5 +18,5 @@ const passthrough = (data: unknown): unknown => data;
 export const listDirectories = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<DirListing>> =>
-    boundary(BrowseInputSchema, data, listDirectoriesCore),
+    authenticatedBoundary(BrowseInputSchema, data, listDirectoriesCore),
   );

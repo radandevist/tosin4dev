@@ -1,7 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { BundleMemberSchema, ObjectIdString, SpecInputSchema, TicketType, RunnerName } from "../domain/schemas";
-import { boundary, type ServerResult } from "./result";
+import { authenticatedBoundary } from "./authBoundary.server";
+import type { ServerResult } from "./result";
 import {
   dropBundleMemberCore,
   getBundleCore,
@@ -64,29 +65,29 @@ const passthrough = (data: unknown): unknown => data;
 export const getBundle = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<SpecBundleDTO>> =>
-    boundary(BundleRefSchema, data, getBundleCore),
+    authenticatedBoundary(BundleRefSchema, data, getBundleCore),
   );
 
 export const updateBundleMember = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
-    boundary(UpdateBundleMemberInputSchema, data, updateBundleMemberCore),
+    authenticatedBoundary(UpdateBundleMemberInputSchema, data, updateBundleMemberCore),
   );
 
 export const dropBundleMember = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
-    boundary(DropBundleMemberInputSchema, data, dropBundleMemberCore),
+    authenticatedBoundary(DropBundleMemberInputSchema, data, dropBundleMemberCore),
   );
 
 export const reorderBundle = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ ok: true }>> =>
-    boundary(ReorderBundleInputSchema, data, reorderBundleCore),
+    authenticatedBoundary(ReorderBundleInputSchema, data, reorderBundleCore),
   );
 
 export const lockBundle = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ tickets: { ticketId: string; seq: number }[] }>> =>
-    boundary(BundleRefSchema, data, lockBundleCore),
+    authenticatedBoundary(BundleRefSchema, data, lockBundleCore),
   );

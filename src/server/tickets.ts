@@ -9,7 +9,8 @@ import {
   type Ticket,
 } from "../domain/schemas";
 import { PublicEventSchema } from "../domain/stateMachine";
-import { boundary, type ServerResult } from "./result";
+import { authenticatedBoundary } from "./authBoundary.server";
+import type { ServerResult } from "./result";
 import {
   createTicketCore,
   getTicketCore,
@@ -66,7 +67,7 @@ const passthrough = (data: unknown): unknown => data;
 export const listTickets = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<TicketDTO[]>> =>
-    boundary(z.object({ boardId: ObjectIdString }).strict(), data, (input) =>
+    authenticatedBoundary(z.object({ boardId: ObjectIdString }).strict(), data, (input) =>
       listTicketsCore(input.boardId),
     ),
   );
@@ -74,7 +75,7 @@ export const listTickets = createServerFn({ method: "GET" })
 export const getTicket = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<TicketDTO>> =>
-    boundary(
+    authenticatedBoundary(
       z
         .object({ boardId: ObjectIdString, seq: z.number().int().positive() })
         .strict(),
@@ -86,35 +87,35 @@ export const getTicket = createServerFn({ method: "GET" })
 export const dependencyStatus = createServerFn({ method: "GET" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<DependencyStatusDTO>> =>
-    boundary(TicketRefSchema, data, dependencyStatusCore),
+    authenticatedBoundary(TicketRefSchema, data, dependencyStatusCore),
   );
 
 export const createTicket = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ id: string; seq: number }>> =>
-    boundary(CreateTicketInputSchema, data, createTicketCore),
+    authenticatedBoundary(CreateTicketInputSchema, data, createTicketCore),
   );
 
 export const updateSpec = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<void>> =>
-    boundary(UpdateSpecInputSchema, data, updateSpecCore),
+    authenticatedBoundary(UpdateSpecInputSchema, data, updateSpecCore),
   );
 
 export const setRunner = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<void>> =>
-    boundary(SetRunnerInputSchema, data, setRunnerCore),
+    authenticatedBoundary(SetRunnerInputSchema, data, setRunnerCore),
   );
 
 export const transitionTicket = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ status: string }>> =>
-    boundary(TransitionInputSchema, data, transitionTicketCore),
+    authenticatedBoundary(TransitionInputSchema, data, transitionTicketCore),
   );
 
 export const provideInput = createServerFn({ method: "POST" })
   .validator(passthrough)
   .handler(({ data }): Promise<ServerResult<{ status: string }>> =>
-    boundary(ProvideInputInputSchema, data, provideInputCore),
+    authenticatedBoundary(ProvideInputInputSchema, data, provideInputCore),
   );
