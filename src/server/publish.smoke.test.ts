@@ -92,9 +92,11 @@ describe("pushBranch", () => {
         delete process.env.T4D_SHIM_PR_LIST;
         delete process.env.T4D_SHIM_LOG;
       }
-      // The branch still reached origin — the reuse path pushes before it looks.
+      // The reuse path looks the PR up BEFORE pushing: a branch that already
+      // has an open PR is already on the remote, so the publish must not push
+      // it again. A push-first implementation would leave the branch here.
       const { stdout } = await exec("git", ["-C", origin, "branch", "--list", "tosin4dev/run/abc"]);
-      expect(stdout.trim()).toContain("tosin4dev/run/abc");
+      expect(stdout.trim()).not.toContain("tosin4dev/run/abc");
     });
 
     it("creates a PR when the shim reports no existing PR", async () => {

@@ -304,4 +304,83 @@ describe("dispatchRun acceptance-check preflight", () => {
     await rm(ghDir, { recursive: true, force: true });
     process.env.PATH = ORIGINAL_PATH;
   });
+
+  it("refuses an execute run with remote_unreachable before anything is claimed", async () => {
+    // `git remote get-url origin` reads local config only — it cannot see a
+    // dead network or an unreachable host. The preflight must probe the remote
+    // itself, so this fixture has an origin that resolves but cannot be
+    // reached: get-url passes, the reachability probe fails, and dispatch must
+    // stop before the agent starts.
+    const dir = await mkdtemp(join(tmpdir(), "t4d-unreachable-"));
+    execFileSync("git", ["init", "-b", "develop", dir]);
+    execFileSync("git", [
+      "-C", dir, "remote", "add", "origin",
+      join(tmpdir(), "t4d-origin-that-does-not-exist"),
+    ]);
+    const ghDir = await mkdtemp(join(tmpdir(), "t4d-gh-u-"));
+    try {
+      await writeFile(
+        join(ghDir, "gh"),
+        '#!/bin/sh\necho "shim: logged in"\nexit 0\n',
+        { mode: 0o755 },
+      );
+    } catch (err) {
+      await rm(ghDir, { recursive: true, force: true });
+      throw err;
+    }
+    process.env.PATH = stubPath(ghDir);
+    const database = await db();
+    const boardId = new ObjectId();
+    const at = "2026-08-07T00:00:00.000Z";
+    await database.collection("boards").insertOne({
+      _id: boardId,
+      slug: `unreachable-${process.pid}-${Date.now()}`,
+      name: "Unreachable Origin",
+      repoPath: dir,
+      defaultBaseBranch: "develop",
+      checks: [{ key: "ok", label: "ok", command: ["true"], timeoutMs: 10_000 }],
+      createdAt: at,
+      updatedAt: at,
+    });
+    const ticketId = new ObjectId();
+    await database.collection("tickets").insertOne({
+      _id: ticketId,
+      boardId: boardId.toString(),
+      seq: 4,
+      title: "t",
+      type: "implement",
+      status: "approved",
+      runner: "claude",
+      activeRunId: null,
+      dependsOn: [],
+      activity: [],
+      spec: {
+        intent: "do the thing",
+        scope: "",
+        nonGoals: "",
+        acceptance: ["it works"],
+        links: [],
+        risk: "low",
+        approvedAt: at,
+        approvedBy: "radan",
+      },
+      createdAt: at,
+      updatedAt: at,
+    });
+
+    await expect(dispatchRun(ticketId.toString(), "execute")).rejects.toMatchObject({
+      code: "remote_unreachable",
+    });
+
+    // The preflight refuses before anything is claimed or a run is created.
+    const ticket = await database
+      .collection("tickets")
+      .findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.activeRunId).toBeNull();
+    expect(ticket?.status).toBe("approved");
+    expect(await database.collection("runs").countDocuments()).toBe(0);
+    await rm(dir, { recursive: true, force: true });
+    await rm(ghDir, { recursive: true, force: true });
+    process.env.PATH = ORIGINAL_PATH;
+  });
 });
