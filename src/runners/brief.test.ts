@@ -120,18 +120,19 @@ describe("buildPrompt", () => {
   });
 
   it("pins the spec_draft prompt's JSON keys to DraftedSpecSchema", () => {
-    const specPath = "/r/spec.json";
     const prompt = buildPrompt({
       ticket,
       board,
       workDir: "/unused",
       phase: "spec_draft",
-      specPath,
     });
 
-    // The write target must reach the prompt so the runner actually produces
-    // the file applyDraftedSpec reads.
-    expect(prompt).toContain(specPath);
+    // The stdout contract must reach the prompt: the runner runs read-only,
+    // so it prints the draft between markers and Tosin-owned code writes the
+    // spec.json applyDraftedSpec reads.
+    expect(prompt).toContain("SPEC_JSON_START");
+    expect(prompt).toContain("SPEC_JSON_END");
+    expect(prompt).not.toContain("write this JSON to");
 
     // The prompt's inline JSON template and DraftedSpecSchema must agree:
     // a field renamed on either side alone makes .strict() reject every real
