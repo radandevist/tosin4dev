@@ -19,6 +19,10 @@ export const AuthSessionSchema = z
   })
   .strict();
 
+function configuredSecret(): string | null {
+  return process.env.TOSIN4DEV_AUTH_SECRET?.trim() || null;
+}
+
 function hash(value: string): Buffer {
   return createHash("sha256").update(value).digest();
 }
@@ -91,6 +95,9 @@ export async function issueSession(): Promise<void> {
 }
 
 export async function requireSession(): Promise<void> {
+  if (!configuredSecret()) {
+    throw new ServerResultError("unauthorized", "Unlock Tosin4dev to continue");
+  }
   const authorized = await isRequestAuthorized(getRequestHeader("cookie"));
   if (!authorized) {
     throw new ServerResultError("unauthorized", "Unlock Tosin4dev to continue");
@@ -110,8 +117,20 @@ export async function revokeCurrentSession(): Promise<void> {
 }
 
 export async function authenticateSecret(candidate: string): Promise<boolean> {
-  const configured = process.env.TOSIN4DEV_AUTH_SECRET?.trim();
+  const configured = configuredSecret();
   if (!configured) return false;
 
   return timingSafeEqual(hash(candidate), hash(configured));
+}
+
+export async function loginCore({
+  secret,
+}: {
+  secret: string;
+}): Promise<{ unlocked: true }> {
+  if (!(await authenticateSecret(secret))) {
+    throw new ServerResultError("unauthorized", "Unlock Tosin4dev to continue");
+  }
+  await issueSession();
+  return { unlocked: true };
 }

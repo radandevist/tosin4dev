@@ -19,6 +19,10 @@ just db-up
 just dev
 ```
 
+Before starting the console, set a long random `TOSIN4DEV_AUTH_SECRET` in
+`.env`. The browser will ask for it once and receive a 12-hour local session.
+For example: `openssl rand -base64 32`.
+
 Open <http://127.0.0.1:3141>.
 
 Create a board with the absolute `repoPath` of the Git repository Tosin4dev should operate on. Set its default base branch to the branch new execution worktrees should start from, such as `main` or `develop`.
@@ -39,7 +43,9 @@ Runner execution is local. The selected CLI works inside the isolated worktree a
 
 ## Configuration
 
-`.env.example` configures the local MongoDB connection. Set `DISCORD_WEBHOOK_URL` in `.env` to receive optional blocked and review-ready notifications; leave it blank to disable notifications.
+`.env.example` configures the local MongoDB connection and the required
+`TOSIN4DEV_AUTH_SECRET`. Set `DISCORD_WEBHOOK_URL` in `.env` to receive optional
+blocked and review-ready notifications; leave it blank to disable notifications.
 
 ## Useful commands
 

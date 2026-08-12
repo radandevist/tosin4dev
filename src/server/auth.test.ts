@@ -19,7 +19,9 @@ import {
   issueSession,
   isSessionValid,
   isRequestAuthorized,
+  loginCore,
   readSessionToken,
+  requireSession,
   revokeSession,
   sessionCookie,
 } from "./auth.server";
@@ -46,6 +48,12 @@ afterAll(async () => {
 describe("local auth secret", () => {
   it("rejects a missing configured secret", async () => {
     delete process.env.TOSIN4DEV_AUTH_SECRET;
+
+    await expect(authenticateSecret("candidate")).resolves.toBe(false);
+  });
+
+  it("rejects a whitespace-only configured secret", async () => {
+    process.env.TOSIN4DEV_AUTH_SECRET = "   ";
 
     await expect(authenticateSecret("candidate")).resolves.toBe(false);
   });
@@ -147,5 +155,27 @@ describe("local auth secret", () => {
     });
     expect(stored).not.toBeNull();
     expect(JSON.stringify(stored)).not.toContain(token ?? "");
+  });
+
+  it("unlocks only when the submitted secret is valid", async () => {
+    process.env.TOSIN4DEV_AUTH_SECRET = "correct horse battery staple";
+
+    await expect(loginCore({ secret: "wrong secret" })).rejects.toMatchObject({
+      code: "unauthorized",
+    });
+    await expect(
+      loginCore({ secret: "correct horse battery staple" }),
+    ).resolves.toEqual({ unlocked: true });
+  });
+
+  it("fails closed when the configured secret is removed", async () => {
+    process.env.TOSIN4DEV_AUTH_SECRET = "correct horse battery staple";
+    await createSession("configured-then-removed-token");
+    runtime.cookie = "tosin4dev_session=configured-then-removed-token";
+    delete process.env.TOSIN4DEV_AUTH_SECRET;
+
+    await expect(requireSession()).rejects.toMatchObject({
+      code: "unauthorized",
+    });
   });
 });
