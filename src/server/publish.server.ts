@@ -84,7 +84,19 @@ export async function preflightPublish(repoPath: string): Promise<void> {
 // Plain push. Never --force, never --force-with-lease: a rejected push is
 // information, and this branch is namespaced per run so a rejection means
 // something genuinely unexpected happened.
-export async function pushBranch(workDir: string, branch: string): Promise<void> {
+export async function pushBranch(
+  workDir: string,
+  branch: string,
+  commitSha?: string,
+): Promise<void> {
+  if (commitSha) {
+    await execFileAsync(
+      "git",
+      ["-C", workDir, "push", "-u", "origin", `${commitSha}:refs/heads/${branch}`],
+      { encoding: "utf8" },
+    );
+    return;
+  }
   await execFileAsync("git", ["-C", workDir, "push", "-u", "origin", branch], {
     encoding: "utf8",
   });
@@ -170,11 +182,12 @@ export async function publishRun(input: {
   workDir: string;
   branch: string;
   bodyFile: string;
+  commitSha: string;
 }): Promise<{ prUrl: string }> {
   assertPublishable(input.board, input.branch);
+  await pushBranch(input.workDir, input.branch, input.commitSha);
   const existing = await existingPrUrl(input.workDir, input.branch);
   if (existing !== null) return { prUrl: existing };
-  await pushBranch(input.workDir, input.branch);
   const { stdout } = await execFileAsync(
     "gh",
     draftPrArgs({

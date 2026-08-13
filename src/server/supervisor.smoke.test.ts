@@ -24,7 +24,7 @@ process.env.MONGODB_URI = `mongodb://127.0.0.1:27017/${TEST_DB}`;
 process.env.DISCORD_WEBHOOK_URL = "";
 
 const { db, closeDb, ObjectId } = await import("./db");
-const { dispatchRun, recoverOrphans } = await import("./supervisor.server");
+const { continueExecution, dispatchRun, recoverOrphans } = await import("./supervisor.server");
 
 let database: Db;
 let boards: Collection<BoardDoc>;
@@ -297,6 +297,37 @@ describe("supervisor smoke", () => {
     expect(ticket?.spec.approvedAt).toBeNull();
   });
 
+  it("records the offending DraftedSpec field for schema-invalid Codex stdout", async () => {
+    await writeRunner(
+      [
+        "runner output",
+        "## SUMMARY",
+        "draft plan",
+        "SPEC_JSON_START",
+        JSON.stringify({
+          intent: "confetti from codex",
+          approvedBy: "radan",
+          acceptance: ["fires once"],
+        }),
+        "SPEC_JSON_END",
+      ],
+      0,
+      false,
+      "codex",
+    );
+    const ticketId = await insertTicket("inbox", 12, null, "codex");
+    const { runId } = await dispatchRun(ticketId, "spec_draft");
+    await waitForRun(runId, "succeeded");
+    const ticket = await tickets.findOne({ _id: new ObjectId(ticketId) });
+    expect(ticket?.status).toBe("inbox");
+    expect(ticket?.activity).toContainEqual(
+      expect.objectContaining({
+        kind: "spec",
+        message: expect.stringContaining("invalid drafted spec field: approvedBy"),
+      }),
+    );
+  });
+
   it("keeps an inbox ticket unchanged when spec drafting fails", async () => {
     await writeRunner(["draft failed", "SUMMARY", "draft failure"], 9);
     const ticketId = await insertTicket("inbox", 8);
@@ -307,6 +338,68 @@ describe("supervisor smoke", () => {
     expect(run.exitCode).toBe(9);
     expect(ticket?.status).toBe("inbox");
     expect(ticket?.activeRunId).toBeNull();
+  });
+
+  it("restores pending verification feedback when continue execution fails before spawn confirmation", async () => {
+    const waitingTicketId = await insertTicket("needs_input", 13);
+    const pending = {
+      attempts: 2,
+      signature: "sig-13",
+      message: "retry the checks",
+    };
+    const waitingRunId = new ObjectId();
+    const at = timestamp();
+    await tickets.updateOne(
+      { _id: new ObjectId(waitingTicketId) },
+      { $set: { activeRunId: waitingRunId.toString() } },
+    );
+    await runs.insertOne({
+      _id: waitingRunId,
+      ticketId: waitingTicketId,
+      boardId,
+      runner: "claude",
+      phase: "execute",
+      status: "awaiting_input",
+      workDir: repo,
+      promptFile: join(repo, "pending-prompt.md"),
+      logFile: join(repo, "pending-output.log"),
+      stderrFile: null,
+      pid: null,
+      exitCode: null,
+      summary: null,
+      branch: null,
+      baseSha: null,
+      verdict: null,
+      failureKind: null,
+      fixAttempts: pending.attempts,
+      lastFixSignature: null,
+      pendingFixFeedback: pending,
+      prUrl: null,
+      executionSessionId: "verification-session",
+      executionLeaseId: null,
+      executionLeaseExpiresAt: null,
+      parkedBy: "question" as const,
+      awaitingQuestion: "what is next?",
+      exchanges: [],
+      turns: [],
+      queuedAt: at,
+      startedAt: at,
+      finishedAt: null,
+    });
+    process.env.PATH = binDirectory;
+    await rm(join(binDirectory, "claude"), { force: true });
+    await expect(continueExecution(waitingRunId.toString(), "still retrying")).rejects.toMatchObject({
+      message: expect.stringContaining("run could not be continued"),
+    });
+    const restoredRun = await runs.findOne({ _id: waitingRunId });
+    const restoredTicket = await tickets.findOne({
+      _id: new ObjectId(waitingTicketId),
+    });
+    expect(restoredRun?.status).toBe("awaiting_input");
+    expect(restoredRun?.executionLeaseId).toBeNull();
+    expect(restoredRun?.pendingFixFeedback).toMatchObject(pending);
+    expect(restoredTicket?.status).toBe("needs_input");
+    expect(restoredTicket?.activeRunId).toBe(waitingRunId.toString());
   });
 
   it("accepts review fixes only from the already-running state", async () => {

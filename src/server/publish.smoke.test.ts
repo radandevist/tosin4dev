@@ -69,6 +69,11 @@ describe("pushBranch", () => {
     });
 
     it("reuses an existing PR for the head and does not call pr create", async () => {
+      const verifiedCommit = (
+        await exec("git", ["-C", clone, "rev-parse", "tosin4dev/run/abc"], {
+          encoding: "utf8",
+        })
+      ).stdout.trim();
       process.env.T4D_SHIM_PR_LIST = '[{"url":"https://github.com/tosin4dev/publyapp/pull/7"}]';
       // The shim logs every invocation to T4D_SHIM_LOG, so this test can prove
       // pr create never ran — the URL alone cannot see an extra call (an
@@ -82,6 +87,7 @@ describe("pushBranch", () => {
           title: "#1 confetti",
           workDir: clone,
           branch: "tosin4dev/run/abc",
+          commitSha: verifiedCommit,
           bodyFile: join(clone, "body.md"),
         });
         expect(result.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/7");
@@ -92,14 +98,24 @@ describe("pushBranch", () => {
         delete process.env.T4D_SHIM_PR_LIST;
         delete process.env.T4D_SHIM_LOG;
       }
-      // The reuse path looks the PR up BEFORE pushing: a branch that already
-      // has an open PR is already on the remote, so the publish must not push
-      // it again. A push-first implementation would leave the branch here.
+      // Existing PRs are still idempotent, but the verified SHA must still be
+      // pushed before publish to keep the PR tip aligned.
       const { stdout } = await exec("git", ["-C", origin, "branch", "--list", "tosin4dev/run/abc"]);
-      expect(stdout.trim()).not.toContain("tosin4dev/run/abc");
+      expect(stdout.trim()).toContain("tosin4dev/run/abc");
+      const { stdout: remoteTip } = await exec(
+        "git",
+        ["-C", origin, "rev-parse", "tosin4dev/run/abc"],
+        { encoding: "utf8" },
+      );
+      expect(remoteTip.trim()).toBe(verifiedCommit);
     });
 
     it("creates a PR when the shim reports no existing PR", async () => {
+      const verifiedCommit = (
+        await exec("git", ["-C", clone, "rev-parse", "tosin4dev/run/abc"], {
+          encoding: "utf8",
+        })
+      ).stdout.trim();
       // Production writes the body file before gh pr create runs; the shim now
       // refuses a create whose --body-file is missing or empty, so the test
       // has to mirror the real ordering.
@@ -109,9 +125,38 @@ describe("pushBranch", () => {
         title: "#1 confetti",
         workDir: clone,
         branch: "tosin4dev/run/abc",
+        commitSha: verifiedCommit,
         bodyFile: join(clone, "body.md"),
       });
       expect(result.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/1");
+    });
+
+    it("pushes exactly the commit passed from verification even after later local moves", async () => {
+      const verifiedCommit = (
+        await exec("git", ["-C", clone, "rev-parse", "tosin4dev/run/abc"], {
+          encoding: "utf8",
+        })
+      ).stdout.trim();
+      await writeFile(join(clone, "f.txt"), "post-verify");
+      await exec("git", ["-C", clone, "add", "f.txt"]);
+      await exec("git", ["-C", clone, "commit", "-m", "extra work"]);
+      await writeFile(join(clone, "body.md"), "# PR body\n");
+
+      const result = await publishRun({
+        board: BOARD,
+        title: "#1 confetti",
+        workDir: clone,
+        branch: "tosin4dev/run/abc",
+        commitSha: verifiedCommit,
+        bodyFile: join(clone, "body.md"),
+      });
+      expect(result.prUrl).toBe("https://github.com/tosin4dev/publyapp/pull/1");
+      const { stdout: remoteTip } = await exec(
+        "git",
+        ["-C", origin, "rev-parse", "tosin4dev/run/abc"],
+        { encoding: "utf8" },
+      );
+      expect(remoteTip.trim()).toBe(verifiedCommit);
     });
 
     it("fails closed when the gh shim sees a pr create without --draft", async () => {
