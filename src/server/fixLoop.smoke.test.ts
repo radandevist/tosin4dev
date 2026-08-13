@@ -177,6 +177,8 @@ async function installRunnerStub(dir: string): Promise<void> {
     stub,
     [
       "#!/usr/bin/env bash",
+      "if [ -n \"$T4D_SPAWN_MARKER\" ]; then printf '%s\\n' spawned >> \"$T4D_SPAWN_MARKER\"; fi",
+      "if [ -n \"$T4D_STUB_SLEEP\" ]; then sleep \"$T4D_STUB_SLEEP\"; fi",
       // A continue turn writes the outcome the supervisor reads back as the
       // turn's result. The only required shape is a valid RunOutcome; the
       // supervisor resolves it against the runDir captured in T4D_OUTCOME_PATH,
@@ -901,7 +903,7 @@ describe("fix-loop verification tail", () => {
     expect(resumed?.lastFixSignature).toBeTruthy();
   });
 
-  it("rejects resumed feedback when the atomic turn delivery CAS misses", async () => {
+  it("fails closed when the pre-spawn feedback claim misses", async () => {
     const { runId, ticketId } = await seedBlockedPathFixture();
     await applyRunCompletion(
       runId,
@@ -932,26 +934,121 @@ describe("fix-loop verification tail", () => {
     const stubDir = await mkdtemp(join(tmpdir(), "t4d-fixcas-"));
     await installRunnerStub(stubDir);
     process.env.PATH = stubPath(stubDir);
+    const spawnMarker = join(runDir, "preclaim-spawned.log");
+    await rm(spawnMarker, { force: true });
+    process.env.T4D_SPAWN_MARKER = spawnMarker;
     const originalUpdateOne = Collection.prototype.updateOne;
     let sabotaged = false;
+    let sawClaim = false;
+    let sawConsume = false;
+    const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
+      async function (this: Collection, filter, update, options) {
+        const set = (update as { $set?: Record<string, unknown> }).$set;
+        const isPreSpawnClaim =
+          !sabotaged &&
+          this.collectionName === "runs" &&
+          String((filter as Record<string, unknown>)?._id) === runId &&
+          set?.status === "running" &&
+          typeof set.executionLeaseId === "string" &&
+          !!(filter as Record<string, unknown>)["pendingFixFeedback.signature"];
+        if (isPreSpawnClaim) {
+          sabotaged = true;
+          sawClaim = true;
+          sawConsume =
+            set.pendingFixFeedback === null &&
+            set.fixAttempts === parked?.pendingFixFeedback?.attempts! + 1 &&
+            set.lastFixSignature === parked?.pendingFixFeedback?.signature;
+          // Return a real CAS miss without changing the parked document. The
+          // child must not be started when this pre-spawn claim fails.
+          return {
+            acknowledged: true,
+            matchedCount: 0,
+            modifiedCount: 0,
+            upsertedCount: 0,
+            upsertedId: null,
+          } as never;
+        }
+        return originalUpdateOne.call(this, filter, update, options);
+      },
+    );
+    try {
+      const { continueExecution } = await import("./supervisor.server");
+      await expect(
+        continueExecution(runId, "resume the execution"),
+      ).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      spy.mockRestore();
+      delete process.env.T4D_SPAWN_MARKER;
+      await rm(stubDir, { recursive: true, force: true });
+      process.env.PATH = stubPath(binDirectory);
+    }
+
+    const after = await database
+      .collection("runs")
+      .findOne({ _id: new ObjectId(runId) });
+    expect(sabotaged).toBe(true);
+    expect(sawClaim).toBe(true);
+    expect(sawConsume).toBe(true);
+    expect(existsSync(spawnMarker)).toBe(false);
+    expect(after?.status).toBe("awaiting_input");
+    expect(after?.pendingFixFeedback).toBeTruthy();
+    expect(after?.pendingFixFeedback?.signature).toBe(
+      parked?.pendingFixFeedback?.signature,
+    );
+    expect(after?.turns).toHaveLength(0);
+  });
+
+  it("consumes feedback before spawn and never re-delivers after a post-spawn turn failure", async () => {
+    const { runId, ticketId } = await seedBlockedPathFixture();
+    await applyRunCompletion(
+      runId,
+      ticketId,
+      "execute",
+      0,
+      "out\\n",
+      logFile,
+      null,
+      board,
+      runDir,
+      new ObjectId().toString(),
+    );
+
+    const database = await db();
+    const parked = await database
+      .collection("runs")
+      .findOne({ _id: new ObjectId(runId) });
+    expect(parked?.pendingFixFeedback).toBeTruthy();
+    await database.collection("boards").insertOne({
+      _id: new ObjectId(parked?.boardId),
+      ...board,
+      slug: `${board.slug}-ordering`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const stubDir = await mkdtemp(join(tmpdir(), "t4d-fixordering-"));
+    await installRunnerStub(stubDir);
+    process.env.PATH = stubPath(stubDir);
+    process.env.T4D_STUB_SLEEP = "0.2";
+    const originalUpdateOne = Collection.prototype.updateOne;
+    let failTurnWrite = true;
     const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(
       async function (this: Collection, filter, update, options) {
         const push = (update as { $push?: Record<string, unknown> }).$push;
         const isTurnWrite =
-          !sabotaged &&
+          failTurnWrite &&
           this.collectionName === "runs" &&
           String((filter as Record<string, unknown>)?._id) === runId &&
           !!push?.turns;
         if (isTurnWrite) {
-          sabotaged = true;
-          // Change the CAS key between the child send and the durable turn
-          // claim. The delivery must be rejected without clearing feedback.
-          await originalUpdateOne.call(
-            this,
-            { _id: new ObjectId(runId) },
-            { $set: { fixAttempts: 99 } },
-            undefined,
-          );
+          failTurnWrite = false;
+          return {
+            acknowledged: true,
+            matchedCount: 0,
+            modifiedCount: 0,
+            upsertedCount: 0,
+            upsertedId: null,
+          } as never;
         }
         return originalUpdateOne.call(this, filter, update, options);
       },
@@ -961,22 +1058,37 @@ describe("fix-loop verification tail", () => {
       await expect(
         continueExecution(runId, "resume the execution"),
       ).rejects.toMatchObject({ code: "spawn_failed" });
+
+      const afterFirst = await database
+        .collection("runs")
+        .findOne({ _id: new ObjectId(runId) });
+      expect(afterFirst?.status).toBe("awaiting_input");
+      expect(afterFirst?.pendingFixFeedback).toBeNull();
+      expect(afterFirst?.fixAttempts).toBe(1);
+      const deliveredPrompt = await readFile(parked?.promptFile ?? "", "utf8");
+      expect(deliveredPrompt).toContain("acceptance checks");
+
+      // The first child was already live when the turn-row write failed. A
+      // retry may spawn a fresh turn, but it must not carry the old feedback.
+      await continueExecution(runId, "try again");
+      await pollSettledContinue(runId);
+      const retried = await database
+        .collection("runs")
+        .findOne({ _id: new ObjectId(runId) });
+      expect(
+        retried?.turns?.filter(
+          (turn: { kind?: string }) => turn.kind === "continue",
+        ),
+      ).toHaveLength(1);
     } finally {
       spy.mockRestore();
+      delete process.env.T4D_STUB_SLEEP;
       await rm(stubDir, { recursive: true, force: true });
       process.env.PATH = stubPath(binDirectory);
     }
 
-    const after = await database
-      .collection("runs")
-      .findOne({ _id: new ObjectId(runId) });
-    expect(sabotaged).toBe(true);
-    expect(after?.status).toBe("awaiting_input");
-    expect(after?.pendingFixFeedback).toBeTruthy();
-    expect(after?.pendingFixFeedback?.signature).toBe(
-      parked?.pendingFixFeedback?.signature,
-    );
-    expect(after?.turns).toHaveLength(0);
+    const retriedPrompt = await readFile(parked?.promptFile ?? "", "utf8");
+    expect(retriedPrompt).not.toContain("acceptance checks");
   });
 
   it("keeps pending feedback when the resumed send fails before its turn claim", async () => {
