@@ -42,7 +42,10 @@ import { claudeAdapter } from "../runners/claude";
 import { codexAdapter } from "../runners/codex";
 import type { RunnerAdapter, RunnerBrief } from "../runners/types";
 import { db, ObjectId } from "./db";
-import { captureDraftedSpec, readDraftedSpec } from "./draftedSpec.server";
+import {
+  extractDraftedSpecBlock,
+  readDraftedSpec,
+} from "./draftedSpec.server";
 import { notify } from "./notify.server";
 import { parseSessionId, readOutcome } from "./outcome.server";
 import { preflightPublish, publishRun } from "./publish.server";
@@ -533,6 +536,7 @@ export async function applyDraftedSpec(
   ticketId: string,
   runDir: string,
   at: string,
+  failureReason?: string | null,
 ): Promise<void> {
   const draft = await readDraftedSpec(runDir);
   if (!draft) {
@@ -540,10 +544,17 @@ export async function applyDraftedSpec(
     // apply, so record activity naming the cause. No status/spec change — the
     // ticket stays in inbox and the whole point is that a bad draft writes
     // nothing to the spec.
+    const reasonSuffix = failureReason ? ` (${failureReason})` : "";
     const database = await db();
     await database.collection<TicketDoc>("tickets").updateOne(
       { _id: new ObjectId(ticketId) },
-      { $push: pushActivity("spec", "spec draft produced no usable spec.json", at) },
+      {
+        $push: pushActivity(
+          "spec",
+          `spec draft produced no usable spec.json${reasonSuffix}`,
+          at,
+        ),
+      },
     );
     return;
   }
@@ -882,8 +893,14 @@ export async function applyRunCompletion(
       );
     }
     if (succeeded) {
-      await captureDraftedSpec(stdout, runDir);
-      await applyDraftedSpec(ticketId, runDir, at);
+      const parsedDraft = extractDraftedSpecBlock(stdout);
+      if (parsedDraft.draft) {
+        await writeFile(
+          `${runDir}/spec.json`,
+          JSON.stringify(parsedDraft.draft, null, 2),
+        );
+      }
+      await applyDraftedSpec(ticketId, runDir, at, parsedDraft.reason);
     }
     return succeeded ? "completed" : "failed";
   }
@@ -1114,6 +1131,7 @@ export async function applyRunCompletion(
           title: `#${ticket.seq} ${ticket.title}`,
           workDir: run.workDir,
           branch: run.branch,
+          commitSha: result.commitSha,
           bodyFile,
         });
         prUrl = published.prUrl;
@@ -2656,6 +2674,22 @@ async function sendContinueTurn(opts: {
     if (child && child.exitCode === null) {
       child.kill("SIGKILL");
       await runningChild?.exited.catch(() => undefined);
+    }
+    if (pendingFeedback && spawnState && !spawnState.confirmed) {
+      try {
+        await restoreParkedResume(
+          database,
+          run,
+          runId,
+          run.awaitingQuestion,
+          pendingFeedback,
+        );
+      } catch (compensationError) {
+        console.error(
+          `Failed to restore run ${runId} after continue pre-spawn CAS:`,
+          compensationError,
+        );
+      }
     }
     throw new ServerResultError("spawn_failed", "run could not be continued");
   }

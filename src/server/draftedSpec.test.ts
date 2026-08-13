@@ -6,6 +6,7 @@ import {
   SPEC_BLOCK_CAP,
   captureDraftedSpec,
   readDraftedSpec,
+  extractDraftedSpecBlock,
 } from "./draftedSpec.server";
 
 describe("readDraftedSpec", () => {
@@ -126,6 +127,16 @@ describe("readDraftedSpec", () => {
       ].join("\n");
       expect(await captureDraftedSpec(stdout, runDir)).toBeNull();
       expect(await readDraftedSpec(runDir)).toBeNull();
+    });
+
+    it("returns the offending zod field when stdout violates the DraftedSpec schema", async () => {
+      const parsed = extractDraftedSpecBlock([
+        "SPEC_JSON_START",
+        JSON.stringify({ approvedBy: "radan", intent: "do it", acceptance: ["ok"] }),
+        "SPEC_JSON_END",
+      ].join("\n"));
+      expect(parsed.draft).toBeNull();
+      expect(parsed.reason).toMatch(/invalid drafted spec field: approvedBy/);
     });
 
     it("writes nothing when the block smuggles an approval field", async () => {

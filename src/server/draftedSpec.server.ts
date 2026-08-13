@@ -11,10 +11,15 @@ export const SPEC_JSON_START = "SPEC_JSON_START";
 export const SPEC_JSON_END = "SPEC_JSON_END";
 export const SPEC_BLOCK_CAP = 32_768;
 
+export type DraftedSpecParseResult = {
+  draft: DraftedSpec | null;
+  reason: string | null;
+};
+
 // Extract the bounded structured spec block from a runner's stdout. Fail-closed
 // like readDraftedSpec: no block, an oversized block, unparseable JSON or a
 // schema violation all yield null, so the caller never applies a partial spec.
-export function extractDraftedSpecBlock(stdout: string): DraftedSpec | null {
+export function extractDraftedSpecBlock(stdout: string): DraftedSpecParseResult {
   const lines = stdout.replace(/\r\n?/g, "\n").split("\n");
   // The prompt says the markers occupy their own lines. Requiring exact lines
   // prevents prose or a JSON string that merely mentions a marker from being
@@ -24,19 +29,41 @@ export function extractDraftedSpecBlock(stdout: string): DraftedSpec | null {
   for (let index = 0; index < lines.length; index++) {
     if (lines[index] === SPEC_JSON_START) startLine = index;
   }
-  if (startLine < 0) return null;
+  if (startLine < 0) {
+    return { draft: null, reason: "missing draft start marker" };
+  }
   const endLine = lines.indexOf(SPEC_JSON_END, startLine + 1);
-  if (endLine < 0) return null;
+  if (endLine < 0) {
+    return { draft: null, reason: "missing draft end marker" };
+  }
   const block = lines.slice(startLine + 1, endLine).join("\n").trim();
-  if (block.length === 0 || block.length > SPEC_BLOCK_CAP) return null;
+  if (block.length === 0 || block.length > SPEC_BLOCK_CAP) {
+    return { draft: null, reason: "draft block empty or too large" };
+  }
   let decoded: unknown;
   try {
     decoded = JSON.parse(block);
   } catch {
-    return null;
+    return { draft: null, reason: "invalid draft JSON" };
   }
   const parsed = DraftedSpecSchema.safeParse(decoded);
-  return parsed.success ? parsed.data : null;
+  if (parsed.success) return { draft: parsed.data, reason: null };
+  const firstIssue = parsed.error.issues[0];
+  const field = (() => {
+    const byPath = firstIssue?.path?.join(".");
+    if (byPath && byPath.length > 0) return byPath;
+    if (firstIssue?.code === "unrecognized_keys") {
+      const unrecognized = (firstIssue as { keys?: unknown[] }).keys;
+      if (Array.isArray(unrecognized) && typeof unrecognized[0] === "string") {
+        return unrecognized[0];
+      }
+    }
+    return "spec";
+  })();
+  return {
+    draft: null,
+    reason: `invalid drafted spec field: ${field}`,
+  };
 }
 
 // Parse a runner's bounded structured stdout and write the spec.json artifact
@@ -45,7 +72,7 @@ export async function captureDraftedSpec(
   stdout: string,
   runDir: string,
 ): Promise<DraftedSpec | null> {
-  const draft = extractDraftedSpecBlock(stdout);
+  const { draft } = extractDraftedSpecBlock(stdout);
   if (!draft) return null;
   await writeFile(`${runDir}/spec.json`, JSON.stringify(draft, null, 2));
   return draft;
