@@ -1442,6 +1442,7 @@ async function restoreParkedResume(
   run: RunDoc,
   runId: string,
   question: string | null,
+  pendingFeedback?: PendingFixFeedback,
 ): Promise<void> {
   const at = now();
   const runs = database.collection<RunDoc>("runs");
@@ -1455,6 +1456,13 @@ async function restoreParkedResume(
     awaitingQuestion: question,
     pid: null,
     startedAt: run.startedAt,
+    ...(pendingFeedback !== undefined
+      ? {
+          pendingFixFeedback: pendingFeedback,
+          fixAttempts: pendingFeedback.attempts,
+          lastFixSignature: run.lastFixSignature ?? null,
+        }
+      : {}),
   };
   // Restore the parked status and its open row in one document write. A
   // concurrent retry must never observe awaiting_input without an open
@@ -1574,6 +1582,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
 
   let child: ChildProcess | undefined;
   let runningChild: RunningChild | undefined;
+  let spawnConfirmed = false;
   const answeredAt = now();
   const exchanges = run.exchanges ?? [];
   const deliveryCas = pendingFeedbackDeliveryCas(pendingFeedback);
@@ -1616,6 +1625,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
         $set: {
           status: "running",
           startedAt: answeredAt,
+          ...(deliveryCas.set ?? {}),
           ...(openIndex >= 0
             ? {
                 [`exchanges.${openIndex}.answer`]: answer,
@@ -1717,6 +1727,7 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
       runningChild.exited,
     ]).catch(() => undefined);
     await waitForSpawn(spawnedChild);
+    spawnConfirmed = true;
 
     const runStarted = await runs.updateOne(
       { _id: new ObjectId(runId), status: "running" },
@@ -1760,11 +1771,9 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
       {
         _id: new ObjectId(runId),
         status: "running",
-        ...deliveryCas.filter,
       } as Filter<RunDoc>,
       {
         $push: { turns: { $each: [resumeTurn], $slice: -TURN_CAP } },
-        ...(deliveryCas.set ? { $set: deliveryCas.set } : {}),
       } as UpdateFilter<RunDoc>,
     );
     if (turnRecorded.matchedCount === 0) {
@@ -1790,7 +1799,13 @@ export async function resumeRun(runId: string, answer: string): Promise<void> {
       await runningChild?.exited.catch(() => undefined);
     }
     try {
-      await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+      await restoreParkedResume(
+        database,
+        run,
+        runId,
+        run.awaitingQuestion,
+        spawnConfirmed ? undefined : (pendingFeedback ?? undefined),
+      );
     } catch (compensationError) {
       console.error(
         `Failed to restore parked run ${runId} after spawn failure:`,
@@ -2184,10 +2199,11 @@ export async function deliverFixFeedback(
   return { decision, signature, attempts: run.fixAttempts };
 }
 
-// Build the CAS folded into a resumed turn's durable turn write. Pending
-// feedback is acknowledged exactly once with the turn row: either this update
-// matches both the pending signature/counter and appends the turn, or neither
-// happens. In particular, a zero-match cannot be logged as an accepted send.
+// Build the CAS folded into the pre-spawn run claim. Pending feedback is
+// acknowledged exactly once with the execution lease: either this update
+// matches the pending signature/counter and consumes it before spawn, or no
+// child is started. In particular, a zero-match cannot be logged as an accepted
+// send.
 function pendingFeedbackDeliveryCas(
   pending: PendingFixFeedback | null | undefined,
 ): { filter: Record<string, unknown>; set?: Record<string, unknown> } {
@@ -2462,6 +2478,7 @@ async function sendContinueTurn(opts: {
   claimSet: Record<string, unknown>;
   claimPush?: PushOperator<RunDoc>;
   pendingFeedback?: PendingFixFeedback | null;
+  spawnState?: { confirmed: boolean };
   afterRunStarted?: () => Promise<void>;
 }): Promise<boolean> {
   const {
@@ -2476,6 +2493,7 @@ async function sendContinueTurn(opts: {
     claimSet,
     claimPush,
     pendingFeedback,
+    spawnState,
     afterRunStarted,
   } = opts;
   const runs = database.collection<RunDoc>("runs");
@@ -2505,6 +2523,7 @@ async function sendContinueTurn(opts: {
     {
       $set: {
         ...claimSet,
+        ...(deliveryCas.set ?? {}),
         executionLeaseId: leaseId,
         executionLeaseExpiresAt: new Date(
           Date.now() + EXECUTION_LEASE_MS,
@@ -2587,6 +2606,7 @@ async function sendContinueTurn(opts: {
       runningChild.exited,
     ]).catch(() => undefined);
     await waitForSpawn(spawnedChild);
+    if (spawnState) spawnState.confirmed = true;
 
     const runStarted = await runs.updateOne(
       {
@@ -2612,11 +2632,9 @@ async function sendContinueTurn(opts: {
         _id: new ObjectId(runId),
         status: "running",
         executionLeaseId: leaseId,
-        ...deliveryCas.filter,
       } as Filter<RunDoc>,
       {
         $push: { turns: { $each: [continueTurn], $slice: -TURN_CAP } },
-        ...(deliveryCas.set ? { $set: deliveryCas.set } : {}),
       } as UpdateFilter<RunDoc>,
     );
     if (turnRecorded.matchedCount === 0) {
@@ -2745,6 +2763,7 @@ export async function continueExecution(
       : undefined;
 
   const leaseId = new ObjectId().toString();
+  const spawnState = { confirmed: false };
   let sent: boolean;
   try {
     sent = await sendContinueTurn({
@@ -2759,6 +2778,7 @@ export async function continueExecution(
       claimSet,
       claimPush,
       pendingFeedback,
+      spawnState,
       afterRunStarted: async () => {
         const at = now();
         const to = transition("needs_input", "provide_input");
@@ -2792,7 +2812,13 @@ export async function continueExecution(
         { _id: new ObjectId(runId), executionLeaseId: leaseId },
         { $set: { executionLeaseId: null, executionLeaseExpiresAt: null } },
       );
-      await restoreParkedResume(database, run, runId, run.awaitingQuestion);
+      await restoreParkedResume(
+        database,
+        run,
+        runId,
+        run.awaitingQuestion,
+        spawnState.confirmed ? undefined : (pendingFeedback ?? undefined),
+      );
     } catch (compensationError) {
       console.error(
         `Failed to restore parked run ${runId} after spawn failure:`,
